@@ -1,0 +1,81 @@
+# CI for the PUBLIC FF13-SpeedrunPractice repo. This file lives in the private monorepo at
+# sr_practice/publish/build.yml and is placed at .github/workflows/build.yml by publish.sh --
+# deliberately NOT under the monorepo's own .github/, so it never runs there.
+#
+# zig cross-compiles the x86 Windows DLL on a Linux runner: no Windows runner, no game files.
+# Every push builds; a v* tag also packages the release zip and publishes it.
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create a Release on tags
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      ZIG_VERSION: "0.16.0"   # keep in sync with the private repo's vendored toolchain
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install zig ${{ env.ZIG_VERSION }}
+        run: |
+          set -euo pipefail
+          V="$ZIG_VERSION"; found=""
+          # zig changed its archive naming across versions; try both orders.
+          for name in "zig-x86_64-linux-$V" "zig-linux-x86_64-$V"; do
+            if curl -fSL "https://ziglang.org/download/$V/$name.tar.xz" -o zig.tar.xz; then
+              found="$name"; break
+            fi
+          done
+          test -n "$found" || { echo "::error::zig $V download failed"; exit 1; }
+          mkdir -p "$HOME/zigtc"
+          tar -xJf zig.tar.xz -C "$HOME/zigtc" --strip-components=1
+          echo "ZIG=$HOME/zigtc/zig" >> "$GITHUB_ENV"
+
+      - name: Build dinput8.dll
+        run: ./src/build.sh
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: FF13-SpeedrunPractice-dinput8
+          path: src/out/dinput8.dll
+          if-no-files-found: error
+
+      - name: Publish Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # One flat zip: all four files land in the game's bin folder, so "extract the
+          # zip there" is the whole install. Loose .bat/.dll downloads also trip browser
+          # warnings that a zip avoids. The ini ships under its real name -- every key is
+          # optional and the content equals the built-in defaults, so placing it unedited
+          # changes nothing, and nobody has to rename an .example first. The two launchers
+          # are the with/without-tools way to start the game (run parks the DLL).
+          cp ff13-srpractice.ini.example ff13-srpractice.ini
+          zip -j "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" \
+            src/out/dinput8.dll \
+            ff13-srpractice.ini \
+            ff13-practice.bat \
+            ff13-run.bat
+          # A release for this tag can already exist -- the tag gets moved when a version is
+          # re-cut before anyone has it, and `gh release create` fails outright on a duplicate.
+          # Replace the asset in that case rather than failing the run.
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" \
+              --title "FF13-SpeedrunPractice $GITHUB_REF_NAME" \
+              --generate-notes
+          fi

@@ -1,0 +1,75 @@
+; 各設定の詳細な説明はREADMEにあります。
+; FF13-SpeedrunPractice configuration. Rename to ff13-srpractice.ini, place next to ffXiiiimg.exe.
+; All keys optional; a missing file or missing key keeps the built-in default shown below.
+; THE SETTINGS ARE EXPLAINED IN THE README. One line per language here, and it is a reminder.
+; This file lives beside the exe; everything the mod WRITES goes in ff13-mods\ beside it
+; (the .dat.bak save backups are the exception -- those stay with the saves).
+
+[hotkeys]
+; キーは F1..F24 / 英字 / 数字 / 生の0xNNコード(Enter=0x0D、Backspace=0x08、Space=0x20)。
+; Ctrl+ / Shift+ / Alt+ を前に付けられる(例: Ctrl+Shift+T)。Fnは使えない。offで無効化。
+; A key is F1..F24, a letter, a digit, or a raw 0xNN code (Enter = 0x0D, Backspace = 0x08,
+; Space = 0x20), on its own or behind Ctrl+ / Shift+ / Alt+ -- Ctrl+Shift+T, Alt+1, Ctrl+F1.
+; Not Esc (0x1B) -- that opens the game's own quit dialog. Fn cannot be used (see the README).
+; Any key can be disabled with "off".
+
+; require_focus: 1=FF13のウィンドウがアクティブなときだけ有効。0=無条件で有効
+; 0 = the keys fire even while the game is in the background (a browser, an editor)
+; -- and the save key writes a file.
+require_focus  = 1
+
+; 各機能と現在のホットキーの一覧をゲーム画面に表示する。
+; Shows the in-game list of every feature and its current hotkey.
+help           = F1
+game_speed     = F2
+kill_mode      = F3
+warp           = F4
+enemy_suppress = F5
+; どこでもセーブ画面を開く。
+; Opens the save-anywhere screen.
+save           = F7
+; ロード復帰後にカメラが固定アングルに貼り付いたとき、それを外す。
+; Un-sticks the follow camera when a load-restore leaves it locked.
+camera_unstick = F8
+battle_overlay = F10
+battle_picker  = F11
+picker_up      = 0x26
+picker_down    = 0x28
+picker_left    = 0x25
+picker_right   = 0x27
+cancel         = 0x08
+
+[overlay]
+; Modが表示する文字の言語: auto | jp | en。
+; What the mod draws is in: auto (follow the game) | jp | en.
+language = auto
+
+[game_speed]
+; 0.1〜10倍。カンマ区切りで並べるとホットキーで順に切り替わる(例: 2.0,3.0,0.5)。最後はOFF(最大8個)。
+; How much faster, 0.1..10. A comma-separated list is walked by the hotkey (e.g. 2.0,3.0,0.5),
+; then off (max 8).
+multiplier = 3.0
+
+[battle_picker]
+; Nothing here needs setting for the picker to work.
+
+; 戦闘の曲が入るまでの無音の長さ。0〜8000ms。
+; Silence before a picked fight's own track comes in, 0..8000 ms.
+bgm_delay_ms = 1200
+
+[save]
+; どこでもセーブ。ここは何も設定しなくても動く。
+; Save anywhere. Nothing here needs setting for it to work.
+
+; ゲームのセーブ一覧で、ホットキー保存の番号の右に付ける印(「セーブデータ 01*」)。最大8文字、off=付けない。
+; Mark a hotkey save after its number in the game's save list ("Save Data 01*"). Max 8 chars; off = none.
+list_mark = *
+; ff13-NN.datがあるディレクトリ。空 = 自動検出。
+; Directory holding the ff13-NN.dat save files. Empty = auto-detect.
+; 例 / e.g.  C:\Users\<user>\AppData\Local\SquareEnix\FinalFantasyXIII\save
+save_dir =
+
+[log]
+; quiet | normal | verbose。
+; quiet=errors+startup / normal=+your actions' results / verbose=+the game's internals.
+level = normal
