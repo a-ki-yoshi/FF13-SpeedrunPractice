@@ -72,4 +72,6 @@ save_dir =
 [log]
 ; quiet | normal | verbose。
 ; quiet=errors+startup / normal=+your actions' results / verbose=+the game's internals.
+; 不具合を報告するときは できればverbose にして、ff13-mods\ff13-srpractice.log を送ってください。
+; Reporting a problem? Set verbose if you can, and send us ff13-mods\ff13-srpractice.log.
 level = normal

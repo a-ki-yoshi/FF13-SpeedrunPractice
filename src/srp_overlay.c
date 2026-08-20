@@ -429,6 +429,7 @@ static int g_realRunning = 0;                   // REAL timer running
 // Fight boundaries: REAL starts when GAME (battletime) goes 0->nonzero and ends when the fight
 // resolves (target appears, or enemy_point clears while in a fight) -- same boundaries as GAME.
 static int g_inFight = 0, g_prevBt = 0, g_prevTarget = 0, g_prevEnemyPt = 0;
+static int g_prevInBattle = 0;                  // ...and whether the battle screen was up
 
 // -1 if unavailable. Guarded read-only.
 static int battle_gametime_ms(void) {
@@ -461,6 +462,13 @@ static void overlay_draw(void* dev) {
     int bt = battle_gametime_ms(); if (bt < 0) bt = 0;
     int tgt = read_via_ptr(RVA_TARGET_PTR, OFF_TARGET);
     int ep  = read_via_ptr(RVA_ENEMYPT_PTR, OFF_ENEMYPT);
+    // The battle screen comes up a moment before its clock starts, so REAL is zeroed on the frame
+    // the screen appears -- but never over a clock already running.
+    if (inBattle && !g_prevInBattle && !g_realRunning) {
+        QueryPerformanceCounter(&g_realStart);
+        g_realEnd = g_realStart;
+    }
+    g_prevInBattle = inBattle;
     if (bt != 0 && g_prevBt == 0) { QueryPerformanceCounter(&g_realStart); g_realRunning = 1; g_inFight = 1; }
     if (tgt != 0 && g_prevTarget == 0) { QueryPerformanceCounter(&g_realEnd); g_realRunning = 0; g_inFight = 0; }
     if (g_inFight && ep == 0 && g_prevEnemyPt != 0) { QueryPerformanceCounter(&g_realEnd); g_realRunning = 0; g_inFight = 0; }

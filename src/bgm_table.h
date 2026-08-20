@@ -132,7 +132,7 @@ static const ff13_bgm_scene kBgmScene[] = {
     { 9039, "music_158opn1_i", 2},
     { 9040, "music_158opn1_i", 2},
     { 9041, "music_bossa", 2},
-    { 9042, "music_16gfaru_b", 2},
+    { 9042, "music_40monst_b", 2},
     { 9043, "music_158opn1_i", 2},
     { 9044, "music_158opn1_i", 2},
     { 9045, "music_158opn1_i", 2},

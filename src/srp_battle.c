@@ -44,13 +44,6 @@ volatile DWORD g_swapWindowUntil = 0;
 // The music path is independent of the battle scene. onPlay_ reads a FIXED 16-byte inline name
 // buffer, so any substitute name must be zero-padded to that size.
 static volatile int g_bgmLogN = 0;
-// Learned pairs: which track a battle scene played when it was fought for real.
-struct ff13_bgm_pair g_bgmMap[BGMMAP_MAX];
-volatile int      g_bgmMapN = 0;
-static volatile uint32_t g_bgmLearnFor = 0;   // btsc whose battle track we are waiting to hear
-// A lead-in cutscene's track passes every battle-track test, so the learner keeps the LAST track
-// that started and commits once the fight has audibly been running (bgm_learn_tick).
-static char              g_bgmLearnCand[BGM_NAME_MAX + 1];
 // Story boss fights are started by name and have no scene number to pair with, so what is kept
 // from them is the TRACK. ORDER: the theme plays during the run-up and startBattle_l is called
 // AFTER it, so arming a "learn the next track" flag there is too late -- every track is stamped as
@@ -124,75 +117,6 @@ static int bgm_is_boss_track(const char* n) {
     if (!bgm_is_battle_track(n)) return 0;
     if (g_zoneBattle[0] && strncmp(n, g_zoneBattle, BGM_NAME_MAX) == 0) return 0;
     return 1;
-}
-
-static const char* bgm_lookup(uint32_t btsc) {
-    for (int i = 0; i < g_bgmMapN; i++) if (g_bgmMap[i].btsc == btsc) return g_bgmMap[i].track;
-    return NULL;
-}
-static const char* bgm_pick_track3(uint32_t btsc, const char** origin, const char** tag,
-                                   int useLearned);
-void bgm_learn(uint32_t btsc, const char* track) {
-    if (!btsc || !track || !track[0]) return;
-    // Sampling the manager at the end of a fight catches the game-over jingle, or the field theme
-    // once a checkpoint restart has put it back.
-    if (!bgm_is_battle_track(track)) {
-        ff13logv("[FF13-SRP] btsc%05u: \"%.16s\" is not a fight's music -- not remembered\n",
-                 btsc, track);
-        return;
-    }
-    // EXCEPTIONS only -- 48 slots against a playthrough's hundreds of fights: a track the rules
-    // below already answer is not stored, and a stored entry they catch up with is retired.
-    const char* dorigin = NULL;
-    const char* derived = bgm_pick_track3(btsc, &dorigin, NULL, 0);
-    if (derived && strncmp(derived, track, BGM_NAME_MAX) == 0) {
-        for (int i = 0; i < g_bgmMapN; i++) {
-            if (g_bgmMap[i].btsc != btsc) continue;
-            g_bgmMap[i] = g_bgmMap[--g_bgmMapN];
-            ff13logv("[FF13-SRP] btsc%05u: \"%.16s\" now matches the derived answer -- learned "
-                     "entry retired\n", btsc, track);
-            zb_save();
-            return;
-        }
-        ff13logv("[FF13-SRP] btsc%05u: \"%.16s\" matches the derived answer%s -- not stored\n",
-                 btsc, track, dorigin ? dorigin : "");
-        return;
-    }
-    for (int i = 0; i < g_bgmMapN; i++) {
-        if (g_bgmMap[i].btsc != btsc) continue;
-        if (strncmp(g_bgmMap[i].track, track, BGM_NAME_MAX) == 0) return;
-        ff13logv("[FF13-SRP] btsc%05u now plays \"%.16s\" (was \"%.16s\")\n",
-                 btsc, track, g_bgmMap[i].track);
-        strncpy(g_bgmMap[i].track, track, BGM_NAME_MAX);
-        g_bgmMap[i].track[BGM_NAME_MAX] = 0;
-        zb_save();
-        return;
-    }
-    if (g_bgmMapN >= BGMMAP_MAX) return;
-    g_bgmMap[g_bgmMapN].btsc = btsc;
-    strncpy(g_bgmMap[g_bgmMapN].track, track, BGM_NAME_MAX);
-    g_bgmMap[g_bgmMapN].track[BGM_NAME_MAX] = 0;
-    g_bgmMapN++;
-    ff13logv("[FF13-SRP] learned: btsc%05u plays \"%.16s\" (%d pairs known, kept across launches)\n",
-             btsc, track, g_bgmMapN);
-    zb_save();
-}
-static void bgm_learn_close(void) {
-    if (g_bgmLearnFor && g_bgmLearnCand[0]) bgm_learn(g_bgmLearnFor, g_bgmLearnCand);
-    g_bgmLearnFor = 0; g_bgmLearnCand[0] = 0;
-}
-static void bgm_learn_note(const char* name) {
-    if (!g_bgmLearnFor || strncmp(g_bgmLearnCand, name, BGM_NAME_MAX) == 0) return;
-    strncpy(g_bgmLearnCand, name, BGM_NAME_MAX);
-    g_bgmLearnCand[BGM_NAME_MAX] = 0;
-    ff13logv("[FF13-SRP] learn candidate: btsc%05u \"%.16s\"\n", g_bgmLearnFor, name);
-}
-void bgm_learn_tick(DWORD now) {
-    if (!g_bgmLearnFor) return;
-    // Late enough that the fight's own track has replaced a lead-in cutscene's; early enough that
-    // a mid-fight phase change usually has not happened yet.
-    if (overlay_in_battle() && g_btlStatAt && (int)(now - (g_btlStatAt + 3000)) >= 0)
-        bgm_learn_close();
 }
 
 volatile uint32_t g_lastBtscId = 0;        // last btsc ID asked for (field-symbol path)
@@ -291,10 +215,6 @@ uint32_t __cdecl on_encount_scene(uint32_t origId) {
         else
             ff13logv("[FF13-SRP] field encounter btsc%05u\n", origId);
     }
-    // Only for a fight the game itself brought about: a substituted scene plays the zone's
-    // ORDINARY battle theme, and learning that as the boss's track poisons the pair table.
-    g_bgmLearnFor = swapped ? 0 : useId;
-    g_bgmLearnCand[0] = 0;
     // Remember the band and the touch id, so the picker works in this zone on later launches.
     // Guarded: a non-enemy touch resolves to -1, and learning that as the band left the picker
     // permanently empty (the record persists across launches).
@@ -888,7 +808,7 @@ static void vm_call1(uint32_t rva, const uint32_t* slot) {
 
 // Which deck the fight starts held. Its own native, NOT reached through callPartyNative.
 #define RVA_SETOPTIMADECK 0x7DCBC0   // VA 0xBDCBC0  Party.setOptimaDeck(int)
-static void vm_set_optima_deck(int deck) {
+void vm_set_optima_deck(int deck) {
     if (!g_base) return;
     uint32_t a[2];
     a[0] = 0; a[1] = (uint32_t)deck;
@@ -917,6 +837,18 @@ static void vm_party_setup(const char* const* names, int n) {
         vm_slot_str(a + 2, names[i]);
         vm_call1(RVA_PARTY_STAND, a);
     }
+}
+
+// The game's own name for a zone state, out of the table its logger uses: indexed by state,
+// 78 entries ending at STATE_RESTART.
+#define RVA_ZONE_STATE_NAMES 0x22A1818   // VA 0x26A1818
+#define ZONE_STATE_N 78
+const char* zone_state_name(int st) {
+    if (!g_base || st < 0 || st >= ZONE_STATE_N) return "?";
+    uintptr_t p = g_base + RVA_ZONE_STATE_NAMES + (uintptr_t)st * 4;
+    if (IsBadReadPtr((void*)p, 4)) return "?";
+    const char* n = (const char*)(uintptr_t)(*(uint32_t*)p);
+    return (n && !IsBadStringPtrA(n, 64)) ? n : "?";
 }
 
 // The party manager's live record; see common/docs/PARTY_LEADER.md for the walk to it.
@@ -1027,7 +959,8 @@ int party_battle_ids(int out[3]) {
 }
 
 // Which deck is in hand: the low byte of [record+0x5C] -- 0xB63940 (setOptimaDeck's writer)
-// stores it there. -1 = could not read.
+// stores it there. SIGNED, as the game reads it (0xB6F19F: shl 24 / sar 24), so "none in hand"
+// comes back as -1 rather than 255. -1 also means could not read; both are "nothing to put back".
 #define OFF_REC_SEL 0x5C
 int deck_sel_live(void) {
     if (!g_base || IsBadReadPtr((void*)(g_base + RVA_PARTY_ROOT), 4)) return -1;
@@ -1037,7 +970,7 @@ int deck_sel_live(void) {
     if (idx > 3) return -1;
     uintptr_t rec = pm + OFF_PARTY_RECS + (uintptr_t)idx * PARTY_REC_STRIDE;
     if (IsBadReadPtr((void*)(rec + OFF_REC_SEL), 4)) return -1;
-    return (int)(*(uint32_t*)(rec + OFF_REC_SEL) & 0xFF);
+    return (int)(signed char)(*(uint32_t*)(rec + OFF_REC_SEL) & 0xFF);
 }
 
 // The live record's decks -- the leading run of non-empty entries, in decks_apply's shape.
@@ -1090,6 +1023,7 @@ uint32_t party_state_key(void) {
 // This is a separate table from kSceneArena on purpose: an entry in kSceneArena takes a fight off
 // the field-encounter path whatever its other fields say.
 static const char* const kPartySnowAlone[1] = { "snow" };
+static const char* const kPartyLightningHope[2] = { "lightning", "hope" };
 // Fights whose END has to be taken to the checkpoint although the mod does not stage them: an
 // event fight ends by handing the run to the story, and a picked one has no story to hand it to.
 // "End", not "win": btsc03036 runs the same scripted ending either way, so the outcome is not the
@@ -1107,6 +1041,11 @@ static const struct { uint16_t btsc; const char* const* who; int n; } kScenePart
     // btsc07010 has a door and the door is not enough: its chain's script sets the decks but the
     // BATTLE party does not follow, so the party change belongs to a step the door enters past.
     { 7010, kPartySnowAlone, 1 },
+    // btsc04027's party change is the story's own step and NOT part of its cutscene (the chain is
+    // in CODE_NOTES). Set here rather than through a door: the plain field swap already fields all
+    // five enemies, and a door would hand the win to bt_vpek_200_cb, which marks a save point and
+    // plays the next cutscene on into the story.
+    { 4027, kPartyLightningHope, 2 },
 };
 
 // The paradigms a fight is meant to hold, written once it has started. Kept out of the arena table
@@ -1128,6 +1067,13 @@ static const struct { uint16_t btsc; int n; signed char decks[8][3]; } kSceneDec
                   { R_SAB, R_COM, R_RAV },
                   { R_SAB, R_COM, R_MED } } },
     // btsc11412 needs no entry: its door produces the right paradigms already.
+    // btsc04027 -- measured off the story fight, and also what the game generates for the pair.
+    // Do NOT "restore" the player's saved set for a party the picker sets: it grows over a
+    // playthrough and gave six decks where the story has four (CODE_NOTES).
+    { 4027, 4, { { R_COM, R_RAV, -1 },
+                 { R_COM, R_SYN, -1 },
+                 { R_MED, R_MED, -1 },
+                 { R_RAV, R_RAV, -1 } } },
     // btsc03036, Snow alone: three decks, one slot each, -1 for the two nobody is standing in.
     { 3036, 3, { { R_COM, -1, -1 },
                  { R_SEN, -1, -1 },
@@ -1411,7 +1357,6 @@ void vm_sync_wait(void) {
 // 0xB25BE0 writes the leader's 16-byte name key into a caller buffer with no VM involved, and
 // slot1 is forged to 0xBF6900's string-variant encoding {tag16=5, len16, char*}.
 #define RVA_LEADERNAME 0x725BE0      // VA 0xB25BE0 leader name key -> 16-byte buffer (cdecl)
-#define RVA_SWITCHCTL  0x7C61B0     // VA 0xBC61B0 Chara.switchControl(boolean)
 
 // The 16-byte roster name key of the current leader. 0xB25BE0 is Party.getPartyLeader()'s own data
 // path: the live record's leader charID at record+0x50, resolved to the roster record's key at +0x30.
@@ -1432,22 +1377,44 @@ int riding_chocobo(void) {
     return memcmp(name, "cho_", 4) == 0;
 }
 
-static void vm_switch_control_name(const char* name, int on, int say) {
-    if (!g_base || !name || !name[0]) return;
-    {
-        uint8_t  ctx[0x200];
-        uint32_t args[4];
-        uint32_t len = (uint32_t)strlen(name);
-        memset(ctx, 0, sizeof ctx);
-        args[0] = 0; args[1] = on ? 1u : 0u;             // slot0 {tag, on} -- value read raw
-        args[2] = 5u | (len << 16);                      // slot1 = string variant, 0xBF6900's shape
-        args[3] = (uint32_t)(uintptr_t)name;
-        *(uint32_t*)(ctx + SB_ARGSTACK_OFF) = (uint32_t)(uintptr_t)args;
-        ((vmNative1_t)(uintptr_t)(g_base + RVA_SWITCHCTL))(ctx);
+// Resolving the name inside switchControl's entry (0xBC61B0) is the btsc09055 crash: the interning
+// is session-ordered and the chara-DB bounds check there only LOGS before it derefs. Do it here and
+// call the tail, which returns NULL on a miss. Game thread only (virtual call). See CODE_NOTES.
+#define RVA_CHARA_MGR    0x22E80DC   // VA 0x26E80DC -> field chara manager
+#define OFF_CM_SLOTS     0x310       // manager -> object table, indexed by chara id
+#define CM_SLOT_MAX      0x70        // where the game's own by-name walk stops
+#define OFF_CO_NAMEBLK   0x124       // vtable slot: object -> its name block
+#define OFF_CN_NAMES     0x338       // two 16-byte names back to back; either may match
+#define RVA_SWITCHCTL_ON 0x2C6CE0    // VA 0x6C6CE0 switchControl(id) tail, the on=true side
+static int chara_id_by_name(const char name16[16]) {
+    // The table holds the charaspec form ("p_fang"); leader_name gives the roster key ("fang").
+    char pfx[16];
+    memset(pfx, 0, sizeof pfx);
+    pfx[0] = 'p'; pfx[1] = '_';
+    for (int k = 0; k < 13 && name16[k]; k++) pfx[2 + k] = name16[k];
+    if (!g_base || IsBadReadPtr((void*)(g_base + RVA_CHARA_MGR), 4)) return -1;
+    uint32_t mgr = *(uint32_t*)(g_base + RVA_CHARA_MGR);
+    if (!mgr || IsBadReadPtr((void*)(uintptr_t)(mgr + OFF_CM_SLOTS), 4)) return -1;
+    const uint32_t* tbl = *(const uint32_t**)(uintptr_t)(mgr + OFF_CM_SLOTS);
+    if (!tbl || IsBadReadPtr(tbl, CM_SLOT_MAX * 4)) return -1;
+    for (uint32_t i = 0; i < CM_SLOT_MAX; i++) {
+        uint32_t o = tbl[i];
+        if (!o || IsBadReadPtr((void*)(uintptr_t)o, 4)) continue;
+        uint32_t vt = *(uint32_t*)(uintptr_t)o;
+        if (!vt || IsBadReadPtr((void*)(uintptr_t)(vt + OFF_CO_NAMEBLK), 4)) continue;
+        uint32_t fn = *(uint32_t*)(uintptr_t)(vt + OFF_CO_NAMEBLK);
+        if (!fn || IsBadReadPtr((void*)(uintptr_t)fn, 4)) continue;
+        uint32_t nb = ((uint32_t (__thiscall*)(void*))(uintptr_t)fn)((void*)(uintptr_t)o);
+        if (!nb || IsBadReadPtr((void*)(uintptr_t)(nb + OFF_CN_NAMES), 32)) continue;
+        const void* n1 = (const void*)(uintptr_t)(nb + OFF_CN_NAMES);
+        const void* n2 = (const void*)(uintptr_t)(nb + OFF_CN_NAMES + 16);
+        // Bounded, not a raw 16-byte compare: the fields are fixed width and nothing says what
+        // follows the name in them, and there a byte of tail garbage would be a silent miss.
+        if (!strncmp((const char*)n1, name16, 16) || !strncmp((const char*)n2, name16, 16) ||
+            !strncmp((const char*)n1, pfx, 16)    || !strncmp((const char*)n2, pfx, 16))
+            return (int)i;
     }
-    if (say)
-        ff13logv("[FF13-SRP] battle picker: field control %s for \"%s\" (the event lock)\n",
-                 on ? "back on" : "off", name);
+    return -1;
 }
 // switchControl does NOT stop the pause menu; that is a separate gate,
 // White.setFieldTopMenuOpenFlag(7, false) at 0xBE5CA0 (slot0 boolean, slot1 flag number).
@@ -1458,7 +1425,7 @@ static void vm_switch_control_name(const char* name, int on, int say) {
 
 // Read before writing, so the flag can be HELD without a write every frame: writing it every frame
 // crashed the game with the Start button held down (the game's own menu code drives the same flag).
-static int vm_top_menu_get(void) {
+int vm_top_menu_get(void) {
     if (!g_base) return -1;
     uint8_t  ctx[0x200];
     uint32_t args[2];
@@ -1522,50 +1489,24 @@ static void field_ui_unlock(void) {
     g_uiSaved = 0xFFFFFFFFu;
 }
 
-// switchControl is per CHARACTER, which is why this is a list and not a flag. Two ways a
-// single-shot lock came undone on hardware: the leader changed under it (the lock went on before
-// the party script), and the call can silently do nothing (leader_name reads a live record that is
-// empty while the party is rebuilt). So: lock whoever is leading, remember the name, keep checking
-// while the cover is up, and unlock EVERY name that was locked -- a character left with control
-// off who later rejoins the party is a party member who cannot move.
-#define CTL_NAMES 6
-static char g_ctlNames[CTL_NAMES][20];
-volatile int g_ctlN = 0;
+// Three parts, none of them through the VM: input dies at the dinput8 proxy (di_gate_arm), the
+// party is pinned, and the field UI and pause menu are shut. A fourth part -- Chara.switchControl
+// through a forged context -- crashed on hardware and was removed (CODE_NOTES, the input gate).
+// ctl_force_on still needs switchControl (undoing a switch-off the game's own scripts did is out
+// of an input gate's reach), but past the string resolve: see chara_id_by_name above.
 volatile int g_ctlLocked = 0;
 
-// Said once per attempt, not once per tick: ctl_hold re-applies the lock every frame.
-static volatile int g_ctlSaidNoLeader = 0;
-
 void ctl_lock(void) {
-    char name[20];
-    // Nothing to lock yet. Deliberately does NOT mark the lock as taken: the next tick tries again.
-    if (!leader_name(name)) {
-        if (!g_ctlSaidNoLeader) {
-            g_ctlSaidNoLeader = 1;
-            ff13logv("[FF13-SRP] battle picker: nothing to hold still yet -- no leader to read; "
-                     "trying again each frame\n");
-        }
-        return;
-    }
-    g_ctlSaidNoLeader = 0;
-    int known = 0;
-    for (int i = 0; i < g_ctlN; i++) if (strcmp(g_ctlNames[i], name) == 0) { known = 1; break; }
-    if (!known && g_ctlN < CTL_NAMES) {
-        strncpy(g_ctlNames[g_ctlN], name, 19);
-        g_ctlNames[g_ctlN][19] = 0;
-        g_ctlN++;
-    }
-    vm_switch_control_name(name, 0, !known);      // said out loud the first time for each name
     // The menu flag is HELD (anybody may set it back), but by reading first -- see vm_top_menu_get.
-    // field_ui_lock and hold_still_begin are NOT held: they save state to put back afterwards, so
-    // running them again would save the state they themselves just wrote.
     if (vm_top_menu_get() != 0) vm_top_menu(0);
-    if (!g_ctlLocked) { g_ctlLocked = 1; field_ui_lock(); hold_still_begin(); }
-    else if (!known)
-        // A second pick while the first lock is still on: this adds a name and nothing else, since
-        // the field UI bits and the position hold were taken by the branch above.
-        ff13logv("[FF13-SRP] battle picker: already holding -- \"%s\" added to the lock, but the "
-                 "field UI and the position hold were taken by an earlier one\n", name);
+    if (g_ctlLocked) return;
+    g_ctlLocked = 1;
+    di_gate_arm();
+    // NOT held: these save state to put back afterwards, so running them again would save the
+    // state they themselves just wrote.
+    field_ui_lock();
+    hold_still_begin();
+    ff13logv("[FF13-SRP] battle picker: holding -- input gated, field UI off, party pinned\n");
 }
 // Re-taken EVERY frame while the cover is up. Twice a second was tried and left the party walkable.
 void ctl_hold(void) {
@@ -1575,20 +1516,26 @@ void ctl_hold(void) {
 // Give the leader the field back whoever took it away. ctl_unlock only undoes what THIS mod locked,
 // which is no use against the game's own lock: an event fight ends by handing the run to a story
 // that is not running, so nobody gives control back.
-void ctl_force_on(void) {
+// 0 = there was no leader, or no such name in the table: the caller decides whether to try again.
+int ctl_force_on(void) {
     char name[20];
-    if (!leader_name(name)) return;
-    ff13logv("[FF13-SRP] battle picker: giving \"%s\" the field back -- the fight's own ending "
-             "took it and there was no story left to return it\n", name);
-    vm_switch_control_name(name, 1, 0);
+    if (!leader_name(name)) return 0;
+    int id = chara_id_by_name(name);
+    if (id < 0) return 0;
+    ff13logv("[FF13-SRP] battle picker: giving \"%s\" (chara %d) the field back -- the fight's own "
+             "ending took it and there was no story left to return it\n", name, id);
+    ((void (__cdecl*)(int))(uintptr_t)(g_base + RVA_SWITCHCTL_ON))(id);
+    return 1;
 }
 
 void ctl_unlock(void) {
-    g_ctlSaidNoLeader = 0;             // a fresh lock gets to say it again
-    if (!g_ctlLocked && g_ctlN == 0) return;
-    for (int i = 0; i < g_ctlN; i++) vm_switch_control_name(g_ctlNames[i], 1, 1);
-    g_ctlN = 0;
-    if (g_ctlLocked) { g_ctlLocked = 0; vm_top_menu(1); field_ui_unlock(); hold_still_end(); }
+    if (!g_ctlLocked) return;
+    g_ctlLocked = 0;
+    di_gate_lift();
+    vm_top_menu(1);
+    field_ui_unlock();
+    hold_still_end();
+    ff13logv("[FF13-SRP] battle picker: released -- input, field UI and the party are the game's again\n");
 }
 
 // Start a fight the way a story fight starts: the same native, with an ARENA. The native reads
@@ -1772,6 +1719,31 @@ static const ff13_arena kSceneArena[] = {
       {  -0.981f,  -1.849f,   -1.141f },
       {  -0.331f,  -0.109f,    0.119f },
       {   0.500f,  -2.665f }, 1200.0f, 1 },
+
+    // btsc06046 -- measured, correct, and RETIRED (the plain field swap is what ships). Re-enabling
+    // is dropping the #if 0, but every value here is load-bearing and three of them are traps that
+    // cost a hardware session each -- read CODE_NOTES ("btsc06046 wants a kSceneArena row", and the
+    // section that follows it) before changing any of them.
+#if 0
+    { .btsc = 6046, .arena = "bt_gapr_200_cb", .flags = 0x4,
+      .ex = 0.0f, .ey = 0.0f, .ez = 5.0f,
+      .sp = { {  1.5f, 0.0f, -4.0f },
+              {  0.0f, 0.0f, -3.0f },      // centre (leader)
+              { -1.5f, 0.0f, -4.0f } },
+      .en = { { "m097", 0.0f, 0.0f, 5.0f } },
+      .restartAfterWin = 0,        // trap 3: a win at the checkpoint comes up as the game-over screen
+      .noHomeWarp = 1,
+      // The root is the SCRIPT event one step ahead of the cutscene (the step that does the field
+      // setup the cutscene acts against), so the cutscene itself is named in evLoad.
+      .ev = { "bf_ev_200", "bf_ev_200_cb", NULL, "suc_fx2_on_fldd" },
+      .evScript = 1,
+      .evLoad = { "ev_gapr_200", "a00" },
+      .evFlag = 4464,
+      .evQuiet = 1,                // the chain opens with sfSoundAutoPlayOff; firing it direct does not
+      // traps 1 and 2: .bg NULL (a name sends the picker into a syncWait that never returns) and
+      // no .btlBg (the field is handed a BATTLE mapset and the next load crashes)
+    },
+#endif
 
     // btsc07050 goes in on its FULL story flow, and the EVENT-battle entry is load-bearing: only
     // that route's Restart runs the real checkpoint loader. A field-encounter start gets the quick
@@ -2501,6 +2473,9 @@ const ff13_charaset* charaset_needed(uint32_t zone, uint32_t btsc) {
     // Ours first: g_curCharset tracks only what the GAME asked for, so without this a second
     // attempt at the same fight would ask for the set again and wait for it again.
     const ff13_charaset* cur = charaset_by_name(g_csLoaded[0] ? g_csLoaded : g_curCharset);
+    ff13logv("[FF13-SRP] charaset_needed(btsc%05u): loaded=\"%s\" game=\"%s\" -> cur=%s covers=%d\n",
+             btsc, g_csLoaded, g_curCharset, cur ? cur->name : "(none)",
+             cur ? charaset_covers(cur, sm) : -1);
     if (cur && charaset_covers(cur, sm)) return NULL;
     // Most overlap with the loaded set first, smaller set on a tie. "Smallest covering set" alone
     // was the first rule and chose a set that made the fight come up empty: the most similar set
@@ -2561,7 +2536,9 @@ void __cdecl on_load_sound(uint32_t vmctx) {
 // Asked the way the game asks it at 0xB509E0:
 //     lea ecx,obj ; call 0xB41590   (ctor: clears the object, +0x20 = 0)
 //     push flag ; push id ; call 0xB41640   (getBattleScene; callee-cleans -> __thiscall)
-//     obj+0x20 != 0  <=>  the scene exists in the DataBattle DB right now
+//     obj+0x20 != 0 AND obj+0x24 != 0  <=>  the scene exists in the DataBattle DB right now
+//     (the game's own site, 0xB50A0F/0xB50A15, requires BOTH; testing only +0x20 answers "loaded"
+//      for a scene it will then decline to build)
 // MUST be called on the game's own thread inside its encounter build, so the DB is in the state
 // the real lookup will see moments later.
 typedef void* (__thiscall *btscCtor_t)(void* self);
@@ -2577,7 +2554,12 @@ static int btsc_is_loaded(uint32_t id) {
     ((btscCtor_t)(uintptr_t)(g_base + RVA_BTSC_CTOR))(obj);
     ((btscGet_t )(uintptr_t)(g_base + RVA_GETBTSC  ))(obj, id, 1);
     g_inProbe = 0;
-    return *(uint32_t*)(obj + 0x20) != 0;
+    uint32_t a = *(uint32_t*)(obj + 0x20), b = *(uint32_t*)(obj + 0x24);
+    // Logged rather than silently dropped: this is the case the old one-word test got wrong.
+    if (a && !b)
+        ff13loga("[FF13-SRP] battle swap: btsc%05u is half-loaded (+0x20 set, +0x24 clear) -- the "
+                 "game would decline to build it, so it stays armed\n", id);
+    return a != 0 && b != 0;
 }
 
 // handler(ecx, [esp+0]=return address, &[esp+4]=&id, &[esp+8]=&flag) via ff13_install_argptr_hook.
@@ -2814,21 +2796,25 @@ void __cdecl on_game_log(uint32_t ecx, uint32_t fmtVal, uint32_t* pArgs, uint32_
 // the battle camera narrates itself through it (0x4D6680 / 0x4D7140 / 0x4D7300), which is the one
 // thing the object fields cannot say: WHY the camera decided what it decided.
 const uint8_t P_TRACE[5] = {0x55,0x8B,0xEC,0x33,0xC0};   // push ebp;mov ebp,esp;xor eax,eax
-#define TRACE_MAX 500
+#define TRACE_MAX 3000
 
 void __cdecl on_trace(uint32_t ecx, uint32_t fmtVal, uint32_t* pArgs, uint32_t* unused) {
     (void)ecx; (void)unused;
     const char* fmt = (const char*)(uintptr_t)fmtVal;
     if (!fmt || IsBadStringPtrA(fmt, 200)) return;
-    // Only the first seconds of a fight, the window the party is moved onto the stage in, so an
-    // ordinary encounter and an arena-started one can be read side by side.
-    if ((int)(GetTickCount() - (g_btlStatAt + 4000)) >= 0) return;
+    // The state machines narrate themselves through tagged lines, so those are taken ALWAYS --
+    // but NOT every '['-tag: [WHITE EFFECT] alone floods TRACE_MAX inside one fight. Everything
+    // else keeps the original window, the first seconds of a fight.
+    int tagged = strncmp(fmt, "[Zone", 5) == 0 || strncmp(fmt, "[Encount", 8) == 0
+              || strncmp(fmt, "[Loader", 7) == 0 || strncmp(fmt, "[Field]", 7) == 0
+              || strncmp(fmt, "main state", 10) == 0;
+    if (!tagged && (int)(GetTickCount() - (g_btlStatAt + 4000)) >= 0) return;
     if (g_traceN >= TRACE_MAX || !pArgs || IsBadReadPtr(pArgs, 16)) return;
     g_traceN++;
     char msg[400];
     glog_format(msg, sizeof msg, fmt, pArgs);
     for (char* p = msg; *p; p++) if (*p == '\n' || *p == '\r') *p = ' ';
-    ff13logv("[FF13-SRP] TRACE: %s\n", msg);
+    ff13logv("[FF13-SRP] TRACE: %s (t=%lu)\n", msg, (unsigned long)GetTickCount());
 }
 #endif // FF13_DIAG
 
@@ -3235,10 +3221,9 @@ void bgm_zone_refresh(void) {
         return;
     strncpy(g_zoneField,  f, BGM_NAME_MAX); g_zoneField[BGM_NAME_MAX]  = 0;
     strncpy(g_zoneBattle, b, BGM_NAME_MAX); g_zoneBattle[BGM_NAME_MAX] = 0;
-    // A different pair means a different area, so the learned tracks belong to the old one.
+    // A different pair means a different area, so what was heard belongs to the old one.
     g_bgmScripted[0] = 0;
     g_bgmFieldNow[0] = 0;
-    g_bgmMapN = 0;
     ff13logv("[FF13-SRP] zone BGM defaults: field=\"%.16s\" battle=\"%.16s\"\n",
              g_zoneField[0] ? g_zoneField : "(none)", g_zoneBattle[0] ? g_zoneBattle : "(none)");
 }
@@ -3246,15 +3231,10 @@ void bgm_zone_refresh(void) {
 // What a picked fight should ask for; whatever this returns is started through lazyPlay, so the
 // track need not be loaded. `tag` (may be NULL) gets a short form of the same answer for the
 // picker line, so a wrong choice is obvious before the fight starts.
-static const char* bgm_pick_track3(uint32_t btsc, const char** origin, const char** tag,
-                                   int useLearned) {
+static const char* bgm_pick_track3(uint32_t btsc, const char** origin, const char** tag) {
     const char* dummy = NULL;
     if (!tag) tag = &dummy;
-    const char* learned = useLearned ? bgm_lookup(btsc) : NULL;
-    // A measurement first; everything below is derived. Only fights the game itself started are
-    // recorded (see on_encount_scene), so this cannot be an echo of our own substitution.
-    if (learned) { *origin = " (heard in this fight here)"; *tag = "heard"; return learned; }
-    // Then this fight's exact track from the event data, once its arena name has been seen.
+    // This fight's exact track from the event data, once its arena name has been seen.
     const char* t = bgm_event_track(btsc);
     if (t) { *origin = " (this fight's own track, from the event data)"; *tag = "exact"; return t; }
     // Then the same answer worked out offline by build_bgm_table.py.
@@ -3310,7 +3290,7 @@ static const char* bgm_pick_track3(uint32_t btsc, const char** origin, const cha
     return BGM_DEFAULT_BOSS;
 }
 const char* bgm_pick_track(uint32_t btsc, const char** origin) {
-    return bgm_pick_track3(btsc, origin, NULL, 1);
+    return bgm_pick_track3(btsc, origin, NULL);
 }
 // Most fight tracks start through lazyPlay, which never reaches the immediate-play entry below --
 // without this listener the learner only ever saw the rare direct plays. Observation only.
@@ -3322,21 +3302,12 @@ void __cdecl on_bgm_lazyplay(uint32_t ecx, uint32_t retAddr, uint32_t* pName, ui
     static volatile LONG lazyLogN = 0;
     if (lazyLogN < 200) { InterlockedIncrement(&lazyLogN);
                           ff13logv("[FF13-SRP] BGM lazyPlay \"%.16s\"\n", name); }
-    if (!g_bgmLearnFor) return;
-    // Our own plays cannot mislead this: the pin is armed only for unswapped encounters, and the
-    // mod itself only ever plays for picked (swapped) ones.
-    if (bgm_is_outcome_track(name)) { bgm_learn_close(); return; }   // the fight is over
-    if (bgm_is_battle_track(name)) bgm_learn_note(name);
 }
 
 void __cdecl on_bgm_play(uint32_t ecx, uint32_t retAddr, uint32_t* pName, uint32_t* unused) {
     (void)ecx; (void)unused;
     const char* name = (pName && *pName) ? (const char*)(uintptr_t)*pName : NULL;
     int nameOk = (name && !IsBadReadPtr((void*)name, BGM_NAME_MAX));
-    // While the learn pin is armed, every battle track is a candidate; the last one standing when
-    // the fight has been running for a few seconds is committed (bgm_learn_tick).
-    if (g_bgmLearnFor && nameOk && bgm_is_outcome_track(name)) bgm_learn_close();
-    if (g_bgmLearnFor && nameOk && bgm_is_battle_track(name)) bgm_learn_note(name);
     // Stamp every track, so startBattle_l can look back at what was already playing.
     if (nameOk && bgm_is_battle_track(name)) {
         strncpy(g_bgmLastPlayed, name, BGM_NAME_MAX);

@@ -217,6 +217,18 @@ void save_mapset_census(const char* tag) {
              o ? line : " (none)");
     if (!IsBadReadPtr(mgr + 0xA18, 16)) log_desc16("mapset census a18   ", (unsigned char*)(mgr + 0xA18));
 }
+// The mapset the field is REALLY on, read from the descriptor the streamer works off. loadBg is
+// not a substitute: an arena fight moves this without one, so the name the game last asked for and
+// the name in force disagree after every picked arena fight (btsc06046, measured).
+int save_current_mapset(char out[17]) {
+    out[0] = 0;
+    if (IsBadReadPtr((void*)(g_base + MAPSET_MGR_PTR), 4)) return 0;
+    char* mgr = *(char**)(g_base + MAPSET_MGR_PTR);
+    if (!mgr || IsBadReadPtr(mgr + 0xA18, 16)) return 0;
+    memcpy(out, mgr + 0xA18, 16); out[16] = 0;
+    return out[0] ? 1 : 0;
+}
+
 int save_capture_resident_cells(int out[][2], int maxn) {
     if (IsBadReadPtr((void*)(g_base + MAPSET_MGR_PTR), 4)) return 0;
     char* mgr = *(char**)(g_base + MAPSET_MGR_PTR);

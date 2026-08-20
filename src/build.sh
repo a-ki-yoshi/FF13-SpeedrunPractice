@@ -40,7 +40,7 @@ EXTRA="$EXTRA -DFF13_BUILD_ID=\"$rev\""
     -o "$out/dinput8.dll" \
     "$here/dllmain.c" "$here/srp_proxy.c" "$here/srp_core.c" "$here/srp_speed.c" \
     "$here/srp_battle.c" "$here/srp_picker.c" "$here/srp_warp.c" "$here/srp_overlay.c" \
-    "$here/srp_save.c" \
+    "$here/srp_save.c" "$here/srp_crash.c" \
     "$lib/ff13_hook.c" "$lib/ff13_crypt.c" "$here/dinput8.def" \
     "$out/version.res" \
     -lkernel32 -luser32 -lgdi32

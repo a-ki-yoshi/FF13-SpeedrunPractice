@@ -19,7 +19,7 @@ A mod for the PC (Steam) version of FINAL FANTASY XIII, with features that make 
 
 [**Click `FF13-SpeedrunPractice-x.x.x.zip` on this page**](https://github.com/a-ki-yoshi/FF13-SpeedrunPractice/releases).
 
-2. Extract the zip file and place every file in the same folder as `ffXiiiimg.exe`
+2. Extract the zip file and place the four files other than `LICENSE` and `README` in the same folder as `ffXiiiimg.exe`
 
 Example folder path: `C:\Program Files (x86)\Steam\steamapps\common\FINAL FANTASY XIII\white_data\prog\win\bin\`
 
@@ -86,14 +86,6 @@ For features of the ON/OFF-toggle kind, the ON/OFF state carries over across gam
   - Can be changed in the ini file, 0.1~10.0
   - The ini file also takes a list like `2.0,3.0`; the hotkey then switches through it in order, 2.0x → 3.0x → OFF
 
-- **Battle overlay** — `battle_overlay`
-  - Hotkey: F10
-  - Shows the following during battle
-    - GAME: in-game time
-    - REAL: real time
-    - HP: remaining HP of the targeted enemy
-  - When the game-speed feature is also in use, in-game time moves with it
-
 - **KILL mode** — `kill_mode`
   - Hotkey: F3
   - The hotkey switches through "instant win at battle start + one-hit kill" → "one-hit kill" → OFF, in that order
@@ -141,6 +133,14 @@ For features of the ON/OFF-toggle kind, the ON/OFF state carries over across gam
   - Puts the camera back into leader-follow mode
   - A remedy for the camera sometimes getting stuck while moving after loading a save made with the save-anywhere feature
 
+- **Battle overlay** — `battle_overlay`
+  - Hotkey: F10
+  - Shows the following during battle
+    - GAME: in-game time
+    - REAL: real time
+    - HP: remaining HP of the targeted enemy
+  - When the game-speed feature is also in use, in-game time moves with it
+
 - **Battle picker** — `battle_picker`
   - Hotkeys
     - Open/confirm/close the menu: F11
@@ -174,6 +174,27 @@ For features of the ON/OFF-toggle kind, the ON/OFF state carries over across gam
 - `{save data directory}\ff13-NN.dat.bak`
   - A backup of the save data, created automatically right before the mod adjusts its checkpoint
   - If a save ever fails to load, renaming the `.bak` back to `.dat` recovers it
+
+## When something goes wrong, or the game crashes
+
+### 1. Copy the log somewhere safe first
+
+Copy `ff13-mods\ff13-srpractice.log` somewhere else -- your desktop, for instance.
+
+> **Careful: starting the game again rewrites this log from scratch.**
+> Copy it before you restart or close the game (the log from right after it went wrong is the only
+> thing there is to go on).
+
+### 2. If you can reproduce it, reproduce it with `verbose`
+
+Change the `[log]` section of `ff13-srpractice.ini` to `level = verbose`, start the game, and do
+the same thing again to bring the problem back. On verbose the log records the game's internals as
+well, which makes the cause far quicker to find. Once you have reproduced it, put that log
+somewhere safe too.
+
+### 3. Sending the log helps enormously
+
+Get in touch with what happened (what you did, and what the game did) and the log you saved.
 
 ## Uninstall
 

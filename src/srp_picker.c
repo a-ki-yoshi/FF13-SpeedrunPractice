@@ -82,7 +82,16 @@ static volatile int g_emptyN = 0;
 // it locks is the sound manager, and it silenced every sound in the game. The way in is a passive
 // hook on load completion, on the game's own thread.
 #define BS_PRELOAD_CAP_MS 8000
+// A cap that expires while the probe still says "not resident" starts a fight whose models are
+// missing; the extension is bounded so BS_GIVEUP_MS stays the outer wall. Measured: CODE_NOTES.
+#define BS_PRELOAD_STEP_MS      1000
+#define BS_PRELOAD_EXTRA_MAX_MS 8000
 static const int         g_bsPreloadMs = BS_PRELOAD_CAP_MS;
+// Only an arming that ASKED to wait may be extended. Two of them hand the touch over at once (the
+// arena door, the second pass), and on those the probe says "no" as a matter of course -- judging
+// them by it would sit on a fight that has nothing left to load. Both are set at every arm site.
+static volatile int      g_bsTouchCap = 0;     // ms this arming asked for; 0 = hand over at once
+static volatile int      g_bsTouchExtra = 0;
 // The touch id and the "one is pending" fact must stay separate: object id 0 is a perfectly valid
 // live object, so 0 cannot double as "none".
 static volatile int      g_bsTouchDue = 0;
@@ -92,6 +101,18 @@ static volatile int      g_bsTouchReady = 0;
 static volatile int      g_bsProbeMoved = 0;   // the probe has been seen to say no
 static volatile int      g_bsProbeLogged = 0;
 static char g_csRestore[40];                   // set to put back when the fight ends
+// ...and the deferred half of putting it back: sending the chrset command the moment the fight is
+// over can freeze the AsyncLoader thread for the rest of the session (see cs_restore_watch).
+static volatile uint32_t g_decksRestoreFor = 0;  // fight whose party the picker set, decks pending
+static volatile int   g_selBefore = -1;          // paradigm in hand when the pick was made
+static volatile int   g_selRestoreDue = 0;       // ...and whether the field still owes it back
+static volatile DWORD g_selRestoreFrom = 0;
+static char           g_csRestorePend[40];
+static volatile uint32_t g_csRestoreZone = 0;    // ...and the zone it was the set OF
+static volatile DWORD g_csRestoreFrom = 0;
+static volatile DWORD g_csRestoreStable = 0;
+static volatile DWORD g_csRestoreEarliest = 0;   // a short fight holds the set for its retry
+static volatile int   g_csRestoreHold = 0;       // ...timed from the field coming back, not the win
 volatile uint32_t g_bsStarted = 0;      // scene the picker last started
 #define BLACKOUT_MAX_MS 25000
 static volatile DWORD g_blackUntil = 0;
@@ -246,6 +267,7 @@ void btsc_hand(uint32_t btsc, int mode, const unsigned short** jp, const char** 
 // The most forms one fight can offer.
 #define FORMS_MAX 6
 static int aimode_count(uint32_t btsc);   // how many forms this fight offers; defined with the pin
+static volatile DWORD g_loadDownAt;       // when the loading indicator last went down (see on_load_hide)
 
 static const void* field_rec(uint32_t btsc, int* got, int* want) {
     for (int i = 0; i < g_emptyN; i++) {
@@ -328,8 +350,6 @@ void zb_save(void) {
         fprintf(f, "field %u %u %u\n", g_fieldRec[i].btsc, g_fieldRec[i].got, g_fieldRec[i].want);
     for (int i = 0; i < g_bossN; i++)
         fprintf(f, "story %u %s\n", g_bossList[i], g_bossArena[i][0] ? g_bossArena[i] : "-");
-    for (int i = 0; i < g_bgmMapN; i++)
-        fprintf(f, "bgm %u %s\n", g_bgmMap[i].btsc, g_bgmMap[i].track);
     fclose(f);
 }
 // File what the game reported for this fight: `want` enemies built, `got` of them alive. Applies to
@@ -413,18 +433,11 @@ void zb_load(void) {
                 g_fieldRec[g_emptyN].want = (uint16_t)want;
                 g_emptyN++;
             }
-        } else if (!strcmp(kw, "bgm") && fscanf(f, "%u", &z) == 1) {
+        } else if (!strcmp(kw, "bgm")) {
+            // Written by the battle-track learner this build no longer carries: still parsed so an
+            // older sidecar reads cleanly, then dropped.
             char tr[BGM_NAME_MAX + 1] = "";
-            // Same test on the way in, so a file written before that check existed repairs itself.
-            if (fscanf(f, "%16s", tr) == 1 && tr[0] && !bgm_is_battle_track(tr)) {
-                ff13logv("[FF13-SRP] btsc%05u: dropping remembered \"%.16s\" -- not a fight's "
-                         "music\n", z, tr);
-            } else if (tr[0] && g_bgmMapN < BGMMAP_MAX) {
-                g_bgmMap[g_bgmMapN].btsc = z;
-                strncpy(g_bgmMap[g_bgmMapN].track, tr, BGM_NAME_MAX);
-                g_bgmMap[g_bgmMapN].track[BGM_NAME_MAX] = 0;
-                g_bgmMapN++;
-            }
+            (void)(fscanf(f, "%u %16s", &z, tr) == 2);   // consumed and dropped
         } else if (!strcmp(kw, "story") && fscanf(f, "%u", &z) == 1) {
             // The arena name is optional: files written before it existed have none, and "-"
             // stands for "this fight was seen but its name was not readable".
@@ -466,6 +479,9 @@ void zb_learn(uint32_t zone, uint32_t band, uint32_t touch) {
 
 volatile int      g_bsOpen  = 0;      // list is on screen
 volatile int      g_bsReq   = 0;      // 1 = open+scan, 2 = start the selected fight
+// Raised by the hotkey thread when it closes the list: remembering the row reads a game pointer
+// chain and rewrites the sidecar, so the work itself belongs on the game thread.
+volatile int      g_bsRememberDue = 0;
 volatile int      g_bsCount = 0;
 volatile int      g_bsSel   = 0;
 uint32_t          g_bsList[BS_MENU_MAX];
@@ -641,7 +657,8 @@ static void bs_scan(void) {
 //                                                mode-change action carries)
 // `name` is a FIXED 16-byte NUL-padded buffer on the CALLER's frame, so a hook at the entry of
 // 0x471140 can write the wanted form into it before the game reads it. The roll is left alone.
-// Do NOT try to steer the roll instead: the AI's unused-form pool could not be located in memory.
+// Do NOT steer the roll instead: the pin only has to look like one of its outcomes. What the roll
+// draws from still has to be kept straight with it -- see on_ai_afterexec.
 const uint8_t P_SPECREPL[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x20,0x02,0x00,0x00};
 #define SPEC_NAME_LEN 16             // the game's own fixed key width, NUL-padded
 
@@ -652,14 +669,17 @@ const uint8_t P_SPECREPL[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x20,0x02,0x00,0x00};
 // sees unchanged, because that comes from the ability's own effects.
 // `aim` names the part a buff should land on, for the fights where that is a separate question from
 // which buff it is. NULL leaves the AI's own choice alone.
+// `flag` is the AI generic flag the mode's ability spends (0 = this fight keeps no such
+// bookkeeping). A bend has to correct it -- see on_ai_afterexec.
 static const struct { uint16_t btsc; const char* base;
                       const char* forms[FORMS_MAX]; const char* acts[FORMS_MAX];
-                      const char* aim[FORMS_MAX]; } kAiForms[] = {
+                      const char* aim[FORMS_MAX]; const uint8_t flag[FORMS_MAX]; } kAiForms[] = {
     // Mode N means "the Nth entry here", and that binding is the only thing btsc_picker.tsv has to
     // keep. Row order in the file decides where a row is shown, so these can stay in any order.
     { 6046, "m097", { "m097_i",     "m097_f",     "m097_t",     "m097_w"     },   // ice / fire /
                     { "m097_ac510", "m097_ac500", "m097_ac520", "m097_ac530" },   // lightning / water
-                    { NULL, NULL, NULL, NULL } },
+                    { NULL, NULL, NULL, NULL },
+                    { 3, 2, 4, 5 } },
     // Barthandelus 1. Not a form change at all -- no charaspec is swapped, so `forms` is empty and
     // only the ability is pinned:
     //   m300_mg000 = enchant     m300_mg010 = enhance
@@ -672,7 +692,8 @@ static const struct { uint16_t btsc; const char* base;
     // listed; add a row here and in btsc_picker.tsv if they are ever wanted.
     { 9055, "m300", { NULL },
                     { "m300_mg000", "m300_mg000", "m300_mg010", NULL, NULL, NULL },
-                    { "m301",       "m303",       NULL,         NULL, NULL, NULL } },
+                    { "m301",       "m303",       NULL,         NULL, NULL, NULL },
+                    { 0 } },
 };
 #define AI_FORMS_N ((int)(sizeof(kAiForms)/sizeof(kAiForms[0])))
 
@@ -711,6 +732,11 @@ static volatile DWORD    g_formActBent  = 0;  // when the bend expires, 0 = it h
 // about its mode-change candidates seconds before it commits, and a pin that dies in between
 // leaves the first change unbent (measured once on 6046 -- a non-picked element came up).
 static volatile int      g_formSwapEnds = 0;
+// The enemy's own record of which modes are still unspent this cycle: a bend has to move the mark
+// onto the mode the player is shown, or the pinned one stays unspent and can come round again at
+// once (see on_ai_afterexec).
+static volatile int      g_formFlag = 0;      // the flag the pinned mode spends, 0 = none
+static volatile unsigned g_formFlagPool = 0;  // every flag this fight's modes spend, as a bit set
 // The aim's own clock, started by the first target taken: the resolve can come long after the bend,
 // so it cannot hang off PIN_ACT_MS. Holds one decision's pair; decisions are a minute apart.
 #define AIM_HOLD_MS 3000
@@ -726,9 +752,11 @@ static volatile int      g_actorTagOk = 0;
 // Arm the pin for a fight the picker is about to start. mode 0 (or a fight with no forms) clears it,
 // so a plain pick disarms whatever an earlier one left behind.
 static void aipin_arm(uint32_t btsc, int mode) {
+    extra_force_reset();          // a fresh pick starts the forced-extra draw over as well
     g_formWant[0] = 0; g_formAct[0] = 0; g_formAim[0] = 0; g_formBase[0] = 0;
     g_formScene = 0; g_formMode = 0;
     g_formActSaid = 0; g_formActBent = 0; g_formSwapEnds = 0; g_formAimUntil = 0;
+    g_formFlag = 0; g_formFlagPool = 0;
     g_aimHoldUntil = 0; g_aimHoldFrom = 0; g_aimHoldSaid = 0;
     g_actorTag = 0; g_actorTagOk = 0;   // the tag belongs to a battle; never carry one across
     for (int i = 0; i < AI_FORMS_N; i++) {
@@ -747,6 +775,9 @@ static void aipin_arm(uint32_t btsc, int mode) {
             strncpy(g_formAim, kAiForms[i].aim[mode - 1], SPEC_NAME_LEN);
             g_formAim[SPEC_NAME_LEN] = 0;
         }
+        for (int m = 0; m < FORMS_MAX; m++)
+            if (kAiForms[i].flag[m]) g_formFlagPool |= 1u << kAiForms[i].flag[m];
+        g_formFlag = kAiForms[i].flag[mode - 1];
         if (kAiForms[i].forms[mode - 1]) {
             strncpy(g_formWant, kAiForms[i].forms[mode - 1], SPEC_NAME_LEN);
             g_formWant[SPEC_NAME_LEN] = 0;
@@ -1197,6 +1228,10 @@ static void aim_hold_arm(void) {
 
 static void aim_hold(void) {
     if (!g_aimHoldUntil) return;
+    // Only while the fight is up: battle actors are freed at fight-over but their pages stay
+    // mapped with their bytes, so the name walk still "finds" the enemy and this writes into memory
+    // the game has moved on from. IsBadWritePtr cannot tell the two apart; only this test can.
+    if (!g_bsInFight) return;
     DWORD now = GetTickCount();
     if (!g_formAim[0] || (int)(now - g_aimHoldUntil) >= 0) { g_aimHoldUntil = 0; return; }
     // Stands down with the aim's window once a resolve has been steered: holding on writes into
@@ -1233,6 +1268,18 @@ static void aim_hold(void) {
     }
 }
 
+// A pin belongs to ONE fight and is taken down with it, never left to run out its window: the tag
+// is battle-scoped in the game itself (it goes up per battle), so one carried into the next fight
+// names an actor nobody compares against -- and an armed pin keeps a per-frame writer alive.
+static void aipin_battle_over(void) {
+    if (!g_formBase[0] && !g_aimHoldUntil && !g_actorTagOk) return;
+    g_formWant[0] = 0; g_formAct[0] = 0; g_formAim[0] = 0; g_formBase[0] = 0;
+    g_formUntil = 0; g_formActBent = 0; g_formAimUntil = 0; g_formSwapEnds = 0;
+    g_formFlag = 0; g_formFlagPool = 0;
+    g_aimHoldUntil = 0; g_aimHoldFrom = 0; g_aimHoldSaid = 0;
+    g_actorTag = 0; g_actorTagOk = 0;
+}
+
 // ---- the ability door, one step upstream of the charaspec -----------------------------------
 // 0x4943B0 takes an ability label (a C string, [esp+4]) and queues that ability. Redirecting the
 // label there swaps the whole mode-change action -- its effects and its presentation, not just the
@@ -1254,11 +1301,220 @@ static int read_cstr_safe(uint32_t p, char* out, int cap) {
     return i;
 }
 
+// Battle.apiAiPushEnemyAfterExecArgs (0xBC3300): arguments come off the VM operand stack at
+// [ctx+0x114], one 8-byte slot each with the value in the second dword, in REVERSE of the order the
+// script writes them -- k0 int argc, k1 int argv, k2 str argc, k3 str argv, k4 enemy id, k5 kind.
+// Filled BEFORE the ability name is returned, so the name door cannot reach it
+// (ENEMY_AI_FLAGS_RE.md 2).
+const uint8_t P_AIAFTER[6] = {0x55,0x8B,0xEC,0x83,0xEC,0x4C};
+#define VM_ARG_STACK 0x114
+#define VM_ARG(a, k) ((a)[2 * (k) + 1])
+#define AFTER_FLAG_SET 19     // AFTER_FLAG_0: raises the generic flag its int arg names
+#define AI_FLAGS_MAX   15     // the enemy's flag array, as 0x55AD10 bounds it
+
+void __cdecl on_ai_afterexec(uint32_t ctx) {
+    if (!g_formFlag || !g_formFlagPool) return;
+    if (!g_formAct[0] && !g_formWant[0]) return;             // the pin has stood down
+    if ((int)(GetTickCount() - g_formUntil) >= 0) return;
+    if (!ctx || IsBadReadPtr((void*)(uintptr_t)(ctx + VM_ARG_STACK), 4)) return;
+    uint32_t sp = *(uint32_t*)(uintptr_t)(ctx + VM_ARG_STACK);
+    if (!sp || IsBadReadPtr((void*)(uintptr_t)sp, 6 * 8)) return;
+    const uint32_t* a = (const uint32_t*)(uintptr_t)sp;
+    if (VM_ARG(a, 5) != AFTER_FLAG_SET || (int32_t)VM_ARG(a, 0) < 1) return;
+    uint32_t argv = VM_ARG(a, 1);
+    if (!argv || IsBadWritePtr((void*)(uintptr_t)argv, 4)) return;
+    int32_t flag = *(int32_t*)(uintptr_t)argv;
+    if (flag < 0 || flag > AI_FLAGS_MAX) return;
+    if (!(g_formFlagPool & (1u << flag)) || flag == g_formFlag) return;
+    // Someone else's bookkeeping is left alone; an id that will not resolve is corrected anyway,
+    // since only the pinned fight is up and only its enemy keeps this.
+    uint32_t* tbl = actor_table();
+    int slot = actor_id_slot(VM_ARG(a, 4));
+    char nm[SPEC_NAME_LEN + 1];
+    if (tbl && slot >= 0 && slot < ACTOR_SLOTS && actor_name_of(tbl[slot], nm)
+        && strncmp(nm, g_formBase, strlen(g_formBase))) return;
+    *(int32_t*)(uintptr_t)argv = g_formFlag;
+    ff13logv("[FF13-SRP] form pin: btsc%05u mode %d -- the enemy was about to spend mode flag %d, "
+             "the one it rolled; spending %d instead, the one it is being made to take\n",
+             g_formScene, g_formMode, (int)flag, (int)g_formFlag);
+}
+
+// The condition dispatcher's join (0x558031): the hooked instruction is the mov that loads the
+// answer into eax, so writing [esp+0x2C98] here decides the condition. Frame layout and the rules
+// that come with it: ENEMY_AI_FLAGS_RE.md 3.9.
+const uint8_t P_AICOND[7] = {0x8B,0x84,0x24,0x98,0x2C,0x00,0x00};
+
+// The AI state setter, 0x549D40(this, state); state 9 = the action went through.
+#define OFF_ACTOR_ID 0x16C     // the chara's own actor id (0x4ED600 reads it as a signed word)
+const uint8_t P_AISTATE[6] = {0x55,0x8B,0xEC,0x83,0xEC,0x30};
+
+// IsBadReadPtr costs a page probe, and this runs on every condition the battle AI evaluates:
+// measured, it drops frames. Do not put one back.
+static int prb_ptr_ok(uint32_t p) { return p >= 0x10000u && p < 0x7FFF0000u; }
+
+// The one enemy the AI overrule below applies to. The condition kinds are generic -- every sheet
+// spends them on something of its own -- so widening this rewrites AI nobody has looked at.
+static const char g_probeSpec[] = "m097";
+#ifdef FF13_DIAG
+static char g_actLast[ACT_NAME_LEN + 1];   // the ability the AI last named, for the line above
+#endif
+
+// btsc06046's optional extra attack, forced often enough to rehearse. A share of CYCLES is
+// overruled, never a share of rolls: the element change is what a FAILED roll produces, so a roll
+// that cannot fail stops the element cycling altogether. Neither rate is the rate that comes out --
+// a forced decision still dies to a hit before the gauge can pay -- so calibrate by measuring.
+// Values, and what each one cost to find: CODE_NOTES / ENEMY_AI_FLAGS_RE.md 3.9.
+#define EXTRA_FORCE_PCT 25
+// Aim the grant at one of the two rolls: the sheet asks the 30% one first, so answering the first
+// roll yes makes every forced extra the plain attack (measured, 10 of 10).
+#define EXTRA_GRANT_ATTACK_PCT 60
+#define EXTRA_PER_CYCLE_MAX 2
+#define COND_KIND_30 7
+#define COND_KIND_50 5
+// A safety stop, not the design: forcing ends when the extra EXECUTES (on_ai_state). Capping by
+// count instead never lets the gauge pay for one (measured, 0 extras in 4 fights).
+#define EXTRA_FORCE_MAX 12
+#define EXTRA_FORCE_SPEC "m097"
+
+static volatile int g_exDecided = 0;    // this element cycle has had its one draw
+static volatile int g_exForcing = 0;    // ...and the draw said yes
+static volatile int g_exUsed    = 0;    // successes granted so far this cycle
+static volatile int g_exGrant   = 0;    // ...and which roll it grants (COND_KIND_30 / _50)
+static volatile int g_exDone    = 0;    // extras actually executed in this cycle
+
+// Cleared on every element change (see on_ability_label) and at the start of a picked fight.
+void extra_force_reset(void) { g_exDecided = 0; g_exForcing = 0; g_exUsed = 0; g_exDone = 0; }
+
+static unsigned ex_rand(void);
+// An extra went through. Forcing does NOT stop here: counter 4 comes round again inside the same
+// element cycle, and stopping at the first is why second extras never appeared.
+void extra_force_done(void) {
+    if (!g_exForcing) return;
+    // One execution reaches here more than once (the state setter repeats; the low-HP table commits
+    // its pair back to back). Two extras half a second apart cannot be paid for, so it is one.
+    static volatile DWORD s_lastDone = 0;
+    DWORD now = GetTickCount();
+    if (s_lastDone && (now - s_lastDone) < 500) return;
+    s_lastDone = now;
+    g_exUsed = 0;                                     // the next window gets its own grants
+    ++g_exDone;
+#ifdef FF13_DIAG
+    ff13logv("[FF13-SRP] extra: one went through (%d this cycle); forcing %s\n",
+             g_exDone, g_exDone >= EXTRA_PER_CYCLE_MAX ? "stops here" : "stays on for another");
+#endif
+    if (g_exDone >= EXTRA_PER_CYCLE_MAX) { g_exForcing = 0; return; }
+    g_exGrant = ((ex_rand() % 100u) < (unsigned)EXTRA_GRANT_ATTACK_PCT)
+              ? COND_KIND_30 : COND_KIND_50;          // so the pair can be one of each
+}
+
+static unsigned ex_rand(void) {         // xorshift: the game's own RNG is not ours to disturb
+    static unsigned st = 0;
+    if (!st) st = GetTickCount() | 1u;
+    st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+    return st;
+}
+
+void __cdecl on_ai_cond(uint32_t esp) {
+    if (!prb_ptr_ok(esp)) return;
+    uint32_t* f = (uint32_t*)(uintptr_t)esp;
+    uint32_t kind = f[0x2C80 / 4];
+    if (kind != 5 && kind != 7) return;              // only the extra attack's two rolls
+    uint32_t ctx   = f[0x2C84 / 4];
+    uint32_t chara = f[0x2C88 / 4];
+    if (!prb_ptr_ok(ctx) || !prb_ptr_ok(chara)) return;
+    // By NAME, not by the pointer a lookup returned: after an element change the table can answer
+    // with an object that is no longer the one acting.
+    {
+        char nm[SPEC_NAME_LEN + 1];
+        if (!actor_name_of(chara, nm)) return;
+        size_t pl = strlen(g_probeSpec);
+        if (strncmp(nm, g_probeSpec, pl) || (nm[pl] && nm[pl] != '_')) return;
+    }
+    uint32_t w = *(uint32_t*)(uintptr_t)(ctx + 0x5B0);
+    if ((w & 0x7Fu) != 4) return;                   // only the decision that carries the extra
+    int arg = *(int32_t*)(uintptr_t)(ctx + 0x10);
+    if (arg != 50) return;                          // ...and only its two rolls
+
+    // Picked fights only: the story's own fight is not the mod's to change.
+    if (g_bsStarted) {
+        if (!g_exDecided) {
+            g_exDecided = 1;
+            g_exForcing = (ex_rand() % 100u) < (unsigned)EXTRA_FORCE_PCT;
+            g_exGrant = ((ex_rand() % 100u) < (unsigned)EXTRA_GRANT_ATTACK_PCT)
+                      ? COND_KIND_30 : COND_KIND_50;
+        }
+        if (g_exForcing && g_exUsed < EXTRA_FORCE_MAX) {
+            // [esp+0x2C98] is the answer and the hooked instruction is the mov that loads it into
+            // eax, so this lands before anything has read it.
+            if ((int)kind == g_exGrant) {
+                if (!f[0x2C98 / 4]) {
+                    f[0x2C98 / 4] = 1; g_exUsed++;
+#ifdef FF13_DIAG
+                    ff13logv("[FF13-SRP] extra: granted the %s roll (%d already out this cycle)\n",
+                             g_exGrant == COND_KIND_30 ? "attack" : "magic", g_exDone);
+#endif
+                }
+            } else if ((int)kind == COND_KIND_30) {
+                // The sheet only asks the 50% roll after the 30% one has failed, so the cycle's
+                // other draw has to be made to miss.
+                f[0x2C98 / 4] = 0;
+            }
+        }
+    }
+}
+
+// `this` is the AI block and its first field is the actor id. Resolve the chara THROUGH that id,
+// never by name: this enemy renames itself on every element change and its PARTS keep the old name
+// (ENEMY_AI_FLAGS_RE.md 3.10).
+void __cdecl on_ai_state(uint32_t ecx, uint32_t state, uint32_t* pRet, uint32_t* pUp) {
+    (void)pRet; (void)pUp;
+    if (state != 9 || !prb_ptr_ok(ecx)) return;
+    uint32_t* tbl = actor_table();
+    if (!tbl) return;
+    int slot = actor_id_slot(*(int32_t*)(uintptr_t)ecx);
+    if (slot < 0 || slot >= ACTOR_SLOTS) return;
+    uint32_t self = tbl[slot];
+    if (!prb_ptr_ok(self)) return;
+    char nm[SPEC_NAME_LEN + 1];
+    if (!actor_name_of(self, nm)) return;
+    size_t pl = strlen(g_probeSpec);
+    if (strncmp(nm, g_probeSpec, pl) || (nm[pl] && nm[pl] != '_')) return;
+    uint32_t w = *(uint32_t*)(uintptr_t)(self + 0x1370 + 0x5B0);
+#ifdef FF13_DIAG
+    // One line per action: ability, action counter, generic flag array (chara+8). The flags are
+    // the open question -- ENEMY_AI_FLAGS_RE.md 3.8 has been wrong about them twice.
+    ff13logv("[FF13-SRP] m097 acted: %-12s cnt=%u flags=%08X act=%d\n",
+             g_actLast[0] ? g_actLast : "?", w & 0x7Fu,
+             *(uint32_t*)(uintptr_t)(self + 8), *(signed char*)(uintptr_t)(self + 0x265));
+#endif
+    // Do NOT test the counter alone: AFTER_COUNTER_SET_0 has often already put it back to 0 by the
+    // time the state setter runs (half the executions, measured), and the missed half let a forced
+    // cycle run past its cap. An outstanding grant identifies that half -- while one is pending the
+    // enemy is holding the counter-4 decision and can be committing nothing else.
+    unsigned cnt = w & 0x7Fu;
+    if (cnt != 4 && !(cnt == 0 && g_exUsed > 0)) return;
+    if (*(signed char*)(uintptr_t)(self + 0x265) == 19) return;   // broken: a free attack, not this
+    extra_force_done();
+}
+
 void __cdecl on_ability_label(uint32_t ecx, uint32_t label) {
     (void)ecx;
     if (!label) return;
     char cur[ACT_NAME_LEN + 1];
     if (!read_cstr_safe(label, cur, (int)sizeof cur)) return;
+    // An element change ends the cycle, so the forced-extra draw starts again from the next one.
+#ifdef FF13_DIAG
+    if (!strncmp(cur, EXTRA_FORCE_SPEC "_", sizeof(EXTRA_FORCE_SPEC "_") - 1)) {
+        strncpy(g_actLast, cur, ACT_NAME_LEN); g_actLast[ACT_NAME_LEN] = 0;
+    }
+#endif
+    if (!strncmp(cur, EXTRA_FORCE_SPEC "_ac5", sizeof(EXTRA_FORCE_SPEC "_ac5") - 1)) {
+#ifdef FF13_DIAG
+        if (g_exDecided)
+            ff13logv("[FF13-SRP] extra: element change -- the cycle ends with %d\n", g_exDone);
+#endif
+        extra_force_reset();
+    }
     if (!g_formBase[0]) return;
     size_t n = strlen(g_formBase);
     if (strncmp(cur, g_formBase, n) || cur[n] != '_') return;      // some other actor's ability
@@ -1403,6 +1659,7 @@ void __cdecl on_spec_replace(uint32_t ecx, uint32_t name) {
                                 // if the way back ever wedges again)
 volatile int      g_homeHave = 0;    // a spot was taken for this fight
 volatile int      g_homeDue  = 0;    // 1 = waiting for the field, 2 = the worker may warp
+static volatile int g_homeNoWarp = 0;  // ...unless this fight's row asked to be left where it ends
 static volatile DWORD    g_homeAt   = 0;
 static volatile uint32_t g_homeZone = 0;
 float g_homeX = 0, g_homeY = 0, g_homeZ = 0;
@@ -1462,6 +1719,10 @@ static void bs_start_selected(void) {
         return;
     }
     uint32_t want = g_bsList[g_bsSel];
+    // Everything the staging asks for is a call the game itself would only make on a settled field,
+    // so how long the field has been up belongs in a report.
+    ff13logv("[FF13-SRP] battle picker: the loading indicator went down %lums ago\n",
+             g_loadDownAt ? (unsigned long)(GetTickCount() - g_loadDownAt) : 0UL);
     evquiet_lift();                    // a fresh pick never inherits an earlier pick's quiet bit
     zb_remember_sel(field_zone_id(), want, g_bsVar[g_bsSel]);
     // Which form of this fight was picked, if it offers a choice. Armed before anything else so it
@@ -1543,6 +1804,9 @@ static void bs_start_selected(void) {
     g_partyWho = scene_party_who(want, (int*)&g_partyWhoN);
     g_partyDoor = (ar != NULL);
     party_script_run("picked");
+    // A party the MOD set gets the decks the game generates for it; the story's own change ends in
+    // restoreOptimaDeckAll and this one cannot. Only where no table row writes the decks anyway.
+    g_decksRestoreFor = (g_partyWho && g_partyWhoN > 0 && !scene_decks(want, &(int){0})) ? want : 0;
     // An arena fight stages under the blackout cover, so root the party the way the story's own
     // staging does (ucOff) and shut the field menu -- otherwise the party can be walked off the mark
     // in the dark, or the pause menu opened over a party that is being rebuilt. Every picked fight,
@@ -1551,7 +1815,10 @@ static void bs_start_selected(void) {
     ctl_lock();
     g_evNoFightAt = 0; g_evSkipDoor = 0;   // a fresh pick always goes through the door first
     g_bsStarted = want; g_bsStartedAt = GetTickCount(); g_bsInFight = 0; g_bsSawEnemy = 0;
-    g_touchAt = GetTickCount(); g_touchSeq = g_encIdSeq;   // see touch_stall_probe
+    // Field-door picks only: an arena fight is started by the script and builds no encounter from
+    // the touch, so the probe would call every one of them wedged (measured).
+    g_touchAt = ar ? 0 : GetTickCount();
+    g_touchSeq = g_encIdSeq;   // see touch_stall_probe
     // "They saw you coming", if asked for, is held over the whole build rather than written once,
     // because the encounter info is not finished being built when the door returns. Armed here and
     // not with the arena start: the picker's ordinary door is a field touch and never reaches that.
@@ -1590,6 +1857,9 @@ static void bs_start_selected(void) {
             }
         }
     }
+    // ...and which paradigm was in hand, so the field gets it back however the fight ends. The game
+    // does this itself on the ordinary way back, but not for every fight -- see sel_restore_watch.
+    g_selBefore = deck_sel_live();
     tp_sample();               // TP as it stands now: what the fight gets back afterwards
     // ...and what is known about the enemies. Taking no snapshot is what leaves a kept fight's scan
     // alone; any snapshot still pending from an earlier fight is dropped with it, because putting
@@ -1601,6 +1871,10 @@ static void bs_start_selected(void) {
     // back TO, and for a kept one it is what the fight's own gain is measured against.
     libra_sample();
     g_homeHave = 0; g_homeDue = 0; g_homeAt = 0;
+    // Rows that ask for it keep the spot (the mapset and music heals read it) but never warp back:
+    // an arena fight's own end already puts the party somewhere sensible, and the warp from there
+    // was the less stable of the two (measured).
+    g_homeNoWarp = (ar && ar->noHomeWarp) ? 1 : 0;
     if (field_party_pos(&g_homeX, &g_homeY, &g_homeZ)) {
         g_homeZone = field_zone_id();
         g_homeHave = 1;
@@ -1686,6 +1960,7 @@ static void bs_start_selected(void) {
         g_bsTouchPending = touch;                  // bs_pump hands it over once the wait is up
         g_bsTouchDue = 1;
         g_bsTouchAt = GetTickCount() + (DWORD)g_bsPreloadMs;
+        g_bsTouchCap = g_bsPreloadMs; g_bsTouchExtra = 0;
         return;
     }
     load_loose_specs(want, NULL);   // no set was loaded, so everything is missing
@@ -1699,6 +1974,7 @@ static void bs_start_selected(void) {
         g_bsTouchPending = touch;
         g_bsTouchDue = 1;
         g_bsTouchAt = GetTickCount() + (DWORD)g_bsPreloadMs;
+        g_bsTouchCap = g_bsPreloadMs; g_bsTouchExtra = 0;
         return;
     }
     // A fight the story stages goes through the arena door whether or not a character set had to be
@@ -1708,6 +1984,7 @@ static void bs_start_selected(void) {
         g_bsTouchPending = touch;
         g_bsTouchDue = 1;
         g_bsTouchAt = GetTickCount();          // nothing to load: due immediately
+        g_bsTouchCap = 0; g_bsTouchExtra = 0;
         return;
     }
     // Hand the game a pending touch; its own doEncountCheck picks it up next frame and runs the
@@ -1739,6 +2016,8 @@ typedef void (__thiscall *sendTrig_t)(void* zsm, int trigger);
 volatile int   g_trigOk = 0;            // 0x817400 verified present
 static volatile int   g_restartOnArena = 1;    // [battle_swap] arena_restart
 static volatile int   g_ctlGiveBack   = 0;     // this restart owes the leader the field back
+#define CTL_GIVEBACK_RETRY_MS 3000
+static volatile DWORD g_ctlRetryUntil = 0;     // ...and the leader was not in the table yet
 static volatile DWORD g_restartUntil = 0;      // watching until this tick (0 = not watching)
 static volatile int   g_restartLast = -1;      // last state seen, so only changes are logged
 #define RESTART_AFTER_MS 45000
@@ -1769,7 +2048,13 @@ static void restart_after_watch(void) {
         save_mapset_census("back on the field");
         // ...and the same for a lock this mod never took. Only where the mod asked for the restart
         // in the first place, which is the case that has no story left to give control back.
-        if (g_ctlGiveBack) { g_ctlGiveBack = 0; ctl_force_on(); }
+        // A miss is not "nothing to do": the chara table can still be short of the leader this
+        // soon after a restart, and this state edge does not come round a second time. Keep asking
+        // -- the debt is a field the player cannot walk in.
+        if (g_ctlGiveBack) {
+            g_ctlGiveBack = 0;
+            if (!ctl_force_on()) g_ctlRetryUntil = GetTickCount() + CTL_GIVEBACK_RETRY_MS;
+        }
         ff13logv("[FF13-SRP] restarting: back on the field\n");
     }
 }
@@ -1794,6 +2079,21 @@ static volatile DWORD g_goUp = 0;              // when the GAME OVER screen came
 // A chain-marked checkpoint's restart loader loads the FIGHT's mapset, not the field's -- void
 // beyond it, which the story never walks and a picked win does. Watched by state rather than from
 // fight-over: a mid-fight Restart never reaches the fight-over code.
+// The walk is a virtual call per slot, so it is asked five times a second, not per frame.
+static void ctl_giveback_retry(void) {
+    static DWORD next = 0;
+    if (!g_ctlRetryUntil) return;
+    DWORD now = GetTickCount();
+    if ((int)(now - next) < 0) return;
+    next = now + 200;
+    if (ctl_force_on()) { g_ctlRetryUntil = 0; return; }
+    if ((int)(now - g_ctlRetryUntil) >= 0) {
+        g_ctlRetryUntil = 0;
+        ff13logv("[FF13-SRP] battle picker: the leader never turned up in the chara table -- "
+                 "leaving control alone\n");
+    }
+}
+
 static void bg_heal_watch(void) {
     if (!g_homeBg[0]) return;
     if (!g_bsStarted
@@ -1806,9 +2106,14 @@ static void bg_heal_watch(void) {
     g_bgHealLast = st;
     if (st != 3 || was == 3 || was < 0) return;        // only on coming BACK to the field
     if (field_zone_id() != g_homeZone) { g_homeBg[0] = 0; return; }
-    if (!strcmp(g_curBg, g_homeBg)) return;
-    ff13loga("[FF13-SRP] battle picker: the restart left the field on \"%s\" (the fight's own "
-             "mapset) -- asking for \"%s\" back\n", g_curBg, g_homeBg);
+    // The descriptor in force, not the name the game last asked for: an arena fight leaves the
+    // field on the ARENA's mapset without a loadBg of its own, so g_curBg still reads the field's
+    // and the hole in the ground goes unhealed (measured).
+    char now[17];
+    if (!save_current_mapset(now)) return;
+    if (!strcmp(now, g_homeBg)) return;
+    ff13loga("[FF13-SRP] battle picker: the field came back on \"%s\" (the fight's own mapset) -- "
+             "asking for \"%s\" back\n", now, g_homeBg);
     vm_load_bg(g_homeBg);
     // Ours does not update g_curBg (by design); after the heal the field really is on it again.
     strncpy(g_curBg, g_homeBg, sizeof g_curBg - 1);
@@ -2325,17 +2630,53 @@ static volatile int g_placeMatN = 0;
 volatile int g_bossGotMatrix = 0;
 static volatile int g_lightDone = 0;         // ...and the fight has been lit once they exist
 
+#ifdef FF13_DIAG
+// Which early-out turned an actor away: one that never reaches the write below is left on the
+// commit hook's leash, which pins it where it was put -- an enemy that cannot walk.
+static volatile int g_pjLog = 0;
+#define PJ_WHY(why) do { if (g_placeBoss && g_pjLog < 12) { g_pjLog++; \
+        ff13logv("[FF13-SRP] placement join: turned away (%s)\n", (why)); } } while (0)
+#else
+#define PJ_WHY(why) ((void)0)
+#endif
+
 void __cdecl on_place_join(uint32_t esp) {
     if (!g_placeMatrix || !g_placeBoss) return;          // only while we are staging an arena fight
     uintptr_t f = (uintptr_t)esp + PLACE_EBP_OFF;        // = ebp
-    if (IsBadReadPtr((void*)(f - PLACE_THIS_OFF), 4)) return;
+    if (IsBadReadPtr((void*)(f - PLACE_THIS_OFF), 4)) { PJ_WHY("this unreadable"); return; }
     uint32_t self = *(uint32_t*)(f - PLACE_THIS_OFF);
-    if (!self || IsBadReadPtr((void*)(uintptr_t)(self + OFF_ACTOR_NAME), 16)) return;
-    if (IsBadWritePtr((void*)(f - PLACE_OUT_OFF), 0x40)) return;
+    if (!self || IsBadReadPtr((void*)(uintptr_t)(self + OFF_ACTOR_NAME), 16))
+        { PJ_WHY("no name at +0x1A40"); return; }
+    if (IsBadWritePtr((void*)(f - PLACE_OUT_OFF), 0x40)) { PJ_WHY("out not writable"); return; }
     float* out = (float*)(f - PLACE_OUT_OFF);
     // The one the lookup could not answer for. A character always has a place, so this is the
     // enemy the fight never registered.
-    if (out[12] != 0.0f || out[13] != 0.0f || out[14] != 0.0f) return;
+    if (out[12] != 0.0f || out[13] != 0.0f || out[14] != 0.0f) {
+        // The fight placed this enemy itself, so the commit hook's leash must come OFF: it adopts
+        // an actor that shows at the origin for one frame and then drags it back there every frame,
+        // which reads as an enemy that cannot walk (measured). Only the enemies this row names.
+        char n2[20];
+        memcpy(n2, (const void*)(uintptr_t)(self + OFF_ACTOR_NAME), 16); n2[16] = 0;
+        if (g_arena && !g_bossGotMatrix) {
+            for (int i = 0; i < ARENA_ENEMIES; i++) {
+                const char* en = g_arena->en[i].name;
+                if (!en || !en[0]) continue;
+                if (strncmp(n2, en, strlen(en))) continue;
+                g_bossSlotN = 0;              // nothing of ours is held any more
+                g_bossGotMatrix = 1;          // ...and place_boss stands down for this fight
+                ff13logv("[FF13-SRP] battle picker: \"%.16s\" placed itself at %.2f %.2f %.2f -- "
+                         "the hold is off\n", n2, (double)out[12], (double)out[13],
+                         (double)out[14]);
+                break;
+            }
+        }
+#ifdef FF13_DIAG
+        if (g_placeBoss && g_pjLog < 12) { g_pjLog++;
+            ff13logv("[FF13-SRP] placement join: \"%.16s\" already has a place (%.2f %.2f %.2f)\n",
+                     n2, (double)out[12], (double)out[13], (double)out[14]); }
+#endif
+        return;
+    }
     char* bm = g_base ? *(char**)(g_base + RVA_BM_PTR) : NULL;
     if (!bm || IsBadReadPtr(bm + OFF_BM_STAGE, 64)) return;
     const float* st = (const float*)(bm + OFF_BM_STAGE);
@@ -2724,6 +3065,9 @@ const uint8_t P_LOADSHOW[6]  = {0x55,0x8B,0xEC,0x83,0xEC,0x08};
 const uint8_t P_LOADHIDE[10] = {0x55,0x8B,0xEC,0x51,0x8B,0x0D,0x4C,0x6A,0x82,0x02};
 static volatile DWORD g_loadUpAt = 0;
 static volatile int   g_loadUp = 0;
+// ...and when it went down: a pick taken seconds after a load lands while the game's own loader is
+// still finishing (CODE_NOTES).
+static volatile DWORD g_loadDownAt = 0;
 
 void __cdecl on_load_show(uint32_t mode) {
     if (g_loadUp) return;
@@ -2736,6 +3080,7 @@ void __cdecl on_load_hide(uint32_t ecx) {
     (void)ecx;
     if (!g_loadUp) return;
     g_loadUp = 0;
+    g_loadDownAt = GetTickCount();
     ff13logv("[FF13-SRP] loading indicator: down after %lums (zone state %d)\n",
              (unsigned long)(GetTickCount() - g_loadUpAt), field_zone_state());
 }
@@ -2807,8 +3152,19 @@ static void encount_gates(uint32_t* bits, uint32_t* val, int* ok) {
     }
 }
 
+static int async_loader_type(void);
+// What a pick armed for the fight it was about to become. The arming is keyed on the SCENE ID and
+// nothing else, so a pick that never becomes a fight must disarm it here: left standing it fires on
+// that same fight reached in the STORY, hours later.
+static void staging_disarm(void) {
+    g_decksRestoreFor = 0;
+    g_decksWantFor = 0; g_decksWantN = 0; g_decksWant = NULL;
+    g_decksAgainAt = 0;
+}
+
 static void touch_stall_probe(DWORD now) {
     if (!g_touchAt) return;
+    if (overlay_in_battle()) { g_touchAt = 0; return; }   // a fight is up; nothing stalled
     if (g_encIdSeq != g_touchSeq) { g_touchAt = 0; return; }   // it built one; nothing to explain
     if ((int)(now - (g_touchAt + TOUCH_STALL_MS)) < 0) return;
     g_touchAt = 0;
@@ -2819,21 +3175,21 @@ static void touch_stall_probe(DWORD now) {
              TOUCH_STALL_MS, bits, (bits & 0x02) ? "set" : "CLEAR -> refused",
              (bits & 0x40) ? "set" : "CLEAR -> refused", ok ? "" : "unreadable, last ", val,
              (ok && val) ? " -> refused" : "");
-    // A nonzero [+0x234] is momentary in ordinary play (it flickers several times a second), so one
-    // that has outlasted the whole stall window is wedged -- measured after winning btsc04026,
-    // whose STORY continues into a second fight: the interrupted follow-up staging left the slot
-    // set, and the game then threw every later touch away (picked or walked into alike). Fold the
-    // staging and give the field back promptly instead of holding the lock for the long give-up.
-    // Do NOT write 0 into the slot: measured, that un-wedges the touch gate while the staging
-    // behind it stays inconsistent, and the re-accepted touch then hangs the zone in state 5.
+    // A nonzero [+0x234] flickers several times a second in ordinary play, so one that outlasts the
+    // whole stall window is wedged. Only a frozen AsyncLoader ever produced that (cs_restore_watch
+    // prevents it), so this is a last-resort net: fold the staging and give the field back rather
+    // than hold the lock for the long give-up.
+    // Do NOT write 0 into the slot: measured, that un-wedges the touch gate over an inconsistent
+    // staging and the re-accepted touch hangs the zone in state 5.
     if (ok && val && g_bsStarted) {
         cam_disarm();
         flash_say(ui_text(T_PICK_NEVER_STARTED));
-        ff13loga("[FF13-SRP] battle picker: the pending-touch slot is wedged (a won fight whose "
-                 "story continues?) -- giving the field back; reload the save if fights stay "
-                 "unstartable\n");
+        ff13loga("[FF13-SRP] battle picker: the pending-touch slot is wedged (loader frozen? "
+                 "type %d) -- giving the field back; reload the save if fights stay "
+                 "unstartable\n", async_loader_type());
         g_bsStarted = 0;
         g_csRestore[0] = 0;
+        staging_disarm();
         g_swapEnabled = 0; g_swapBtscId = 0;   // a re-touch must not half-start the picked fight
         ctl_unlock();
         evquiet_lift();
@@ -2868,6 +3224,167 @@ void __cdecl on_encount_refused(uint32_t ecx) {
     ff13logv("[FF13-SRP] encounters: the game threw a touch away -- bit1 %s, bit6 %s, [+0x234] %s%08X"
              " (needs 0)%s\n", (bits & 0x02) ? "on" : "OFF", (bits & 0x40) ? "on" : "OFF",
              ok ? "= " : "UNREADABLE ", val, g_bsStarted ? "  (a picked fight is staging)" : "");
+}
+
+// The AsyncLoader's current-command type, the byte the game's own query at 0x446620 returns:
+// 0 = its worker thread is idle, 5 = a chara/model load, 7 = a character-set load, -1 = unreadable.
+// [[0x27FCE04]+8] is the loader the chara commands go to (read out of loadCharaByCharaSet,
+// 0xBDE930). Raw read, no locks: a torn value costs one frame of a wrong answer.
+#define RVA_ASYNC_LOADER 0x23FCE04
+static int async_loader_type(void) {
+    uintptr_t lp = g_base + RVA_ASYNC_LOADER;
+    if (IsBadReadPtr((void*)lp, 4)) return -1;
+    uint32_t reg = *(uint32_t*)lp;
+    if (!reg || IsBadReadPtr((void*)(uintptr_t)(reg + 8), 4)) return -1;
+    uint32_t ldr = *(uint32_t*)(uintptr_t)(reg + 8);
+    if (!ldr || IsBadReadPtr((void*)(uintptr_t)(ldr + 0x18), 1)) return -1;
+    return *(uint8_t*)(uintptr_t)(ldr + 0x18);
+}
+
+// The paradigm the pick was made in, put back on the field -- the game does it itself for some
+// fights and deliberately not for others (CODE_NOTES). Only ever the DECK IN HAND is written, never
+// the decks themselves. Must wait for the field to settle: the game's own restore lands at
+// fight-over and the field's init writes after it, and writing into that leaves the menu showing
+// one paradigm and the party fighting in another.
+#define SEL_RESTORE_SETTLE_MS 1200
+static void sel_restore_watch(DWORD now) {
+    if (!g_selRestoreDue) return;
+    if (g_bsStarted || g_bsTouchDue || overlay_in_battle()) return;   // another fight owns it
+    if (field_zone_state() != 3) { g_selRestoreFrom = now; return; }  // the field is not back yet
+    if ((int)(now - (g_selRestoreFrom + SEL_RESTORE_SETTLE_MS)) < 0) return;
+    g_selRestoreDue = 0;
+    int cur = deck_sel_live();
+    if (g_selBefore < 0 || cur < 0) return;              // nothing was in hand; nothing to put back
+    if (cur == g_selBefore) {
+        ff13logv("[FF13-SRP] battle picker: paradigm %d is still the one in hand -- left alone\n",
+                 cur);
+        return;
+    }
+    vm_set_optima_deck(g_selBefore);
+    ff13log("[FF13-SRP] battle picker: paradigm back to %d (the fight ended on %d)\n",
+             g_selBefore, cur);
+}
+
+// The deferred half of the fight-over character-set restore. A chrset command sent while the
+// battle's own loads are still draining freezes the AsyncLoader thread for the rest of the session,
+// and the end-of-encounter work behind it never runs: the party cannot walk and every later touch
+// is refused until a full reload (btsc04026, measured -- CODE_NOTES). So it goes back only with the
+// field up and the loader idle. The cap is for an idle that never comes on a busy field.
+#define CS_RESTORE_SETTLE_MS 800
+#define CS_RESTORE_CAP_MS  15000
+#define CS_RESTORE_RETRY_MS 30000   // how long a short fight's set stays loaded for the retry
+static void cs_restore_watch(DWORD now) {
+    if (!g_csRestorePend[0]) return;
+    if (g_bsStarted || g_bsTouchDue) { g_csRestoreStable = 0; return; }   // a pick is live: hold
+    // Timed from the FIELD coming back, not the win: the result screens sit between the two and
+    // their time is not the player's.
+    if (g_csRestoreHold) {
+        if (field_zone_state() != 3) return;
+        g_csRestoreHold = 0;
+        g_csRestoreEarliest = now + CS_RESTORE_RETRY_MS;
+    }
+    if ((int)(now - g_csRestoreEarliest) < 0) return;
+    // On the field or not at all, cap or no cap: what the cap gives up on is the LOADER going idle.
+    // A chrset sent into a fight is the thing this watch exists to prevent.
+    if (field_zone_state() != 3) { g_csRestoreStable = 0; return; }
+    // ...and in the zone it was the set OF: the hold is long enough to walk out of the zone or to
+    // load another save, and sending it then replaces the models the field actually has.
+    uint32_t zoneNow = field_zone_id();
+    if (g_csRestoreZone != (uint32_t)-1 && zoneNow != (uint32_t)-1 && zoneNow != g_csRestoreZone) {
+        ff13log("[FF13-SRP] battle picker: \"%s\" is not this zone's set any more -- dropped "
+                 "instead of loaded\n", g_csRestorePend);
+        g_csRestorePend[0] = 0;
+        g_csLoaded[0] = 0;
+        g_looseLoaded = 0;
+        return;
+    }
+    if ((int)(now - (g_csRestoreEarliest + CS_RESTORE_CAP_MS)) < 0) {
+        if (async_loader_type() != 0) { g_csRestoreStable = 0; return; }
+        if (!g_csRestoreStable) { g_csRestoreStable = now + CS_RESTORE_SETTLE_MS; return; }
+        if ((int)(now - g_csRestoreStable) < 0) return;
+    } else {
+        ff13loga("[FF13-SRP] battle picker: the loader never went idle in %dms -- sending \"%s\" "
+                 "back anyway\n", CS_RESTORE_CAP_MS, g_csRestorePend);
+    }
+    ff13log("[FF13-SRP] battle picker: character set back to \"%s\" (loader idle, %lums after "
+             "the fight)\n", g_csRestorePend, (unsigned long)(now - g_csRestoreFrom));
+    vm_load_charaset(g_csRestorePend);
+    g_csRestorePend[0] = 0;
+    // Only now is the fight's set really gone; while the restore was pending a retry could still
+    // find it loaded and skip the reload (and the race that comes with one).
+    g_csLoaded[0] = 0;
+    g_looseLoaded = 0;
+}
+
+#ifdef FF13_DIAG
+// Every-frame transition trace of the encounter-info slots doEncountCheck gates on: +0x234 is the
+// third refusal, +0x238/+0x23C ride along (the battle-over worker writes +0x23C, the class ctor
+// primes all three). Below it, which paradigm is in hand, sampled per frame so the moment it moves
+// is on the record.
+static void deck_sel_watch(void) {
+    static int last = -2;
+    int sel = deck_sel_live();
+    if (sel == last) return;
+    ff13loga("[FF13-SRP] DIAG deck sel: %d -> %d (zone state %d, %s, t=%lu)\n", last, sel,
+             field_zone_state(), overlay_in_battle() ? "in battle" : "field",
+             (unsigned long)GetTickCount());
+    last = sel;
+}
+
+static void enc_slots_watch(void) {
+    static uint32_t lastA = 0xDEADBEEF, lastB = 0, lastC = 0, lastBits = 0;
+    uintptr_t s = g_base + RVA_ENCGATE3;
+    if (IsBadReadPtr((void*)s, 4)) return;
+    uint32_t scene = *(uint32_t*)s;
+    if (!scene || IsBadReadPtr((void*)(uintptr_t)(scene + 0x36C), 4)) return;
+    uint32_t sub = *(uint32_t*)(uintptr_t)(scene + 0x36C);
+    if (!sub || IsBadReadPtr((void*)(uintptr_t)(sub + 0x234), 12)) return;
+    uint32_t a = *(uint32_t*)(uintptr_t)(sub + 0x234);
+    uint32_t b = *(uint32_t*)(uintptr_t)(sub + 0x238);
+    uint32_t c = *(uint32_t*)(uintptr_t)(sub + 0x23C);
+    uint32_t bits = 0;
+    uintptr_t f = g_base + RVA_FIELDMGR;
+    if (!IsBadReadPtr((void*)f, 4)) {
+        uint32_t mgr = *(uint32_t*)f;
+        if (mgr && !IsBadReadPtr((void*)(uintptr_t)(mgr + OFF_FIELD_BITS), 4))
+            bits = *(uint32_t*)(uintptr_t)(mgr + OFF_FIELD_BITS);
+    }
+    int ltype = async_loader_type();
+    static int lastL = -2;
+    if (a == lastA && b == lastB && c == lastC && bits == lastBits && ltype == lastL) return;
+    ff13loga("[FF13-SRP] DIAG encslots: +234=%08X +238=%08X +23C=%08X bits=%08X ldr=%d (zone state "
+             "%d, t=%lu)\n", a, b, c, bits, ltype, field_zone_state(), (unsigned long)GetTickCount());
+    lastA = a; lastB = b; lastC = c; lastBits = bits; lastL = ltype;
+}
+#endif
+
+// ---- a pause menu that will not close --------------------------------------------------------
+// A WITNESS, not a fix: a pause that will not close on START is reported but has never reproduced
+// here, so this prints what could be holding it, once per episode (CODE_NOTES). 21..32 is every
+// pause the state machine has -- EVENT_ON_FIELD/BATTLE, FIELD and BATTLE, each with its PAUSE /
+// PAUSE_WAIT / PAUSE_END_WAIT -- and 75/76 lead out of one into a restart or a reset. The reported
+// case was a BATTLE pause, so watching the field's alone is not enough.
+#define PAUSE_STUCK_MS 45000
+static int zone_state_is_pause(int st) {
+    return (st >= 21 && st <= 32) || st == 75 || st == 76;
+}
+static void pause_stuck_watch(DWORD now) {
+    static DWORD since = 0;
+    static int said = 0;
+    int st = field_zone_state();
+    if (!zone_state_is_pause(st)) { since = 0; said = 0; return; }
+    if (!since) { since = now; return; }
+    if (said || (int)(now - (since + PAUSE_STUCK_MS)) < 0) return;
+    said = 1;
+    int gate = di_gate_left_ms();
+    ff13loga("[FF13-SRP] the pause menu has been up %lums (%s) -- input gate %s, "
+             "loader %d, field top menu %d, picker lock %d, pick %u, charaset restore %s, "
+             "paradigm restore %s\n",
+             (unsigned long)(now - since), zone_state_name(st),
+             gate < 0 ? "off" : "ON (a pick is holding input)", async_loader_type(),
+             vm_top_menu_get(), g_ctlLocked, g_bsStarted,
+             g_csRestorePend[0] ? g_csRestorePend : "none",
+             g_selRestoreDue ? "pending" : "none");
 }
 
 #define ZTRACE_MS 30000            // how long after a picked fight to keep watching
@@ -3151,6 +3668,9 @@ static void pump_event_door(DWORD now) {
                          (unsigned)g_warpMoved, (unsigned)g_warpSkip);
             }
         }
+        // The chain's cutscene must accept the skip buttons, so the input gate lifts here. The
+        // party stays pinned and the menu stays shut until the battle is up.
+        di_gate_lift();
         // Armed just before the event, so the chain's own first native call spends it. The window
         // is the give-up cap: past that there is no chain left to be inside of.
         if (e->evSetup) {
@@ -3195,6 +3715,13 @@ static void pump_decks(DWORD now) {
         g_decksAgainAt = now + 1200;      // ...and once more, in case something writes after this
         g_decksWantFor = 0;
         optima_log("paradigms set for this fight");
+    } else if (g_decksRestoreFor && g_btlScene == g_decksRestoreFor) {
+        g_decksRestoreFor = 0;
+        // The decks themselves are left ALONE: what the game generates for the new pair is what the
+        // story fight has (measured -- CODE_NOTES). Only the one in hand is set.
+        ff13log("[FF13-SRP] battle picker: this fight's party was set by the picker -- opening on "
+                 "the first paradigm\n");
+        vm_set_optima_deck(0);
     } else if (g_decksAgainAt && (int)(now - g_decksAgainAt) >= 0) {
         g_decksAgainAt = 0;
         if (g_decksWantN && g_btlScene) {
@@ -3247,6 +3774,7 @@ static void pump_event_giveup(DWORD now) {
         snprintf(g_swapNameBuf, sizeof g_swapNameBuf, "btsc%05u", g_bsStarted);
         g_bsTouchPending = g_evTouch;
         g_bsTouchAt = now;                   // the models were waited for on the first pass
+        g_bsTouchCap = 0; g_bsTouchExtra = 0;
         g_bsTouchDue = 1;
         ff13logv("[FF13-SRP] battle picker: the chain is done -- starting btsc%05u the ordinary "
                  "way, with the party and paradigms it left behind\n", g_bsStarted);
@@ -3298,8 +3826,8 @@ static void pump_holds(DWORD now) {
             float px = 0, py = 0, pz = 0;
             int have = field_party_pos(&px, &py, &pz);
             ff13logv("[FF13-SRP] under the cover: leader \"%s\", party at %s(%.2f %.2f %.2f), "
-                     "locked=%d/%d\n", leader_name(who) ? who : "?", have ? "" : "?",
-                     (double)px, (double)py, (double)pz, g_ctlLocked, g_ctlN);
+                     "locked=%d\n", leader_name(who) ? who : "?", have ? "" : "?",
+                     (double)px, (double)py, (double)pz, g_ctlLocked);
         }
     }
 #endif
@@ -3318,6 +3846,7 @@ static void pump_holds(DWORD now) {
     encinfo_tweak();
     restart_watch();
     restart_after_watch();
+    ctl_giveback_retry();
     bg_heal_watch();
     bgm_heal_watch();
     rpflag_watch();
@@ -3356,6 +3885,9 @@ static void pump_scene_light(DWORD now) {
                  ARENA_GATHER_MS, g_bsStarted, a->arena, a->flags);
         field_camera_recenter();
         g_bossSlotN = 0; g_placeLogged = 0; g_stageLogged = 0;
+#ifdef FF13_DIAG
+        g_pjLog = 0;
+#endif
         g_bossGotMatrix = 0; g_placeMatN = 0;
         for (int i = 0; i < ARENA_ENEMIES; i++) g_enUsed[i] = 0;   // this fight claims them afresh
         g_lightDone = 0;
@@ -3605,14 +4137,25 @@ static int pump_touch_due(DWORD now) {
         }
         if (ready == 0) g_bsProbeMoved = 1;            // it has been seen saying no: it is real
         if (ready != 1 && !timeUp) return 1;             // still loading, or cannot tell -- wait
+        if (g_bsTouchCap && ready == 0 && g_bsTouchExtra < BS_PRELOAD_EXTRA_MAX_MS) {
+            // ready==0 is always a trusted no: an untrusted yes was coerced to -1 above.
+            if (!g_bsTouchExtra)
+                ff13logv("[FF13-SRP] battle picker: \"%s\" still loading at the %dms cap -- "
+                         "waiting up to %dms more\n", missing ? missing : "?", g_bsTouchCap,
+                         BS_PRELOAD_EXTRA_MAX_MS);
+            g_bsTouchExtra += BS_PRELOAD_STEP_MS;
+            g_bsTouchAt = now + BS_PRELOAD_STEP_MS;
+            g_bsStartedAt += BS_PRELOAD_STEP_MS;   // the give-up clock times the fight, not the wait
+            return 1;
+        }
         if (ready == 1 && !g_bsTouchReady) {
             g_bsTouchReady = 1;
-            ff13logv("[FF13-SRP] battle picker: models resident after %ums\n",
-                     (unsigned)(now - (g_bsTouchAt - (DWORD)g_bsPreloadMs)));
+            ff13logv("[FF13-SRP] battle picker: models resident after %dms\n",
+                     g_bsTouchCap + g_bsTouchExtra - (int)(g_bsTouchAt - now));
         }
         if (ready == 0)
             ff13logv("[FF13-SRP] battle picker: \"%s\" still not resident after %dms -- starting "
-                     "anyway\n", missing ? missing : "?", g_bsPreloadMs);
+                     "anyway\n", missing ? missing : "?", g_bsTouchCap + g_bsTouchExtra);
         loose_specs_report();     // the hand-fetched ones, now that the waiting is over
         uint32_t touch = g_bsTouchPending;
         g_bsTouchDue = 0;
@@ -3815,23 +4358,13 @@ static void pump_battle_report(DWORD now) {
         // What this fight is ACTUALLY playing, asked of the manager rather than watched for: a fight
         // that inherits its music from the cutscene that starts it calls nothing, so there is no
         // event to catch. Skipped while we are substituting the music ourselves -- that would only
-        // read back our own choice. Only boss/event/story fights are remembered.
+        // read back our own choice. Logged, nothing more.
         {
             char cur[BGM_NAME_MAX + 1];
-            const ff13_btsc_info* bi = btsc_info(scene);
-            int worth = (bi && (bi->kind & (FF13_BTSC_BOSS | FF13_BTSC_EVENT))) || is_boss_scene(scene);
-            // ...but never from a fight the game itself started for us. An event door hands the
-            // story its chain back when the fight ends, and the chain plays its own music -- so
-            // what is running by the time this asks is the next thing, not this fight's.
-            {
-                const struct ff13_arena_s* ea = scene_arena(scene);
-                if (ea && ea->ev[0]) worth = 0;
-            }
             if (!g_bgmWant[0] && bgm_current(cur) && cur[0]) {
                 ff13logv("[FF13-SRP] btsc%05u battle music: \"%.16s\"%s\n", scene, cur,
                          bgm_is_battle_track(cur)
                          ? "" : "  (not a battle arrangement -- carried in from a cutscene?)");
-                if (worth) bgm_learn(scene, cur);
             }
         }
         // The table did not expect this to work here and it did: the model was resident by some
@@ -3871,6 +4404,7 @@ static void pump_battle_live(DWORD now) {
             if (!g_bsSawEnemy && !g_iwHitThisFight && !field_rec(g_bsStarted, NULL, NULL))
                 mark_empty_scene(g_bsStarted);
             g_bsStarted = 0; g_bsInFight = 0; g_bsSawEnemy = 0;
+            aipin_battle_over();
 #ifdef FF13_DIAG
             // Read here as well as after the way back: this is the last moment before the restart,
             // so a scan that is present now and gone later was taken by the restart, not by us.
@@ -3878,7 +4412,7 @@ static void pump_battle_live(DWORD now) {
 #endif
             // ...which is exactly why a kept fight's scan is read HERE and written again later.
             if (libra_keeps(fought)) libra_keep_take(fought);
-            if (g_homeHave) { g_homeDue = 1; g_homeAt = 0; }   // and the same for where you stood
+            if (g_homeHave && !g_homeNoWarp) { g_homeDue = 1; g_homeAt = 0; }   // same for where you stood
             // Put an evNoFight gate's flag back BEFORE the restart reloads: the field init that
             // runs during it reads the flag, and the gate value stages the fight's own tableau.
             if (g_evFlagRestore) {
@@ -3967,6 +4501,7 @@ static void pump_battle_live(DWORD now) {
             // leaving it loaded is how you get a field with holes in it.
             // Deliberately not an automatic retry: a battle restarting by itself reads as a bug to
             // anyone who does not know why.
+            int wasShort = g_btlShort;   // ...and a short fight HOLDS the set (see the arming below)
             if (g_btlShort) {
                 g_btlShort = 0;
                 ff13logv("[FF13-SRP] battle picker: btsc%05u came up short -- pick it again to "
@@ -3982,27 +4517,43 @@ static void pump_battle_live(DWORD now) {
             // Everything below runs on the frame tick, so a call that blocks blocks here and nowhere
             // else -- which is why the tidy-up is timed. The trip back sits in STATE_ENCOUNT_BACK
             // for three to four seconds and how much of that is ours is not yet settled.
-            DWORD tidyAt = GetTickCount(), csMs = 0, bgmMs = 0;
+            DWORD tidyAt = GetTickCount(), bgmMs = 0;
+            // Whatever paradigm this fight ended on, the field gets the pick's own back.
+            g_selRestoreDue = (g_selBefore >= 0);
+            g_selRestoreFrom = tidyAt;
+            // NOT issued here: a chrset sent while the encounter is still concluding freezes the
+            // AsyncLoader for the session. cs_restore_watch sends it once the field is back.
             if (g_csRestore[0]) {
-                ff13log("[FF13-SRP] battle picker: fight over -> character set back to \"%s\"\n",
-                         g_csRestore);
-                DWORD at = GetTickCount();
-                vm_load_charaset(g_csRestore);
-                csMs += GetTickCount() - at;
+                strncpy(g_csRestorePend, g_csRestore, sizeof g_csRestorePend - 1);
+                g_csRestorePend[sizeof g_csRestorePend - 1] = 0;
                 g_csRestore[0] = 0;
-                g_csLoaded[0] = 0;
-                g_looseLoaded = 0;         // the set replaces what was loaded, loose ones included
+                g_csRestoreFrom = GetTickCount();
+                g_csRestoreZone = field_zone_id();
+                g_csRestoreStable = 0;
+                // A short fight holds its set: "pick it again -- the models are loaded now" is only
+                // true while they are, and a retry that finds them loaded has no load to race.
+                // g_csLoaded stays set for the same reason; the watch clears it when it fires.
+                g_csRestoreEarliest = g_csRestoreFrom;
+                g_csRestoreHold = wasShort;
+                ff13log("[FF13-SRP] battle picker: fight over -> \"%s\" goes back once the field "
+                         "has settled%s\n", g_csRestorePend,
+                         wasShort ? " (held while a retry can still use this fight's set)" : "");
             } else if (g_looseLoaded && g_curCharset[0]) {
                 // A fight whose enemies came one at a time rather than as a set had nothing to put
                 // back, so those models simply stayed loaded -- in the one zone that streams its
                 // ground a cell at a time and has the least room to spare. Loading the field's own
                 // set again takes them out, since a set replaces what is resident.
-                ff13log("[FF13-SRP] battle picker: fight over -> reloading \"%s\" to take out the "
-                         "models this fight asked for one at a time\n", g_curCharset);
-                DWORD at = GetTickCount();
-                vm_load_charaset(g_curCharset);
-                csMs += GetTickCount() - at;
-                g_looseLoaded = 0;
+                strncpy(g_csRestorePend, g_curCharset, sizeof g_csRestorePend - 1);
+                g_csRestorePend[sizeof g_csRestorePend - 1] = 0;
+                g_csRestoreFrom = GetTickCount();
+                g_csRestoreZone = field_zone_id();
+                g_csRestoreStable = 0;
+                g_csRestoreEarliest = g_csRestoreFrom;
+                g_csRestoreHold = wasShort;
+                ff13log("[FF13-SRP] battle picker: fight over -> \"%s\" will be reloaded once the "
+                         "field has settled, to take out the models this fight asked for one at a "
+                         "time%s\n", g_csRestorePend,
+                         wasShort ? " (held while a retry can still use them)" : "");
             }
             // A held track must not outlive the fight it was held for -- one-hit-kill ends fights
             // well inside the hold. The field's music has to be asked for here: the hold took it
@@ -4040,20 +4591,22 @@ static void pump_battle_live(DWORD now) {
                 DWORD tidyMs = GetTickCount() - tidyAt;
                 if (tidyMs >= 32)
                     ff13log("[FF13-SRP] battle picker: fight over -> the tidy-up held the frame for "
-                             "%lums (character set %lums, music %lums)\n",
-                             (unsigned long)tidyMs, (unsigned long)csMs, (unsigned long)bgmMs);
+                             "%lums (music %lums)\n",
+                             (unsigned long)tidyMs, (unsigned long)bgmMs);
             }
         } else if (GetTickCount() - g_bsStartedAt > BS_GIVEUP_MS) {
             // A pick that never becomes a fight leaves the event lock on, and the event lock is what
             // makes the party unable to walk -- so this is the way out of being stuck, not a
-            // tidy-up. The staging waits are 8s at the outside, so a fight that has not started in
-            // twenty is not coming.
+            // tidy-up. A slow-disk extension is added to this clock as it is granted, so what is
+            // timed here is always the same window: the fight coming up AFTER the staging.
             cam_disarm();
             ff13logv("[FF13-SRP] battle picker: btsc%05u never became a fight in %dms -- giving the "
                      "field back\n", g_bsStarted, BS_GIVEUP_MS);
             flash_say(ui_text(T_PICK_NEVER_STARTED));
             g_bsStarted = 0;                   // never got into a fight; forget it
+            aipin_battle_over();
             g_csRestore[0] = 0;
+            staging_disarm();
             ctl_unlock();
             evquiet_lift();
         }
@@ -4065,6 +4618,11 @@ static void pump_battle_live(DWORD now) {
 // chocobo counts; the leader read costs a party-manager lock, so it is only asked while the list is
 // actually up.
 static void pump_picker_input(void) {
+    if (g_bsRememberDue) {
+        g_bsRememberDue = 0;
+        if (g_bsCount > 0 && g_bsSel >= 0 && g_bsSel < g_bsCount)
+            zb_remember_sel(field_zone_id(), g_bsList[g_bsSel], g_bsVar[g_bsSel]);
+    }
     if (g_bsOpen && (field_zone_state() != 3 || riding_chocobo())) {
         if (g_bsCount > 0 && g_bsSel >= 0 && g_bsSel < g_bsCount)
             zb_remember_sel(field_zone_id(), g_bsList[g_bsSel], g_bsVar[g_bsSel]);
@@ -4128,6 +4686,9 @@ void bs_pump(void) {
     // pump runs again. See frame_gap_watch.
     frame_gap_watch(now);
     touch_stall_probe(now);
+    cs_restore_watch(now);
+    sel_restore_watch(now);
+    pause_stuck_watch(now);
     preempt_probe(overlay_in_battle(), g_bsStarted);
     pump_zone_bgm(now);
     pump_event_door(now);
@@ -4139,6 +4700,8 @@ void bs_pump(void) {
     pump_cover_lapse(now);
 #ifdef FF13_DIAG
     form_watch();                      // ahead of the early return: a fight outlives the load
+    enc_slots_watch();
+    deck_sel_watch();
 #endif
     if (pump_touch_due(now)) return;   // still loading the pick -- the steps below would read half of it
     pump_battle_report(now);

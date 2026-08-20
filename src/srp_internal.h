@@ -99,7 +99,6 @@ int hk_edge(UINT b, int* was);
 #define RVA_TARGETHP_PTR 0x24337B4
 #define OFF_TARGETHP     0xBEC
 #define BGM_NAME_MAX  16
-#define BGMMAP_MAX 48
 #define BGM_HOLD_MAX_MS     8000
 #define OFF_TOUCHED_ID 0x14648                    // [fieldMgr+0x14648] = pending touched object id
 #define RVA_ENCSCENE 0x75032D        // VA 0xB5032D `mov [ecx+0x354],eax`
@@ -139,7 +138,7 @@ int hk_edge(UINT b, int* was);
 #define ARENA_GATHER_MS 400
 #define ARENA_SETTLE_MS 1500
 #define ARENA_DERIVED_MS 6000
-#define OPTIMA_LOG_MAX 60
+#define OPTIMA_LOG_MAX 400   // a story run to a fight can pass several party changes
 #define LIGHT_MAP   1
 #define LIGHT_CHARA 2
 #define LIGHT_EASE_MS 1300
@@ -164,6 +163,7 @@ int hk_edge(UINT b, int* was);
 #define RVA_ENCF4      0x7505B6        // VA 0xB505B6
 #define RVA_RESOLVETGT 0x158E80      // VA 0x558E80
 #define RVA_ABILLABEL 0x943B0        // VA 0x4943B0
+#define RVA_AIAFTER   0x7C3300       // VA 0xBC3300 Battle.apiAiPushEnemyAfterExecArgs
 // Refuse a warp home longer than this. The streaming budget measures ~390 units; a trip that
 // overruns it strands the party on unstreamed ground, in a load the game never comes out of.
 // 350 leaves margin on a figure that was measured rather than documented.
@@ -196,7 +196,6 @@ int hk_edge(UINT b, int* was);
 #define OVL_FLASH_OFF  0xFFA3A8A8   // status flash   : something switched off
 
 // ---- shared types ----
-struct ff13_bgm_pair { uint32_t btsc; char track[BGM_NAME_MAX + 1]; };
 typedef struct { const char* name; float x, y, z; } ff13_enemy;
 typedef struct ff13_arena_s { uint16_t btsc; const char* arena; uint32_t flags;
                  float ex, ey, ez;      // the enemy, as an offset on the stage
@@ -259,10 +258,14 @@ typedef struct ff13_arena_s { uint16_t btsc; const char* arena; uint32_t flags;
                                                    // converted end reloads OUTSIDE a chain that
                                                    // marked its checkpoint inside itself (NULL =
                                                    // leave the checkpoint alone)
-                 const char* evRpFlag; }           // the event flag this fight's RESTART LOADER
+                 const char* evRpFlag;             // the event flag this fight's RESTART LOADER
                                                    // raises; taken down at the pick and after the
                                                    // way back, or the chain opens its preparation
                                                    // menu on every pick
+                 int noHomeWarp; }                 // 1 = leave the party where the fight's own end
+                                                   // puts them (the spot is still recorded). LAST
+                                                   // on purpose: rows initialise positionally, so
+                                                   // a field inserted above silently shifts them
         ff13_arena;
 
 // ---- diagnostic probes (release builds get the no-ops) ----
@@ -291,6 +294,8 @@ extern volatile int g_hkFocusOnly;
 extern volatile int g_killMode;
 extern volatile unsigned char g_battleOverlay;
 extern int  g_logLevel;
+void crash_report_install(void);
+void crash_report_rearm(void);
 extern int    g_gsStepN;
 extern volatile int g_gsStep;
 extern volatile unsigned char g_gsEnabled;
@@ -345,8 +350,6 @@ extern char g_swapNameBuf[32];
 extern volatile uint32_t g_swapBtscId;
 extern volatile unsigned char g_swapEnabled;
 extern volatile DWORD g_swapWindowUntil;
-extern struct ff13_bgm_pair g_bgmMap[BGMMAP_MAX];
-extern volatile int      g_bgmMapN;
 extern char g_zoneField[BGM_NAME_MAX + 1];
 extern char g_bgmWant[BGM_NAME_MAX + 1];
 extern volatile DWORD g_bgmWantUntil;
@@ -360,7 +363,6 @@ extern volatile DWORD g_bgmWatchUntil;
 extern char g_bgmWatchLast[BGM_NAME_MAX + 1];
 int bgm_is_battle_track(const char* n);
 int bgm_is_outcome_track(const char* n);
-void bgm_learn(uint32_t btsc, const char* track);
 extern volatile uint32_t g_lastBtscId;
 extern volatile uint32_t g_lastTouchedId;
 extern volatile uint32_t g_fieldMgr;
@@ -418,6 +420,9 @@ uint32_t party_state_key(void);
 int party_battle_ids(int out[3]);
 int decks_read_live(signed char out[][3], int maxn);
 int deck_sel_live(void);
+void vm_set_optima_deck(int deck);
+int  vm_top_menu_get(void);
+const char* zone_state_name(int st);
 int scene_win_at_checkpoint(uint32_t btsc);
 const signed char (*scene_decks(uint32_t btsc, int* n))[3];
 extern const uint8_t P_OPTREG[6];
@@ -451,11 +456,14 @@ void __cdecl on_start_cinema(uint32_t vmctx);
 void vm_sync_wait(void);
 int leader_name(char out[20]);
 int riding_chocobo(void);
-extern volatile int g_ctlN;
 extern volatile int g_ctlLocked;
 void ctl_lock(void);
 void ctl_hold(void);
-void ctl_force_on(void);
+// srp_proxy.c -- input silenced at the DirectInput proxy while a pick is being staged
+void di_gate_arm(void);
+int  di_gate_left_ms(void);
+void di_gate_lift(void);
+int  ctl_force_on(void);
 void ctl_unlock(void);
 void vm_start_battle(const char* arena, uint32_t flags, uint32_t btsc);
 int chara_id_of(const char* nm);
@@ -587,7 +595,6 @@ void bgm_zone_refresh(void);
 const char* bgm_pick_track(uint32_t btsc, const char** origin);
 void __cdecl on_bgm_play(uint32_t ecx, uint32_t retAddr, uint32_t* pName, uint32_t* unused);
 void __cdecl on_bgm_lazyplay(uint32_t ecx, uint32_t retAddr, uint32_t* pName, uint32_t* pFade);
-void bgm_learn_tick(DWORD now);
 void* install_encscene_cave(uintptr_t hookAddr, void* handler);
 
 // ---- battle picker, kill mode and the game-over path (srp_picker.c) ----
@@ -605,6 +612,7 @@ void zb_load(void);
 void zb_learn(uint32_t zone, uint32_t band, uint32_t touch);
 extern volatile int      g_bsOpen;
 extern volatile int      g_bsReq;
+extern volatile int      g_bsRememberDue;
 extern volatile int      g_bsCount;
 extern volatile int      g_bsSel;
 extern uint32_t          g_bsList[BS_MENU_MAX];
@@ -623,6 +631,18 @@ extern const uint8_t P_RESOLVETGT[9];
 void __cdecl on_cond_target(uint32_t ecx, uint32_t kind, uint32_t* pActorId, uint32_t* pOut);
 extern const uint8_t P_ABILLABEL[9];
 void __cdecl on_ability_label(uint32_t ecx, uint32_t label);
+extern const uint8_t P_AIAFTER[6];
+// The condition dispatcher's join. Hooked so the enemy's own roll for the optional extra attack
+// can be overruled -- see on_ai_cond and common/docs/ENEMY_AI_FLAGS_RE.md 3.9.
+#define RVA_AICOND    0x158031       // VA 0x558031
+extern const uint8_t P_AICOND[7];
+void __cdecl on_ai_cond(uint32_t esp);
+void extra_force_reset(void);
+void extra_force_done(void);
+#define RVA_AISTATE   0x149D40       // VA 0x549D40 -- the AI state setter
+extern const uint8_t P_AISTATE[6];
+void __cdecl on_ai_state(uint32_t ecx, uint32_t state, uint32_t* pRet, uint32_t* pUp);
+void __cdecl on_ai_afterexec(uint32_t ctx);
 void __cdecl on_spec_replace(uint32_t ecx, uint32_t name);
 extern volatile int      g_homeHave;
 extern volatile int      g_homeDue;
@@ -632,6 +652,7 @@ extern int g_homeCells[HOME_CELLS_MAX][2];
 extern int g_homeCellsN;
 int  save_capture_resident_cells(int out[][2], int maxn);
 void save_mapset_census(const char* tag);
+int  save_current_mapset(char out[17]);
 void save_arm_reconcile(const int cells[][2], int n);
 void save_arm_reconcile_sticky(const int cells[][2], int n, DWORD ms);
 extern const uint8_t P_SENDTRIG[9];

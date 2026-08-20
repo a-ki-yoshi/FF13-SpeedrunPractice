@@ -3,12 +3,13 @@
 # deliberately NOT under the monorepo's own .github/, so it never runs there.
 #
 # zig cross-compiles the x86 Windows DLL on a Linux runner: no Windows runner, no game files.
-# Every push builds; a v* tag also packages the release zip and publishes it.
+# A v* tag builds, packages the release zip and publishes it; pull requests and a manual
+# dispatch build only. NOT plain pushes to main: publish.sh pushes main and the tag together,
+# at the same commit, so a branch trigger would only ever compile the tag's tree a second time.
 name: build
 
 on:
   push:
-    branches: [ main ]
     tags: [ 'v*' ]
   pull_request:
   workflow_dispatch:
@@ -55,27 +56,39 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # One flat zip: all four files land in the game's bin folder, so "extract the
-          # zip there" is the whole install. Loose .bat/.dll downloads also trip browser
+          # One flat zip: everything lands in the game's bin folder, so "extract the zip
+          # there" is the whole install. Loose .bat/.dll downloads also trip browser
           # warnings that a zip avoids. The ini ships under its real name -- every key is
           # optional and the content equals the built-in defaults, so placing it unedited
           # changes nothing, and nobody has to rename an .example first. The two launchers
           # are the with/without-tools way to start the game (run parks the DLL).
+          # LICENSE travels WITH the binary because GPLv3 asks it to: the zip is what gets
+          # passed around, and a copy re-shared from a chat has nothing else to go on. The
+          # READMEs come along because the crash-report steps are read at the moment of the
+          # crash, in this very folder, by someone who is not going back to a web page.
           cp ff13-srpractice.ini.example ff13-srpractice.ini
           zip -j "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" \
             src/out/dinput8.dll \
             ff13-srpractice.ini \
             ff13-practice.bat \
-            ff13-run.bat
+            ff13-run.bat \
+            README.md \
+            README.ja.md \
+            LICENSE
           # A release for this tag can already exist -- the tag gets moved when a version is
           # re-cut before anyone has it, and `gh release create` fails outright on a duplicate.
           # Replace the asset in that case rather than failing the run.
+          # Notes come from .github/RELEASE_NOTES.md in the tagged tree -- written and
+          # reviewed before the push, never generated (main is one commit per version, so
+          # --generate-notes would say nothing).
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" \
               "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" --clobber
+            gh release edit "$GITHUB_REF_NAME" \
+              --notes-file .github/RELEASE_NOTES.md
           else
             gh release create "$GITHUB_REF_NAME" \
               "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" \
               --title "FF13-SpeedrunPractice $GITHUB_REF_NAME" \
-              --generate-notes
+              --notes-file .github/RELEASE_NOTES.md
           fi

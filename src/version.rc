@@ -18,8 +18,8 @@
 
 #include <windows.h>
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 1,0,0,0
- PRODUCTVERSION 1,0,0,0
+ FILEVERSION 1,1,0,0
+ PRODUCTVERSION 1,1,0,0
  FILEOS VOS_NT_WINDOWS32
  FILETYPE VFT_DLL
 BEGIN
@@ -29,12 +29,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "FF13-SpeedrunPractice"
       VALUE "FileDescription", "FF13-SpeedrunPractice - speedrun practice mod for FINAL FANTASY XIII (Steam)"
-      VALUE "FileVersion", "1.0.0.0"
+      VALUE "FileVersion", "1.1.0.0"
       VALUE "InternalName", "FF13-SpeedrunPractice"
       VALUE "LegalCopyright", "Copyright (C) 2026 Akiyoshi. GPLv3 or later."
       VALUE "OriginalFilename", "dinput8.dll"
       VALUE "ProductName", "FF13-SpeedrunPractice"
-      VALUE "ProductVersion", "1.0.0.0"
+      VALUE "ProductVersion", "1.1.0.0"
     END
   END
   BLOCK "VarFileInfo"

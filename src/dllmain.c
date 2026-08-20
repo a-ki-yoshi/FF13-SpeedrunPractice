@@ -130,6 +130,7 @@ static DWORD WINAPI worker(LPVOID unused) {
     config_load();
     state_load();   // restore the toggles from the last session
     save_sidecars_load();   // ...and what save-anywhere left in its sidecars
+    crash_report_install();
 
 
     int waited = wait_for_bytes(g_base + RVA_OHK_SIG, P_OHK_SIG, sizeof(P_OHK_SIG), 120000);
@@ -395,6 +396,34 @@ static DWORD WINAPI worker(LPVOID unused) {
     g_atbOk = waitedAtb >= 0;
     (g_atbOk ? ff13logv : ff13loga)("[FF13-SRP] ATB speed setter @0x%08X: %s\n", (unsigned)(g_base + RVA_SETATBSPEED),
              g_atbOk ? "OK" : "NOT THERE -- game-speed leaves the gauges alone");
+    // The AI's after-exec queue, so a bent form spends its own mode in the enemy's bookkeeping
+    // rather than the one the AI rolled (see on_ai_afterexec).
+    int waitedAe = wait_for_bytes(g_base + RVA_AIAFTER, P_AIAFTER, (int)sizeof(P_AIAFTER), 15000);
+    if (waitedAe < 0) {
+        ff13loga("[FF13-SRP] AI after-exec queue @0x%08X never matched -> a pinned mode can repeat\n",
+                 (unsigned)(g_base + RVA_AIAFTER));
+    } else {
+        void* ae = ff13_install_stackarg_hook(g_base + RVA_AIAFTER, P_AIAFTER, (int)sizeof(P_AIAFTER),
+                                              (void*)on_ai_afterexec, 4);
+        (ae ? ff13logv : ff13loga)("[FF13-SRP] AI after-exec hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_AIAFTER), ae ? "OK" : "FAIL");
+    }
+    {
+        int wc = wait_for_bytes(g_base + RVA_AICOND, P_AICOND, (int)sizeof(P_AICOND), 15000);
+        void* cd = wc < 0 ? NULL
+                 : ff13_install_esp_hook(g_base + RVA_AICOND, P_AICOND, (int)sizeof(P_AICOND),
+                                         (void*)on_ai_cond);
+        (cd ? ff13logv : ff13loga)("[FF13-SRP] AI condition hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_AICOND), cd ? "OK" : "FAIL");
+    }
+    {
+        int ws = wait_for_bytes(g_base + RVA_AISTATE, P_AISTATE, (int)sizeof(P_AISTATE), 15000);
+        void* st = ws < 0 ? NULL
+                 : ff13_install_argptr_hook(g_base + RVA_AISTATE, P_AISTATE,
+                                            (int)sizeof(P_AISTATE), (void*)on_ai_state, 4, 0, 0x10);
+        (st ? ff13logv : ff13loga)("[FF13-SRP] AI state hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_AISTATE), st ? "OK" : "FAIL");
+    }
     // The charaspec swap, so a picked form can be made to stick (see on_spec_replace).
     int waitedSr = wait_for_bytes(g_base + RVA_SPECREPL, P_SPECREPL, (int)sizeof(P_SPECREPL), 15000);
     if (waitedSr < 0) {
@@ -810,9 +839,12 @@ static DWORD WINAPI worker(LPVOID unused) {
 
     hk_rep bsUp = { 0, 0 }, bsDown = { 0, 0 },   // the four that repeat while held
            bsLeft = { 0, 0 }, bsRight = { 0, 0 };
+    DWORD crashRearmAt = 0;
     for (;;) {
         Sleep(HK_POLL_MS);
         DWORD hkNow = GetTickCount();
+        // The game installs its own filter after this mod's, so the seat is re-taken on a timer.
+        if ((int)(hkNow - crashRearmAt) >= 0) { crashRearmAt = hkNow + 2000; crash_report_rearm(); }
         if (hk_edge(g_helpVk, &wasHelp)) {
             g_helpOpen = !g_helpOpen;
             ff13log("[FF13-SRP] hotkey list %s\n", g_helpOpen ? "shown" : "hidden");
@@ -878,8 +910,7 @@ static DWORD WINAPI worker(LPVOID unused) {
                 // asks to open twice rather than closing what has not appeared yet.
                 // Closing remembers the row, as the cancel key below does.
                 if (g_bsOpen) {
-                    if (g_bsCount > 0 && g_bsSel >= 0 && g_bsSel < g_bsCount)
-                        zb_remember_sel(field_zone_id(), g_bsList[g_bsSel], g_bsVar[g_bsSel]);
+                    g_bsRememberDue = 1;       // the game thread does it: see pump_picker_input
                     g_bsOpen = 0;
                 } else {
                     g_bsReq = 1;
@@ -934,8 +965,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         if (hk_edge(g_warpCancelVk, &wasCancel)) {
             if (g_warpPrompt)    warp_cancel();
             else if (g_bsOpen) {
-                if (g_bsCount > 0 && g_bsSel >= 0 && g_bsSel < g_bsCount)
-                    zb_remember_sel(field_zone_id(), g_bsList[g_bsSel], g_bsVar[g_bsSel]);
+                g_bsRememberDue = 1;           // ...likewise
                 g_bsOpen = 0;      // no flash: the list vanishing already says it closed
             }
         }
@@ -943,7 +973,6 @@ static DWORD WINAPI worker(LPVOID unused) {
         // Save anywhere rides this same tick: its hotkeys, the restore state machine and the
         // deferred file work all live in there (srp_save.c).
         save_poll_tick(hkNow);
-        bgm_learn_tick(hkNow);
     }
     return 0;
 }
