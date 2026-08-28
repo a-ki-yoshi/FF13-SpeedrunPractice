@@ -43,5 +43,5 @@ EXTRA="$EXTRA -DFF13_BUILD_ID=\"$rev\""
     "$here/srp_save.c" "$here/srp_crash.c" \
     "$lib/ff13_hook.c" "$lib/ff13_crypt.c" "$here/dinput8.def" \
     "$out/version.res" \
-    -lkernel32 -luser32 -lgdi32
+    -lkernel32 -luser32 -lgdi32 -ladvapi32
 echo "built: $out/dinput8.dll${EXTRA:+ (with $EXTRA)}"

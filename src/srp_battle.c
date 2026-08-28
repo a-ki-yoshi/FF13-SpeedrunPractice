@@ -28,6 +28,11 @@
 // ASSET LIMIT: the btsc must already be loaded in the DataBattle DB, or getBattleScene (0xB41640)
 // fails. RE: common/docs/EVENT_BATTLE_RE.md EN-0..EN-6.
 #define SB_ARGSTACK_OFF 0x114        // [vmctx+0x114] = VM operand-stack pointer
+// Defensive head-room, not a measured need: a native called with a missing slot reads AND
+// writes past what the caller laid out (natives push their return value back into the operand
+// slots). 0x400 turns that mistake into corrupted padding, not a corrupted frame (the 12091
+// crash; CODE_NOTES).
+#define VM_CTX_SIZE 0x400
 #define SB_SLOT         8            // one tagged VM slot: {tag @+0, value @+4}
 // push ebp; mov ebp,esp; sub esp,0x290
 const uint8_t P_SB[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x90,0x02,0x00,0x00};
@@ -125,6 +130,69 @@ volatile uint32_t g_fieldMgr = 0;          // doEncountCheck's ecx (owns the pen
 static volatile uint32_t g_curZone = (uint32_t)-1; // watched so per-zone state is dropped on a move
 static volatile int g_sbLogN = 0;                 // cap the log lines
 
+// ---- what is holding the sound service's streams -----------------------------------------------
+// The service's stream table: five 0x30-byte slots from this+4 to this+0xF4, a slot taken when its
+// StreamReader's count at [[slot+0x20]] is not zero. Read here, at the moment the service decides
+// whether a track gets one (BankService.cpp:117 refuses it outright when none is free).
+#define BANK_SLOT0   0x04
+#define BANK_SLOTEND 0xF4
+#define BANK_SLOTSZ  0x30
+#define BANK_ACTIVE  0x20
+static volatile int g_bankLogN = 0;
+static volatile uint32_t g_bankThis = 0;
+static char              g_bankLine[320];
+static volatile int      g_bankLineReady = 0;
+void bank_log_reset(void) { g_bankLogN = 0; }
+
+void __cdecl on_bank_play(uint32_t ecx, uint32_t name) {
+    if (!ecx) return;
+    g_bankThis = ecx;                                      // the table, for sound_slots_free
+    if (!g_bsStarted || g_bankLogN >= 4) return;
+    char nm[20] = {0};
+    if (name && !IsBadReadPtr((void*)(uintptr_t)name, 16)) {
+        memcpy(nm, (const void*)(uintptr_t)name, 16); nm[16] = 0;
+        for (int i = 0; nm[i]; i++)
+            if ((unsigned char)nm[i] < 0x20 || (unsigned char)nm[i] > 0x7E) { nm[i] = 0; break; }
+    }
+    int act = 0, tot = 0;
+    char held[240]; int hn = 0; held[0] = 0;
+    for (uint32_t a = ecx + BANK_SLOT0; a + BANK_SLOTSZ <= ecx + BANK_SLOTEND; a += BANK_SLOTSZ) {
+        if (IsBadReadPtr((void*)(uintptr_t)a, BANK_SLOTSZ)) break;
+        tot++;
+        uint32_t rc = *(uint32_t*)(uintptr_t)(a + BANK_ACTIVE);
+        if (!rc || IsBadReadPtr((void*)(uintptr_t)rc, 4) || !*(uint32_t*)(uintptr_t)rc) continue;
+        act++;
+        // Nothing in the RE says which word of a slot holds its track name, so the first printable
+        // pointer is taken and reported as a guess.
+        for (int w = 0; w < BANK_SLOTSZ / 4; w++) {
+            uint32_t v = *(uint32_t*)(uintptr_t)(a + w * 4);
+            if (v <= 0x10000 || IsBadReadPtr((void*)(uintptr_t)v, 8)) continue;
+            const char* t = (const char*)(uintptr_t)v;
+            int k = 0;
+            while (k < 31 && t[k] >= 0x20 && t[k] <= 0x7E) k++;
+            if (k < 4 || t[k]) continue;
+            if (hn < (int)sizeof held - 40)
+                hn += snprintf(held + hn, sizeof held - hn, "%s\"%.31s\"", hn ? ", " : "", t);
+            break;
+        }
+    }
+    // Handed to the worker rather than logged here: this runs on the game thread, and a line
+    // written from it lands in the middle of whatever the worker was writing (measured).
+    g_bankLogN++;
+    snprintf(g_bankLine, sizeof g_bankLine,
+             "[FF13-SRP] sound: \"%.16s\" wants a stream -- %d of %d slots are taken%s%s\n",
+             nm[0] ? nm : "(?)", act, tot, hn ? "; holding: " : "", hn ? held : "");
+    g_bankLineReady = 1;
+}
+
+void bank_log_pump(void) {
+    if (!g_bankLineReady) return;
+    char line[sizeof g_bankLine];
+    memcpy(line, (const void*)g_bankLine, sizeof line);
+    g_bankLineReady = 0;
+    ff13log("%s", line);
+}
+
 // __cdecl handler (ff13_install_stackarg_hook with stackOff=4, so it receives arg1 = the VM
 // context). Reads the three pending VM arguments and, while armed, redirects the btsc name.
 // popad restores registers only, so the value we write into the VM operand stack survives.
@@ -150,6 +218,7 @@ void __cdecl on_start_battle(uint32_t vmctx) {
     }
     g_bgmLearnScripted = 1;
     g_bgmLearnUntil = GetTickCount() + BGM_LEARN_WINDOW_MS;
+    if (!g_bsStarted) bgm_heal_standdown();
     if (arg3 && arg3 < 13000) boss_learn(arg3, nameOk ? name : NULL);
     int swapped = 0;
     if (g_swapEnabled && g_swapNameBuf[0]) {
@@ -234,8 +303,9 @@ static volatile int g_gbsLogN = 0, g_encIdLogN = 0;
 
 // ---- VM natives -----------------------------------------------------------------------------
 // They take their arguments off the VM operand stack ([vmctx+0x114], 8-byte tagged slots), exactly
-// like startBattle_l. loadSoundResource pops TWO: (String resource, String group), the group being
-// a sound bus name. The read-only hook below logs the real argument pair.
+// like startBattle_l, the LAST-declared argument in slot0. loadSoundResource is declared
+// (String group, String name) -- the sound bus first -- so slot0 carries the resource name.
+// The read-only hook below logs the real argument pair.
 const uint8_t P_LSND[6] = {0x55,0x8B,0xEC,0x83,0xEC,0x70};
 static volatile int g_lsndLogN = 0;
 static volatile unsigned char g_inSndLoad = 0;    // reentrancy guard: our own call
@@ -247,7 +317,7 @@ typedef void (__cdecl *vmNative1_t)(void* ctx);
 
 void vm_load_sound(const char* name, const char* group) {
     if (!g_base || !name || !group) return;
-    uint8_t   ctx[0x200];
+    uint8_t   ctx[VM_CTX_SIZE];
     uint32_t  args[4];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = (uint32_t)(uintptr_t)name;    // slot0 {tag, value}
@@ -256,6 +326,94 @@ void vm_load_sound(const char* name, const char* group) {
     g_inSndLoad = 1;
     ((vmNative1_t)(uintptr_t)(g_base + RVA_LOADSND))(ctx);
     g_inSndLoad = 0;
+}
+
+void vm_unload_sound(const char* name, const char* group) {
+    if (!g_base || !name || !group) return;
+    uint8_t   ctx[VM_CTX_SIZE];
+    uint32_t  args[4];
+    memset(ctx, 0, sizeof ctx);
+    args[0] = 0; args[1] = (uint32_t)(uintptr_t)name;
+    args[2] = 0; args[3] = (uint32_t)(uintptr_t)group;
+    *(uint32_t*)(ctx + SB_ARGSTACK_OFF) = (uint32_t)(uintptr_t)args;
+    ((vmNative1_t)(uintptr_t)(g_base + RVA_UNLOADSND))(ctx);
+}
+
+// ---- making room for a picked fight's track ----------------------------------------------------
+// The service has five stream slots and a LOADED track holds one, so where five are loaded a picked
+// fight's track is accepted, reported as playing, and silent. Stopping a track does not give its
+// slot back -- only unloading does.
+#define SND_SEEN_N 8
+static char g_sndSeen[SND_SEEN_N][BGM_NAME_MAX + 1];   // "general" tracks, oldest first
+static int  g_sndSeenN = 0;
+static char g_sndFreed[BGM_NAME_MAX + 1];              // ...and the one taken out to make room
+
+static void snd_seen_add(const char* n) {
+    for (int i = 0; i < g_sndSeenN; i++) if (!strncmp(g_sndSeen[i], n, BGM_NAME_MAX)) return;
+    if (g_sndSeenN == SND_SEEN_N) {
+        memmove(g_sndSeen[0], g_sndSeen[1], (SND_SEEN_N - 1) * sizeof g_sndSeen[0]);
+        g_sndSeenN--;
+    }
+    strncpy(g_sndSeen[g_sndSeenN], n, BGM_NAME_MAX);
+    g_sndSeen[g_sndSeenN][BGM_NAME_MAX] = 0;
+    g_sndSeenN++;
+}
+static void snd_seen_drop(const char* n) {
+    for (int i = 0; i < g_sndSeenN; i++)
+        if (!strncmp(g_sndSeen[i], n, BGM_NAME_MAX)) {
+            memmove(g_sndSeen[i], g_sndSeen[i + 1], (g_sndSeenN - i - 1) * sizeof g_sndSeen[0]);
+            g_sndSeenN--;
+            return;
+        }
+}
+
+// -1 = the table has not been seen yet, else the number of slots not held by an active reader.
+int sound_slots_free(void) {
+    uint32_t bank = g_bankThis;
+    if (!bank) return -1;
+    int free = 0;
+    for (uint32_t a = bank + BANK_SLOT0; a + BANK_SLOTSZ <= bank + BANK_SLOTEND; a += BANK_SLOTSZ) {
+        if (IsBadReadPtr((void*)(uintptr_t)a, BANK_SLOTSZ)) return -1;
+        uint32_t rc = *(uint32_t*)(uintptr_t)(a + BANK_ACTIVE);
+        if (!rc || IsBadReadPtr((void*)(uintptr_t)rc, 4) || !*(uint32_t*)(uintptr_t)rc) free++;
+    }
+    return free;
+}
+
+void sound_make_room(const char* want) {
+    if (!want || !want[0]) return;
+    int freeSlots = sound_slots_free();
+    if (freeSlots != 0) return;                 // room already, or the table is not readable
+    char now[BGM_NAME_MAX + 1] = "";
+    bgm_current(now);
+    // Newest first: the track a battle left behind is the one loaded last. Being the track that is
+    // SOUNDING is not a reason to spare it (the leftover result jingle is exactly that); what must
+    // be spared is the field's own music, which is what the way back returns to.
+    for (int i = g_sndSeenN - 1; i >= 0; i--) {
+        const char* c = g_sndSeen[i];
+        if (!strncmp(c, want, BGM_NAME_MAX)) continue;
+        if (g_zoneField[0]   && !strncmp(c, g_zoneField,   BGM_NAME_MAX)) continue;
+        if (g_zoneBattle[0]  && !strncmp(c, g_zoneBattle,  BGM_NAME_MAX)) continue;
+        if (g_bgmFieldNow[0] && !strncmp(c, g_bgmFieldNow, BGM_NAME_MAX)) continue;
+        int sounding = now[0] && !strncmp(c, now, BGM_NAME_MAX);
+        ff13log("[FF13-SRP] sound: every stream is taken -- unloading \"%.31s\"%s so \"%.31s\" has "
+                "one\n", c, sounding ? " (stopping it first)" : "", want);
+        if (sounding) bgm_stop(c, 0.0f);
+        strncpy(g_sndFreed, c, BGM_NAME_MAX); g_sndFreed[BGM_NAME_MAX] = 0;
+        vm_unload_sound(g_sndFreed, "general");
+        snd_seen_drop(g_sndFreed);
+        return;
+    }
+    ff13loga("[FF13-SRP] sound: every stream is taken and nothing here can be spared -- \"%.31s\" "
+             "will be silent\n", want);
+}
+
+void sound_give_room_back(void) {
+    if (!g_sndFreed[0]) return;
+    ff13log("[FF13-SRP] sound: loading \"%.31s\" again, the fight that wanted its stream is over\n",
+            g_sndFreed);
+    vm_load_sound(g_sndFreed, "general");
+    g_sndFreed[0] = 0;
 }
 
 // Same collection idea for character sets: log what the game itself asks for.
@@ -321,7 +479,7 @@ static void setup_spend(int ours) {
 // One VM slot and nothing else off the context, so a forged one is enough.
 void vm_load_charaset(const char* name) {
     if (!g_base || !name || !name[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = (uint32_t)(uintptr_t)name;      // slot0 {tag, value}
@@ -346,7 +504,7 @@ volatile int g_looseLoaded = 0;       // ...and whether any were actually asked 
 
 static void vm_load_chara(const char* spec) {
     if (!g_base || !g_lchOk || !spec || !spec[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = (uint32_t)(uintptr_t)spec;
@@ -356,7 +514,7 @@ static void vm_load_chara(const char* spec) {
 
 static int vm_chara_loaded(const char* spec) {
     if (!g_base || !g_ilcOk || !spec || !spec[0]) return -1;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = (uint32_t)(uintptr_t)spec;
@@ -371,10 +529,12 @@ static int vm_chara_loaded(const char* spec) {
 static const struct { uint16_t btsc; const char* spec; } kSceneExtraSpecs[] = {
     { 7010, "s101" },        // Odin: the cutscene's actor player asks for these two, and no
     { 7010, "s102" },        // character set in this chapter holds either
+    {12001, "s101" },        // Odin again, this time on the fight's own actor list -- an actor the
+    {12001, "s102" },        // scene builds with its charaspec unread takes the game down
 };
 #define FF13_EXTRA_SPEC_N ((int)(sizeof(kSceneExtraSpecs)/sizeof(kSceneExtraSpecs[0])))
 
-void load_loose_specs(uint32_t btsc, const ff13_charaset* cs) {
+int load_loose_specs(uint32_t btsc, const ff13_charaset* cs) {
     int n = 0;
     for (int i = 0; i < FF13_EXTRA_SPEC_N; i++) {
         if (kSceneExtraSpecs[i].btsc != btsc) continue;
@@ -414,6 +574,7 @@ void load_loose_specs(uint32_t btsc, const ff13_charaset* cs) {
                  "none of that happened\n");
     g_looseScene = n ? btsc : 0;      // read back once the wait is up, not now (async load)
     if (n) g_looseLoaded = 1;         // ...and something has to take them back out again
+    return n;                         // a fight started on top of these is a fight without them
 }
 
 // Asked only once the wait is done: the load is asynchronous, and asking straight after the
@@ -480,7 +641,7 @@ void __cdecl on_load_bg(uint32_t vmctx) {
 
 void vm_load_bg(const char* mapset) {
     if (!g_base || !mapset || !mapset[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = (uint32_t)(uintptr_t)mapset;    // slot0 {tag, value}
@@ -499,7 +660,7 @@ static void vm_slot_str(uint32_t* slot, const char* s);
 // on. This exact set is what was measured to fade back in -- do not reason about it from the name.
 void vm_fade_in(void) {
     if (!g_base) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[8];
     memset(ctx, 0, sizeof ctx);
     memset(args, 0, sizeof args);
@@ -516,7 +677,7 @@ void vm_fade_in(void) {
 #define RVA_DORESTARTSAVE 0x7E63D0   // VA 0xBE63D0 White.doRestartSave(String)
 void vm_restart_save(const char* rp) {
     if (!g_base || !rp || !rp[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     vm_slot_str(args, rp);
@@ -528,7 +689,7 @@ void vm_restart_save(const char* rp) {
 // else -- no schedule or pack. What a completed restart runs last to give the field back.
 void vm_field_ucon(void) {
     if (!g_base) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[12];
     memset(ctx, 0, sizeof ctx);
     memset(args, 0, sizeof args);
@@ -623,7 +784,7 @@ void __cdecl on_screen_env(uint32_t vmctx) {
 
 static void vm_drawenv_bg(const char* bg, const char* from, const char* to, int mode, float t) {
     if (!g_base || !bg || !from || !to) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[10];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = f2u(t);                // slot0 = t
@@ -641,7 +802,7 @@ static void vm_drawenv_bg(const char* bg, const char* from, const char* to, int 
 // Standing in the box is what applies its env, and the party is warped into the middle of these.
 static void vm_box(const char* name, int on) {
     if (!g_base || !name || !name[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     vm_slot_str(args, name);
@@ -653,7 +814,7 @@ static void vm_box(const char* name, int on) {
 
 static void vm_drawenv_chara(const char* who, const char* env, int mode, float t) {
     if (!g_base || !who || !who[0] || !env) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[8];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = f2u(t);                // slot0 = t
@@ -677,7 +838,7 @@ static void vm_drawenv_chara(const char* who, const char* env, int mode, float t
 // call left behind, which made this guard say yes to scripts that do not exist.
 static int vm_script_exists(const char* name) {
     if (!g_base || !name || !name[0]) return 0;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     vm_slot_str(args, name);
@@ -687,7 +848,7 @@ static int vm_script_exists(const char* name) {
 }
 static void vm_exec_script(const char* name) {
     if (!g_base || !name || !name[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     vm_slot_str(args, name);
@@ -724,7 +885,7 @@ static void vm_exec_script(const char* name) {
 #define RVA_PARTY_SETWORK 0x7DC0C0   // VA 0xBDC0C0  Party.setWork(int, int)
 int vm_get_work(int idx) {
     if (!g_base) return -1;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t a[2];
     memset(ctx, 0, sizeof ctx);
     a[0] = 0; a[1] = (uint32_t)idx;
@@ -734,7 +895,7 @@ int vm_get_work(int idx) {
 }
 void vm_set_work(int idx, int val) {
     if (!g_base) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t a[4];
     memset(ctx, 0, sizeof ctx);
     a[0] = 0; a[1] = (uint32_t)val;            // slot0 = the value  (reverse order, as always)
@@ -748,7 +909,7 @@ void vm_set_work(int idx, int val) {
 #define RVA_PARTY_SETEVFLAG 0x7DCA60   // VA 0xBDCA60  Party.setEventFlag(String, boolean)
 void vm_set_event_flag(const char* name, int on) {
     if (!g_base || !name) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t a[4];
     memset(ctx, 0, sizeof ctx);
     a[0] = 0; a[1] = (uint32_t)(on ? 1 : 0);            // slot0 = the value  (reverse order)
@@ -761,7 +922,7 @@ void vm_set_event_flag(const char* name, int on) {
 #define RVA_PARTY_GETEVFLAG 0x7DC9D0   // VA 0xBDC9D0  Party.getEventFlag(String) -> boolean
 int vm_get_event_flag(const char* name) {
     if (!g_base || !name) return -1;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t a[2];
     memset(ctx, 0, sizeof ctx);
     a[0] = 0; a[1] = (uint32_t)(uintptr_t)name;
@@ -776,7 +937,7 @@ int vm_get_event_flag(const char* name) {
 #define PARTY_NATIVE_RESTORE_OPTIMA_ALL 4
 static void vm_party_native(int op, int a1, int a2, int a3, int a4) {
     if (!g_base) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t a[10];
     memset(ctx, 0, sizeof ctx);
     a[0] = 0; a[1] = (uint32_t)a4;             // slot0 = the LAST argument, as everywhere
@@ -800,7 +961,7 @@ static void vm_slot_list(uint32_t* slot, const char* const* names, int n) {
     slot[1] = (uint32_t)(uintptr_t)names;
 }
 static void vm_call1(uint32_t rva, const uint32_t* slot) {
-    uint8_t ctx[0x200];
+    uint8_t ctx[VM_CTX_SIZE];
     memset(ctx, 0, sizeof ctx);
     *(uint32_t*)(ctx + SB_ARGSTACK_OFF) = (uint32_t)(uintptr_t)slot;
     ((vmNative1_t)(uintptr_t)(g_base + rva))(ctx);
@@ -1217,16 +1378,58 @@ volatile uint32_t g_evTouch = 0;     // the touched object the first pass was gi
 #define RVA_CREATECHARA 0x7CC290     // VA 0xBCC290  Field.createChara_l
 #define FIELDCHARA_FLAGS 0x4000      // ...ignoring whether the field is active
 
-// Scene.activateAreaIgnoreFieldActive(group), one string slot.
-#define RVA_ACTIVATEAREA 0x7E05B0    // VA 0xBE05B0  Scene.activateAreaIgnoreFieldActive
+#define RVA_ACTIVATEAREA 0x7E05B0    // VA 0xBE05B0  Scene.activateAreaIgnoreFieldActive_l
+// activateAreaIgnoreFieldActive_l(String, boolean): TWO slots, read last-pushed-first, so slot0
+// is the force flag and slot1 the group. Check the fake/*.java declaration before binding any
+// native -- a missing slot hands it stack garbage (the 12091 crash; CODE_NOTES).
 void vm_activate_area(const char* group) {
     if (!g_base || !group || !group[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
+    uint32_t args[4];
+    memset(ctx, 0, sizeof ctx);
+    args[0] = 0; args[1] = 0;                        // slot0 = force (false)
+    vm_slot_str(args + 2, group);                    // slot1 = the group
+    *(uint32_t*)(ctx + SB_ARGSTACK_OFF) = (uint32_t)(uintptr_t)args;
+    ((vmNative1_t)(uintptr_t)(g_base + RVA_ACTIVATEAREA))(ctx);
+}
+
+// Scene.deactivateAreaEx(group), one string slot, returns a handle the story WAITS on. The wait
+// cannot be borrowed from the hotkey thread and the deactivate side has no poll native, so the
+// handle is dropped -- accepted; the hand-off pass re-issues the request (field_drops_apply).
+#define RVA_DEACTIVATEAREAEX 0x7E0800  // VA 0xBE0800  Scene.deactivateAreaEx
+void vm_deactivate_area_ex(const char* group) {
+    if (!g_base || !group || !group[0]) return;
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     vm_slot_str(args, group);
     *(uint32_t*)(ctx + SB_ARGSTACK_OFF) = (uint32_t)(uintptr_t)args;
-    ((vmNative1_t)(uintptr_t)(g_base + RVA_ACTIVATEAREA))(ctx);
+    ((vmNative1_t)(uintptr_t)(g_base + RVA_DEACTIVATEAREAEX))(ctx);
+}
+
+// Scene.deactivateArea(group), one string slot -- what vm_activate_area undoes.
+#define RVA_DEACTIVATEAREA 0x7E0790  // VA 0xBE0790  Scene.deactivateArea
+void vm_deactivate_area(const char* group) {
+    if (!g_base || !group || !group[0]) return;
+    uint8_t  ctx[VM_CTX_SIZE];
+    uint32_t args[2];
+    memset(ctx, 0, sizeof ctx);
+    vm_slot_str(args, group);
+    *(uint32_t*)(ctx + SB_ARGSTACK_OFF) = (uint32_t)(uintptr_t)args;
+    ((vmNative1_t)(uintptr_t)(g_base + RVA_DEACTIVATEAREA))(ctx);
+}
+
+// Scene.showLayoutInstance / hideLayoutInstance, one string slot each.
+#define RVA_SHOWLAYOUT 0x7DFAC0      // VA 0xBDFAC0  Scene.showLayoutInstance
+#define RVA_HIDELAYOUT 0x7DFB40     // VA 0xBDFB40  Scene.hideLayoutInstance
+void vm_layout_show(const char* inst, int show) {
+    if (!g_base || !inst || !inst[0]) return;
+    uint8_t  ctx[VM_CTX_SIZE];
+    uint32_t args[2];
+    memset(ctx, 0, sizeof ctx);
+    vm_slot_str(args, inst);
+    *(uint32_t*)(ctx + SB_ARGSTACK_OFF) = (uint32_t)(uintptr_t)args;
+    ((vmNative1_t)(uintptr_t)(g_base + (show ? RVA_SHOWLAYOUT : RVA_HIDELAYOUT)))(ctx);
 }
 
 // Party.setPositionByPositionMarkerGroup(n), one slot: how a zone's "read" function stands the
@@ -1234,7 +1437,7 @@ void vm_activate_area(const char* group) {
 #define RVA_PARTYMARKER 0x7DC970     // VA 0xBDC970  Party.setPositionByPositionMarkerGroup
 void vm_party_marker(int group) {
     if (!g_base || group < 0) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = (uint32_t)group;
@@ -1244,7 +1447,7 @@ void vm_party_marker(int group) {
 
 void vm_create_field_chara(const char* name, const char* model) {
     if (!g_base || !name || !name[0] || !model || !model[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[6];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = FIELDCHARA_FLAGS;      // slot0 = the flags
@@ -1259,7 +1462,7 @@ void vm_create_field_chara(const char* name, const char* model) {
 // snapshot into the post-fight field.
 void vm_dispose_event(const char* name, const char* pack, const char* pack2) {
     if (!g_base || !name || !name[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[4];
     const char* packs[3] = { pack, pack2, NULL };
     for (int i = 0; i < 2; i++) {
@@ -1287,7 +1490,7 @@ void vm_start_event(const char* name, const char* cb, const char* pack, const ch
                            const char* pack2, int script,
                            const char* loadName, const char* loadPack) {
     if (!g_base || !name || !name[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[12];
 
     const char* ln = (loadName && loadName[0]) ? loadName : name;
@@ -1346,7 +1549,7 @@ void __cdecl on_start_cinema(uint32_t vmctx) {
 #define RVA_SYNCWAIT 0x7DE670        // VA 0xBDE670 Resource.syncWait()
 void vm_sync_wait(void) {
     if (!g_base) return;
-    uint8_t ctx[0x200];
+    uint8_t ctx[VM_CTX_SIZE];
     memset(ctx, 0, sizeof ctx);
     ((vmNative1_t)(uintptr_t)(g_base + RVA_SYNCWAIT))(ctx);
 }
@@ -1427,7 +1630,7 @@ static int chara_id_by_name(const char name16[16]) {
 // crashed the game with the Start button held down (the game's own menu code drives the same flag).
 int vm_top_menu_get(void) {
     if (!g_base) return -1;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[2];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = TOPMENU_OPEN_FLAG;
@@ -1437,7 +1640,7 @@ int vm_top_menu_get(void) {
 }
 static void vm_top_menu(int allow) {
     if (!g_base) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[4];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = allow ? 1u : 0u;          // slot0 = the boolean
@@ -1461,7 +1664,7 @@ static uint32_t g_uiSaved = 0xFFFFFFFFu;  // 0xFFFFFFFF = nothing saved
 
 static void vm_field_ui(int mask, int on) {
     if (!g_base) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[4];
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = on ? 1u : 0u;            // slot0 = the boolean
@@ -1542,7 +1745,7 @@ void ctl_unlock(void) {
 // nothing from the context except [ctx+0x114], popping three slots, so a forged context is enough.
 void vm_start_battle(const char* arena, uint32_t flags, uint32_t btsc) {
     if (!g_base || !arena || !arena[0]) return;
-    uint8_t  ctx[0x200];
+    uint8_t  ctx[VM_CTX_SIZE];
     uint32_t args[6];                                     // 3 slots of {tag, value}
     memset(ctx, 0, sizeof ctx);
     args[0] = 0; args[1] = (uint32_t)(uintptr_t)arena;    // slot0 = arena / script name
@@ -2180,6 +2383,34 @@ const ff13_arena* scene_arena(uint32_t btsc) {
     return NULL;
 }
 
+// What the story takes off the field right before these fights and a door-less pick does not
+// (derivations in CODE_NOTES). Rows of one btsc must stay together: field_drops returns a run.
+static const ff13_fielddrop kFieldDrop[] = {
+    // btsc12090's door (efCallBeforeEvLasd300) drops these five and nothing before 12091/12092
+    // puts them back, so the two Narthex fights after it need the same hand.
+    {12091, FDROP_AREA, "gr_faF01_0141"},
+    {12091, FDROP_AREA, "gr_faF01_0146"},
+    {12091, FDROP_AREA, "gr_faF01_0147"},
+    {12091, FDROP_AREA, "gr_faF01_0149"},
+    {12091, FDROP_AREA_EX, "gr_faF01_0208"},   // the story uses the Ex variant on this one
+    {12092, FDROP_AREA, "gr_faF01_0141"},
+    {12092, FDROP_AREA, "gr_faF01_0146"},
+    {12092, FDROP_AREA, "gr_faF01_0147"},
+    {12092, FDROP_AREA, "gr_faF01_0149"},
+    {12092, FDROP_AREA_EX, "gr_faF01_0208"},
+    // ev_vpek_170 hides this over its fight (efHideBg124Ev170) and shows it again after.
+    { 4026, FDROP_HIDE, "lbg_124_00001"},
+};
+
+const ff13_fielddrop* field_drops(uint32_t btsc, int* n) {
+    int N = (int)(sizeof kFieldDrop / sizeof kFieldDrop[0]), i = 0;
+    while (i < N && kFieldDrop[i].btsc != btsc) i++;
+    int j = i;
+    while (j < N && kFieldDrop[j].btsc == btsc) j++;
+    *n = j - i;
+    return i < N ? &kFieldDrop[i] : NULL;
+}
+
 // Whether picking this fight puts a cutscene on screen first. Derived from kSceneArena rather than
 // written down again in the TSV: a picked fight plays a cutscene only where THIS MOD hands it one.
 // A row with no door goes in through the field encounter; evNoFight gates the cutscene off.
@@ -2370,6 +2601,14 @@ int scene_resident(uint32_t btsc, const char** missing) {
     // An arena entry naming its own character set has said which charaspecs are really needed.
     // The scene table lists what a scene MIGHT field, including models no set carries and the
     // fight never wears, so judging on it meant waiting the full cap every time.
+    for (int i = 0; i < FF13_EXTRA_SPEC_N; i++) {
+        if (kSceneExtraSpecs[i].btsc != btsc) continue;
+        if (!charaspec_resident(kSceneExtraSpecs[i].spec)) {
+            if (missing) *missing = kSceneExtraSpecs[i].spec;
+            last = 0;
+            return 0;
+        }
+    }
     const struct ff13_arena_s* ar = scene_arena(btsc);
     const ff13_charaset* cs = (ar && ar->chset) ? charaset_by_name(ar->chset) : NULL;
     if (cs && cs->n) {
@@ -2463,6 +2702,17 @@ const ff13_charaset* charaset_by_name(const char* name) {
         if (strcmp(kCharasets[i].name, name) == 0) return &kCharasets[i];
     return NULL;
 }
+// The first of `cs`'s models the registry no longer holds, or NULL when it holds them all. NULL
+// also when the probe cannot answer: an unusable probe must not read as "everything is gone".
+static const char* charaset_gone(const ff13_charaset* cs) {
+    if (!cs || !g_isReadThis) return NULL;
+    for (int i = 0; i < cs->n; i++) {
+        const char* nm = kModelName[kCharasetIdx[cs->first + i]];
+        if (!charaspec_resident(nm)) return nm;
+    }
+    return NULL;
+}
+
 // The set to load before starting `btsc` here, or NULL for "leave it alone". NULL covers three
 // situations on purpose: the loaded set already holds every model; no set in this zone holds them
 // all (charaset.wdb does not list every model that can be resident, so a miss is NOT evidence the
@@ -2473,10 +2723,19 @@ const ff13_charaset* charaset_needed(uint32_t zone, uint32_t btsc) {
     // Ours first: g_curCharset tracks only what the GAME asked for, so without this a second
     // attempt at the same fight would ask for the set again and wait for it again.
     const ff13_charaset* cur = charaset_by_name(g_csLoaded[0] ? g_csLoaded : g_curCharset);
+    int ours = (g_csLoaded[0] != 0);
     ff13logv("[FF13-SRP] charaset_needed(btsc%05u): loaded=\"%s\" game=\"%s\" -> cur=%s covers=%d\n",
              btsc, g_csLoaded, g_curCharset, cur ? cur->name : "(none)",
              cur ? charaset_covers(cur, sm) : -1);
-    if (cur && charaset_covers(cur, sm)) return NULL;
+    // Covering it on paper is not holding it: the way back out of a fight rebuilds the field's
+    // resources without going through the character-set native this mod watches, so g_csLoaded can
+    // name a set that is gone. Only OUR bookkeeping is re-checked; the game's is the game's.
+    if (cur && charaset_covers(cur, sm)) {
+        const char* gone = ours ? charaset_gone(cur) : NULL;
+        if (!gone) return NULL;
+        ff13log("[FF13-SRP] battle picker: \"%s\" is not resident any more (\"%s\" is gone) -- "
+                "loading it again rather than trusting it\n", cur->name, gone);
+    }
     // Most overlap with the loaded set first, smaller set on a tie. "Smallest covering set" alone
     // was the first rule and chose a set that made the fight come up empty: the most similar set
     // asks the streaming system for the least and stays closest to what the game has decided
@@ -2528,6 +2787,7 @@ void __cdecl on_load_sound(uint32_t vmctx) {
                  a1ok ? a1 : "(unreadable)", a2ok ? a2 : "(unreadable)",
                  mine ? "   <- requested by us" : "");
     }
+    if (a1ok && a2ok && !strcmp(a2, "general")) snd_seen_add(a1);
     // Read-only. Do not load here: taking over a slot only works while the game happens to be
     // loading that same track, and it then applies to EVERY battle in the zone.
 }
@@ -2725,6 +2985,31 @@ static void glog_to_utf8(const char* in, char* out, int outN) {
         strncpy(out, in, (size_t)outN - 1);
         out[outN - 1] = 0;
     }
+}
+
+// ---- the game's own assert ---------------------------------------------------------------------
+// 0xE8B2E0 formats the failure, prints it at level 6, then executes
+//     0xE8B376  mov dword ptr [0], 0
+// on purpose: EVERY "0xC0000005 at 0x00E8B376, writing 0x00000000" is an assertion the game chose
+// to die on, not memory corruption. Taken at the entry because the text goes out on a path nothing
+// else here sees -- (cond, msg, file, line, tag) at [esp+4..0x14]. Written whatever the log level.
+const uint8_t P_ASSERT[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x0C,0x08,0x00,0x00};
+
+void __cdecl on_game_assert(uint32_t ecx, uint32_t line, uint32_t* a, uint32_t* unused) {
+    (void)ecx; (void)unused;
+    if (!a || IsBadReadPtr(a, 5 * 4)) return;
+    const char* cond = (const char*)(uintptr_t)a[0];
+    const char* msg  = (const char*)(uintptr_t)a[1];
+    const char* file = (const char*)(uintptr_t)a[2];
+    const char* tag  = (const char*)(uintptr_t)a[4];
+    char m8[600] = "";
+    if (msg && !IsBadStringPtrA(msg, 400)) glog_to_utf8(msg, m8, (int)sizeof m8);
+    ff13loga("[FF13-SRP] GAME ASSERT: (%.150s) %.400s  -- %.120s(%u)%s%.60s\n",
+             (cond && !IsBadStringPtrA(cond, 150)) ? cond : "?",
+             m8,
+             (file && !IsBadStringPtrA(file, 120)) ? file : "?", line,
+             (tag && !IsBadStringPtrA(tag, 60)) ? "  [" : "", 
+             (tag && !IsBadStringPtrA(tag, 60)) ? tag : "");
 }
 
 // The lines that say how a fight was populated. Matched on FILE:LINE, NOT on the text: the messages
@@ -3295,6 +3580,7 @@ const char* bgm_pick_track(uint32_t btsc, const char** origin) {
 // Most fight tracks start through lazyPlay, which never reaches the immediate-play entry below --
 // without this listener the learner only ever saw the rare direct plays. Observation only.
 const uint8_t P_BGMLAZY[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x84,0x00,0x00,0x00};
+const uint8_t P_BANKPLAY[9] = {0x55,0x8B,0xEC,0x81,0xEC,0xA0,0x00,0x00,0x00};
 void __cdecl on_bgm_lazyplay(uint32_t ecx, uint32_t retAddr, uint32_t* pName, uint32_t* pFade) {
     (void)ecx; (void)retAddr; (void)pFade;
     const char* name = (pName && *pName) ? (const char*)(uintptr_t)*pName : NULL;

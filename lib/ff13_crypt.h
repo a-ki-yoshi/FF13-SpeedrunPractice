@@ -34,4 +34,8 @@
 void ff13_decrypt(uint8_t* img, size_t len);
 void ff13_encrypt(uint8_t* img, size_t len);
 
+// One block-aligned window of the body, decrypted where it lies: `buf` holds the bytes read from
+// file offset `off` (>= FF13_HEADER_LEN, 8-byte aligned with `len`, ending before the trailer).
+void ff13_decrypt_window(uint8_t* buf, size_t off, size_t len);
+
 #endif

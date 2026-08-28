@@ -38,13 +38,16 @@ volatile unsigned char g_helpOpen = 0;         // hotkey list on screen; NOT per
 #define OVL_GAMESPEED  0xFFD2FA69   // GAME SPEED     : lime-green
 #define OVL_ONEHIT     0xFFFF3B30   // ONE-HIT KILL   : red-orange (same as INSTANT WIN)
 #define OVL_SUPPRESS   0xFFC772EB   // ENEMY SUPPRESS : violet
-#define OVL_BATTLE     0xFFFFFFFF   // battle overlay : white (GAME / REAL / ENEMY HP, one key)
+#define OVL_BATTLE     0xFFFFFFFF   // battle overlay : white (the figures themselves)
+#define OVL_BATTLE_HEAD 0xFFA3A8A8  // ...and grey for the TIME / TARGET group headings
 #define OVL_SWAP       0xFFF5A623   // BATTLE SWAP    : amber
 #define OVL_INSTANT    0xFFFF3B30   // INSTANT WIN    : red-orange
 #define OVL_WARP_PROMPT  0xFF86FDD2   // warp prompt: mint-green
 #define OVL_FLASH   0xFFA3A8A8   // status flash   : grey (same value as OVL_FLASH_OFF; separate
                                     // channels so they CAN differ, not because they must)
 #define OVL_PICK_SEL   0xFFFFF566   // picker: the row you are on
+#define OVL_MENU       0xFF9AD3FE   // save-data menus: their rows, headings' rows and footers
+#define OVL_MENU_SEL   0xFF9FFDF9   // ...and the row the cursor is on (the editor's line, too)
 
 static volatile DWORD  g_flashCol = OVL_FLASH;   // the colour THIS flash is drawn in
 // Show a status line in the overlay for ~4s, in a colour of the caller's choosing.
@@ -68,6 +71,7 @@ void flash_say(const char* s) { flash_say_c(s, OVL_FLASH); }
 //   IDirect3D9:        CreateDevice = 16
 //   IDirect3DDevice9:  Reset = 16, EndScene = 42, Release = 2 (IUnknown)
 //   ID3DXFont:         DrawTextA = 14, OnLostDevice = 16, OnResetDevice = 17
+//   ID3DXSprite:       Begin = 8, End = 11, OnLostDevice = 12, OnResetDevice = 13
 
 // Minimal, hand-rolled D3DPRESENT_PARAMETERS (all fields are 4 bytes on x86; the
 // layout/order must match the real struct because CreateDevice reads it).
@@ -94,6 +98,7 @@ typedef HRESULT (__stdcall *EndScene_t)(void*);
 typedef HRESULT (__stdcall *Reset_t)(void*, FF13_D3DPP*);
 typedef ULONG   (__stdcall *Release_t)(void*);
 typedef HRESULT (__stdcall *FontOp_t)(void*);   // OnLostDevice / OnResetDevice
+typedef HRESULT (__stdcall *PreloadChars_t)(void*, UINT first, UINT last);
 typedef INT     (__stdcall *DrawTextA_t)(void* font, void* sprite, LPCSTR str, INT count,
                                          RECT* rect, DWORD fmt, DWORD color);   // D3DXFONT::DrawTextA
 typedef INT     (__stdcall *DrawTextW_t)(void* font, void* sprite, const unsigned short* str,
@@ -102,6 +107,8 @@ typedef HRESULT (WINAPI *D3DXCreateFontA_t)(void* dev, INT Height, UINT Width, U
                                             UINT MipLevels, BOOL Italic, DWORD CharSet,
                                             DWORD OutputPrecision, DWORD Quality,
                                             DWORD PitchAndFamily, LPCSTR pFaceName, void** ppFont);
+typedef HRESULT (WINAPI *D3DXCreateSprite_t)(void* dev, void** ppSprite);
+typedef HRESULT (__stdcall *SpriteBegin_t)(void*, DWORD flags);
 
 typedef HRESULT (__stdcall *GetRenderTarget_t)(void*, DWORD idx, void** ppSurface);
 typedef HRESULT (__stdcall *Clear_t)(void*, DWORD count, const void* rects, DWORD flags,
@@ -130,12 +137,19 @@ typedef HRESULT (__stdcall *SBApply_t)(void*);
 #define D3DDEV_VT_SETFVF          89
 #define D3DDEV_VT_SETVSHADER      92
 #define D3DDEV_VT_SETPSHADER      107
+#define SB_VT_CAPTURE             4
 #define SB_VT_APPLY               5
 #define IUNK_VT_RELEASE     2
+#define FONT_VT_PRELOADCHARS 10
 #define FONT_VT_DRAWTEXTA  14
 #define FONT_VT_DRAWTEXTW  15
 #define FONT_VT_ONLOST     16
 #define FONT_VT_ONRESET    17
+#define SPRITE_VT_BEGIN     8
+#define SPRITE_VT_END      11
+#define SPRITE_VT_ONLOST   12
+#define SPRITE_VT_ONRESET  13
+#define D3DXSPRITE_ALPHABLEND_F 0x10
 #define DT_NOCLIP_FLAG   0x100
 
 
@@ -146,7 +160,10 @@ static void* g_origReset    = NULL;   // saved IDirect3DDevice9::Reset
 // hkReset drops the cache.
 static void* g_bbCache    = NULL;
 static void* g_bbCacheDev = NULL;     // the device g_bbCache belongs to (refetched if it changes)
+static int   g_bbWidth    = 0;
 static void* g_font         = NULL;   // ID3DXFont* (lazily created on the real device)
+static void* g_sprite       = NULL;   // ID3DXSprite* every DrawText draws through
+static void* g_spriteActive = NULL;   // = g_sprite only between Begin/End; what the helpers pass
 static volatile LONG g_fontTried    = 0;   // create the font at most once (until device reset)
 static volatile LONG g_overlayReady = 0;   // EndScene hook installed
 
@@ -185,9 +202,8 @@ void vk_label(UINT b, char* out, size_t n) {
 
 // The black behind every line: 0 = a single shadow (2 draws per line), 1 = the four diagonals (5),
 // 2 = all eight neighbours (9).
-// MEASURED on hardware 2026-08-12: setting 2 costs a LARGE part of the frame rate -- the picker
-// draws ~30 text items a frame and D3DXFont does not batch across DrawText calls. The shipped
-// setting is 0 because of it; setting 1 is untested, assume roughly half of what 2 cost.
+// Shipped at 0. The frame-rate cost measured for 2 (2026-08-12) was the per-call state swap, which
+// the shared sprite removed -- 1 and 2 only add quads now.
 #define OVL_OUTLINE 0
 // How far the black sits from the text, in pixels -- a separate knob from the shape, because a wide
 // shadow reads as depth while a wide outline looks like a second, blurry copy of the glyph.
@@ -201,11 +217,15 @@ static const int kOvlOutline[8][2] = { {-1,-1}, {1,-1}, {-1,1}, {1,1},
 // A blended quad behind overlay text. The full device state is captured and put back through a
 // state block (D3DSBT_ALL = 1): D3DXFont's own draws follow on this same pass, and enumerating
 // the dozen states a quad touches is how one gets missed. No state block = no draw.
+// hkReset MUST release this -- an outstanding state block makes the game's own Reset fail.
+static void* g_backdropSB = NULL;
 static void overlay_backdrop(void* dev, float x0, float y0, float x1, float y1, DWORD argb) {
     void** vt = *(void***)dev;
-    void* sb = NULL;
-    ((CreateStateBlock_t)vt[D3DDEV_VT_CREATESTATEBLOCK])(dev, 1, &sb);
+    if (!g_backdropSB)
+        ((CreateStateBlock_t)vt[D3DDEV_VT_CREATESTATEBLOCK])(dev, 1, &g_backdropSB);
+    void* sb = g_backdropSB;
     if (!sb) return;
+    if (((SBApply_t)(*(void***)sb)[SB_VT_CAPTURE])(sb) < 0) return;
     ((SetShader_t)vt[D3DDEV_VT_SETVSHADER])(dev, NULL);
     ((SetShader_t)vt[D3DDEV_VT_SETPSHADER])(dev, NULL);
     ((SetTexture_t)vt[D3DDEV_VT_SETTEXTURE])(dev, 0, NULL);
@@ -232,7 +252,6 @@ static void overlay_backdrop(void* dev, float x0, float y0, float x1, float y1, 
     ((SetFVF_t)vt[D3DDEV_VT_SETFVF])(dev, 0x44 /*XYZRHW|DIFFUSE*/);
     ((DrawPrimUP_t)vt[D3DDEV_VT_DRAWPRIMUP])(dev, 5 /*TRIANGLESTRIP*/, 2, v, sizeof v[0]);
     ((SBApply_t)(*(void***)sb)[SB_VT_APPLY])(sb);
-    ((Release_t)(*(void***)sb)[IUNK_VT_RELEASE])(sb);
 }
 
 // Draw one line, outlined in black for readability. All calls guarded.
@@ -246,17 +265,17 @@ static void overlay_line(void* font, int x, int y, const char* text, DWORD color
 #if OVL_OUTLINE == 0
     r.left = x + OVL_OFFSET_PX; r.top = y + OVL_OFFSET_PX;
     r.right = r.left + 1200; r.bottom = r.top + 60;
-    p(font, NULL, text, -1, &r, DT_NOCLIP_FLAG, 0xFF000000);   // shadow
+    p(font, g_spriteActive, text, -1, &r, DT_NOCLIP_FLAG, 0xFF000000);   // shadow
 #else
     for (int i = 0; i < OVL_OUTLINE_N; i++) {
         r.left = x + kOvlOutline[i][0] * OVL_OFFSET_PX;
         r.top  = y + kOvlOutline[i][1] * OVL_OFFSET_PX;
         r.right = r.left + 1200; r.bottom = r.top + 60;
-        p(font, NULL, text, -1, &r, DT_NOCLIP_FLAG, 0xFF000000);
+        p(font, g_spriteActive, text, -1, &r, DT_NOCLIP_FLAG, 0xFF000000);
     }
 #endif
     r.left = x; r.top = y; r.right = x + 1200; r.bottom = y + 60;
-    p(font, NULL, text, -1, &r, DT_NOCLIP_FLAG, color);        // body, last so it sits on top
+    p(font, g_spriteActive, text, -1, &r, DT_NOCLIP_FLAG, color);        // body, last so it sits on top
 }
 
 // Is a typeface actually installed? Needed because the GDI font mapper substitutes silently instead
@@ -305,6 +324,36 @@ static int overlay_char_w(void* font) {
 // spaces; a Japanese run is measured with DT_CALCRECT. All shadows go down before any body, so a
 // run's outline never clips the glyph drawn before it.
 #define OVL_RUNS_MAX 24
+#define JPW_CACHE_N 128
+static struct { unsigned h; int len; int w; } g_jpw[JPW_CACHE_N];
+static int jp_run_width(void* font, const unsigned short* s, int len) {
+    unsigned h = 2166136261u;
+    for (int i = 0; i < len; i++) h = (h ^ s[i]) * 16777619u;
+    unsigned slot = h % JPW_CACHE_N;
+    if (g_jpw[slot].h == h && g_jpw[slot].len == len && g_jpw[slot].w > 0) return g_jpw[slot].w;
+    void** vt = *(void***)font;
+    DrawTextW_t p = vt ? (DrawTextW_t)vt[FONT_VT_DRAWTEXTW] : NULL;
+    if (!p) return 0;
+    RECT m; m.left = 0; m.top = 0; m.right = 0; m.bottom = 0;
+    p(font, NULL, s, len, &m, DT_CALCRECT_FLAG, 0);
+    int w = (int)(m.right - m.left);
+    if (w > 0) { g_jpw[slot].h = h; g_jpw[slot].len = len; g_jpw[slot].w = w; }
+    return w;
+}
+// Must split and measure exactly as overlay_line_w draws, or a caret placed at x + this drifts.
+static int overlay_width_w(const unsigned short* text) {
+    if (!text || !text[0]) return 0;
+    int cw = g_font ? overlay_char_w(g_font) : 0;
+    int w = 0, i = 0;
+    while (text[i]) {
+        int start = i, ascii = (text[i] < 0x80);
+        while (text[i] && (text[i] < 0x80) == ascii) i++;
+        if (ascii && g_font && cw) { w += cw * (i - start); continue; }
+        if (!g_fontJp) continue;
+        w += jp_run_width(g_fontJp, text + start, i - start);
+    }
+    return w;
+}
 static void overlay_line_w(int x, int y, const unsigned short* text, DWORD color) {
     if (!g_fontJp || !text || !text[0]) return;
     struct { void* font; const unsigned short* s; int len; int x; } runs[OVL_RUNS_MAX];
@@ -323,12 +372,7 @@ static void overlay_line_w(int x, int y, const unsigned short* text, DWORD color
         if (f == g_font) {
             cx += cw * runs[nr].len;
         } else if (text[i]) {                  // the last run's width has no taker: skip the measure
-            void** vt = *(void***)f;
-            DrawTextW_t p = vt ? (DrawTextW_t)vt[FONT_VT_DRAWTEXTW] : NULL;
-            if (!p) return;
-            RECT m; m.left = 0; m.top = 0; m.right = 0; m.bottom = 0;
-            p(f, NULL, runs[nr].s, runs[nr].len, &m, DT_CALCRECT_FLAG, 0);
-            cx += (int)(m.right - m.left);
+            cx += jp_run_width(f, runs[nr].s, runs[nr].len);
         }
         nr++;
     }
@@ -344,18 +388,18 @@ static void overlay_line_w(int x, int y, const unsigned short* text, DWORD color
 #if OVL_OUTLINE == 0
                 r.left = runs[k].x + OVL_OFFSET_PX; r.top = yy + OVL_OFFSET_PX;
                 r.right = r.left + 1200; r.bottom = r.top + 60;
-                p(runs[k].font, NULL, runs[k].s, runs[k].len, &r, DT_NOCLIP_FLAG, 0xFF000000);
+                p(runs[k].font, g_spriteActive, runs[k].s, runs[k].len, &r, DT_NOCLIP_FLAG, 0xFF000000);
 #else
                 for (int o = 0; o < OVL_OUTLINE_N; o++) {
                     r.left = runs[k].x + kOvlOutline[o][0] * OVL_OFFSET_PX;
                     r.top  = yy + kOvlOutline[o][1] * OVL_OFFSET_PX;
                     r.right = r.left + 1200; r.bottom = r.top + 60;
-                    p(runs[k].font, NULL, runs[k].s, runs[k].len, &r, DT_NOCLIP_FLAG, 0xFF000000);
+                    p(runs[k].font, g_spriteActive, runs[k].s, runs[k].len, &r, DT_NOCLIP_FLAG, 0xFF000000);
                 }
 #endif
             } else {
                 r.left = runs[k].x; r.top = yy; r.right = r.left + 1200; r.bottom = yy + 60;
-                p(runs[k].font, NULL, runs[k].s, runs[k].len, &r, DT_NOCLIP_FLAG, color);
+                p(runs[k].font, g_spriteActive, runs[k].s, runs[k].len, &r, DT_NOCLIP_FLAG, color);
             }
         }
     }
@@ -365,6 +409,47 @@ static void overlay_line_w(int x, int y, const unsigned short* text, DWORD color
 // into a plain char buffer and this picks the path, so only a line with a byte over 0x7F pays for
 // the conversion. A failed conversion falls back to the ASCII path -- mojibake looks like exactly
 // what it is, where a blank line would look like the feature having stopped working.
+static void overlay_say(void* font, int x, int y, const char* utf8, DWORD color);
+// A "\n" in the text is a PREFERRED break, not a hard one: it is used only when the line will not
+// fit, and otherwise it DISAPPEARS -- put any space the joined text needs BEFORE it, never after.
+#define OVL_WRAP_LINES 3
+static int overlay_say_wrap(void* font, int x, int contX, int y, const char* utf8, DWORD color,
+                            int lineH) {
+    int cw = overlay_char_w(font);
+    int budget = (g_bbWidth > 0 && cw > 0) ? (g_bbWidth - x - 14) / cw : 0;
+    if (budget < 16) { overlay_say(font, x, y, utf8, color); return 1; }
+    const unsigned char* p = (const unsigned char*)utf8;
+    char line[512];
+    int used = 0;
+    while (*p && used < OVL_WRAP_LINES) {
+        int lx = used ? contX : x;
+        int lim = budget - (lx - x) / (cw ? cw : 1);
+        int cells = 0, n = 0;
+        int wantN = -1, spaceN = -1;
+        const unsigned char* wantQ = NULL, *spaceQ = NULL;
+        const unsigned char* q = p;
+        while (*q && n < (int)sizeof line - 4) {
+            if (*q == '\n') { wantN = n; wantQ = q + 1; q++; continue; }
+            int len = (*q < 0x80) ? 1 : (*q < 0xE0) ? 2 : (*q < 0xF0) ? 3 : 4;
+            int cost = (len == 1) ? 1 : 2;
+            if (cells + cost > lim) break;
+            if (*q == ' ') { spaceN = n; spaceQ = q + 1; }
+            for (int i = 0; i < len && *q; i++) line[n++] = (char)*q++;
+            cells += cost;
+        }
+        if (*q) {
+            if (wantN >= 0)                       { n = wantN;  q = wantQ; }
+            else if (spaceN >= 0 && *q != ' ' && (unsigned char)*q < 0x80) { n = spaceN; q = spaceQ; }
+        }
+        line[n] = 0;
+        overlay_say(font, lx, y + used * lineH, line, color);
+        used++;
+        while (*q == ' ' || *q == '\n') q++;
+        p = q;
+    }
+    return used ? used : 1;
+}
+
 static void overlay_say(void* font, int x, int y, const char* utf8, DWORD color) {
     if (!utf8) return;
     const unsigned char* p = (const unsigned char*)utf8;
@@ -380,12 +465,18 @@ static void overlay_say(void* font, int x, int y, const char* utf8, DWORD color)
 // The battle overlay's own row: a label on the left, a figure right-aligned against a fixed edge so
 // the digits stay under each other as they change. The figure is ASCII in either language, so the
 // ASCII font's character width places it exactly; the label may be translated and is drawn from the
-// left. The column is 16 rather than the 12 the widest figure (8 chars) needs, because a full-width
-// glyph is about twice an ASCII one -- five of them fit. Keep these labels short.
-#define OVL_BATTLE_COL 16           // where the figure ends, in characters from x=14
+// left. 18 must clear indent + longest label + figure together, since the two are drawn from
+// opposite ends: "ATB 12s" (7) against "READY " (6) leaves three characters. A full-width glyph is
+// about twice an ASCII one, so keep these labels short.
+#define OVL_BATTLE_COL 18           // where the figure ends, in characters from x=14
+#define OVL_BATTLE_INDENT 2         // ...and where a row's label starts, under its heading
+static void overlay_battle_head(void* font, int y, const char* label) {
+    overlay_say(font, 14, y, label, OVL_BATTLE_HEAD);
+}
+
 static void overlay_battle_row(void* font, int y, const char* label, const char* value) {
-    overlay_say(font, 14, y, label, OVL_BATTLE);
     int cw = overlay_char_w(font);
+    overlay_say(font, 14 + OVL_BATTLE_INDENT * cw, y, label, OVL_BATTLE);
     int n  = (int)strlen(value);
     int x  = 14 + (OVL_BATTLE_COL - n) * cw;
     overlay_line(font, x, y, value, OVL_BATTLE);
@@ -445,12 +536,79 @@ int read_via_ptr(unsigned ptrRva, int off) {
     return *(int*)(p + off);
 }
 
+// ---- paradigm shift -> party-wide ATB refill (see common/docs/PARADIGM_ATB_RE.md) ----
+#define OFF_BM_BTLCLOCK  0x4C       // battle clock (ms). NOT +0x60: that one pauses on another flag
+#define OFF_BM_OPTSTAMP  0xE0       // the battle clock reading when the last shift refilled ATB
+#define OFF_BM_FLAGS     0x38       // battle flags, a dword bitset
+#define BFLAG_EASY       0x49       // set = the interval is scaled by fEasyOptCh
+#define RVA_OPT_ATB_TIME 0x23FD47C  // iOptAtbTime; 0 until the battle database has loaded
+#define RVA_EASY_OPT_CH  0x23FD4C0  // fEasyOptCh
+
+// Milliseconds until a paradigm shift refills the party's ATB again; <= 0 = the next one does.
+static int atb_shift_left_ms(int* out, int* period) {
+    char* bm = *(char**)(g_base + RVA_BM_PTR);
+    if (!bm || IsBadReadPtr(bm, OFF_BM_OPTSTAMP + 4)) return 0;
+    int iv = *(int*)(g_base + RVA_OPT_ATB_TIME);
+    if (iv <= 0) return 0;                       // constants not loaded yet, not "always ready"
+    const uint32_t* fl = (const uint32_t*)(bm + OFF_BM_FLAGS);
+    if (fl[BFLAG_EASY >> 5] & (1u << (BFLAG_EASY & 31)))
+        iv = (int)((float)iv * *(float*)(g_base + RVA_EASY_OPT_CH));
+    *out = iv - (*(int*)(bm + OFF_BM_BTLCLOCK) - *(int*)(bm + OFF_BM_OPTSTAMP));
+    if (period) *period = iv;                    // easy mode scales it, so never hardcode the 12
+    return 1;
+}
+
+// ---- the target's chain gauge -> how long it still holds (see common/docs/CHAIN_GAUGE_RE.md) ----
+#define OFF_CHARA_HP     0x290
+
+// The probe span deliberately reaches the chain object -- far past any field read here, because
+// callers read that one off the returned pointer. Two enemies on equal HP resolve to the lower
+// actor id.
+static uintptr_t target_actor(int hp) {
+    uint32_t* tbl = actor_table();
+    if (!tbl) return 0;
+    for (int i = 0; i < ACTOR_SLOTS; i++) {
+        uintptr_t a = tbl[i];
+        if (!a || IsBadReadPtr((void*)a, OFF_CHARA_CHAIN + OFF_CHAIN_LEFT + 4)) continue;
+        // The table holds the party too, and a party member on the target's exact HP would
+        // answer for it: only the enemy side may match.
+        if (!(*(unsigned char*)(a + OFF_TEAM) & 0x04)) continue;
+        if (*(int*)(a + OFF_CHARA_HP) != hp) continue;
+        return a;
+    }
+    return 0;
+}
+
 // Milliseconds as m:ss.cc (minutes : seconds . centiseconds).
 static void fmt_mmsscc(int ms, char* out, size_t n) {
     if (ms < 0) ms = 0;
     int m = ms / 60000, rem = ms % 60000, s = rem / 1000, cc = (rem % 1000) / 10;
     snprintf(out, n, "%d:%02d.%02d", m, s, cc);
 }
+
+#ifdef FF13_DIAG
+// Per-5s draw-cost census. drawn/s above the frame rate = several back-buffer EndScene passes in
+// one frame, each repainting the overlay.
+static DWORD    g_diagCalls = 0, g_diagDraws = 0;
+static LONGLONG g_diagTicks = 0;
+static char g_passTrace[49]; static int g_passN = 0;
+static void overlay_diag(LONGLONG dt) {
+    static DWORD win = 0;
+    g_diagCalls++; g_diagTicks += dt;
+    DWORD now = GetTickCount();
+    if (!win) { win = now; return; }
+    if (now - win < 5000) return;
+    if (g_diagDraws && g_qpcFreq.QuadPart > 0) {
+        double secs = (now - win) / 1000.0;
+        double us   = (double)g_diagTicks * 1e6 / (double)g_qpcFreq.QuadPart;
+        g_passTrace[g_passN] = 0;
+        ff13loga("[FF13-SRP] overlay diag: %.0f EndScene/s, %.0f drawn/s, cpu %.0fus/s "
+                 "(%.0fus per drawn pass) passes \"%s\"\n", g_diagCalls / secs,
+                 g_diagDraws / secs, us / secs, us / g_diagDraws, g_passTrace);
+    }
+    win = now; g_diagCalls = 0; g_diagDraws = 0; g_diagTicks = 0; g_passN = 0;
+}
+#endif
 
 // Runs on the game (render) thread from hkEndScene. Creates the font lazily against the REAL
 // device.
@@ -480,13 +638,31 @@ static void overlay_draw(void* dev) {
     // leaving either out gates it on the other indicators (an open list vanished once the open
     // flash expired). black is also computed before the font, which the blackout does not need.
     int showPicker = g_bsOpen && g_bsCount > 0;
+    int showSort = g_ssOpen;
+    int showLsel = g_lselOpen;
+    int showEdit = g_labelEdit;
     int black = blackout_on();
+    // Enforced on the render thread because a stalled worker cannot enforce anything; the 2s delay
+    // is what keeps the frame between "menu opened" and "input gate armed" from counting as lapsed.
+    {
+        static DWORD staleSince = 0;
+        if ((showSort || showLsel) && !showEdit && di_gate_left_ms() <= 0) {
+            DWORD nowT = GetTickCount();
+            if (!staleSince) staleSince = nowT;
+            else if (nowT - staleSince > 2000) {
+                staleSince = 0;
+                g_ssOpen = 0; g_lselOpen = 0;
+                showSort = showLsel = 0;
+                ff13loga("[FF13-SRP] save menu: the input gate lapsed under it -- closed\n");
+            }
+        } else staleSince = 0;
+    }
     int help = g_helpOpen != 0;
     // g_fontTried holds the first pass open even with nothing to show: the fonts must exist
     // BEFORE the first flash_say resolves its language, or a JP session's first flash comes
     // out English (ui_text falls back while g_fontJp is still NULL).
-    if (!a && !s && !w && !showBattle && !tpShow && !showPicker && !black && !help
-        && g_fontTried) return;
+    if (!a && !s && !w && !showBattle && !tpShow && !showPicker && !showSort
+        && !showLsel && !showEdit && !black && !help && g_fontTried) return;
 
     // Draw ONLY on the pass whose render target is the back buffer. FF13 calls EndScene many times
     // per frame (scene -> intermediate RTs -> post-processing -> back buffer), and drawing our
@@ -498,12 +674,35 @@ static void overlay_draw(void* dev) {
         if (!bb) return;                       // cannot identify the pass -- same outcome as before
         ((Release_t)(*(void***)bb)[IUNK_VT_RELEASE])(bb);   // identity kept, reference dropped
         g_bbCache = bb; g_bbCacheDev = dev;
+        // D3DSURFACE_DESC: Format, Type, Usage, Pool, MultiSampleType, MultiSampleQuality,
+        // Width, Height -- eight DWORDs, so the width is the seventh. IDirect3DSurface9::GetDesc
+        // is vtable slot 12.
+        {
+            DWORD d[8] = {0};
+            typedef HRESULT (__stdcall *GetDesc_t)(void*, void*);
+            void** bvt = *(void***)bb;
+            if (bvt && ((GetDesc_t)bvt[12])(bb, d) >= 0 && d[6] > 100) g_bbWidth = (int)d[6];
+        }
     }
     void* rt = NULL;
     ((GetRenderTarget_t)dvt[D3DDEV_VT_GETRENDERTARGET])(dev, 0, &rt);
     int onBackbuffer = (rt != NULL && rt == g_bbCache);
     if (rt) ((Release_t)(*(void***)rt)[IUNK_VT_RELEASE])(rt);
-    if (!onBackbuffer) return;
+    // Draw on the FIRST back-buffer pass of the run only. MEASURED 2026-08-27: the frame binds the
+    // back buffer for TWO EndScene passes in a row, and drawing on both painted the overlay twice.
+    // First-of-run, not second, so a frame with a single bb pass still gets its draw.
+    {
+        static int prevWasBb = 0;
+        int repeatBb = onBackbuffer && prevWasBb;
+        prevWasBb = onBackbuffer;
+#ifdef FF13_DIAG
+        if (g_passN < 48) g_passTrace[g_passN++] = onBackbuffer ? (repeatBb ? 'b' : 'B') : '-';
+#endif
+        if (!onBackbuffer || repeatBb) return;
+    }
+#ifdef FF13_DIAG
+    g_diagDraws++;
+#endif
 
     // Cover the staging. A clear of the whole target rather than a blended quad: it needs no render
     // state of its own, so there is nothing to save and nothing to put back. The overlay's own
@@ -524,6 +723,8 @@ static void overlay_draw(void* dev) {
                 HRESULT hr = pCreateFont(dev, OVL_FONT_H, 0, 700, 1, FALSE, 1, 0, 5, 0, OVL_FONT_FACE, &font);
                 if (hr >= 0 && font) {
                     g_font = font;
+                    // ASCII into the glyph atlas now, not on a digit's first appearance mid-fight.
+                    ((PreloadChars_t)(*(void***)font)[FONT_VT_PRELOADCHARS])(font, 0x20, 0x7E);
                     // Asked for by name ONLY after checking the name is installed: the GDI mapper
                     // never fails, it substitutes.
                     const char* face = font_installed(OVL_FONT_FACE_JP) ? OVL_FONT_FACE_JP : NULL;
@@ -536,6 +737,13 @@ static void overlay_draw(void* dev) {
                              g_fontJp ? " (+ Japanese: " : " (no Japanese font -- names hidden)",
                              g_fontJp ? (face ? OVL_FONT_FACE_JP ")" : "system default, "
                                                OVL_FONT_FACE_JP " not installed)") : "");
+                    D3DXCreateSprite_t pCS =
+                        (D3DXCreateSprite_t)GetProcAddress(hx, "D3DXCreateSprite");
+                    void* sp = NULL;
+                    if (pCS && pCS(dev, &sp) >= 0 && sp) g_sprite = sp;
+                    ff13loga("[FF13-SRP] overlay: %s\n",
+                             g_sprite ? "text batched through one sprite"
+                                      : "no sprite -- per-call draws");
                 } else {
                     ff13loga("[FF13-SRP] overlay: D3DXCreateFontA failed hr=0x%08X\n", (unsigned)hr);
                 }
@@ -543,6 +751,14 @@ static void overlay_draw(void* dev) {
         }
     }
     if (!g_font) return;
+
+    // Plain ALPHABLEND on purpose: SORT_TEXTURE reorders across textures, and a JP run's shadow
+    // (2px off) could then land on top of its ASCII neighbour's body.
+    if (g_sprite) {
+        void** svt = *(void***)g_sprite;
+        if (svt && ((SpriteBegin_t)svt[SPRITE_VT_BEGIN])(g_sprite, D3DXSPRITE_ALPHABLEND_F) >= 0)
+            g_spriteActive = g_sprite;
+    }
 
     int y = 10;
     char buf[288], key[32];      // buf holds a formatted line -- see g_flash on the size
@@ -554,11 +770,13 @@ static void overlay_draw(void* dev) {
             { &g_supVk,        T_HELP_SUPPRESS },
             { &g_saveVk,       T_HELP_SAVE },
             { &g_camUnstickVk, T_HELP_CAMERA },
+            { &g_ssVk,         T_HELP_SORT },
             { &g_boVk,         T_HELP_BATTLE_OVL },
             { &g_bsVk,         T_HELP_PICKER },
         };
         int anyBad = cfg_bad_list()[0] != 0;
-        int nrows = 1 + (int)(sizeof(kHelp)/sizeof(kHelp[0])) + (anyBad ? 1 : 0);
+        // x2: a row can wrap to a second line, so the panel is sized for the worst case.
+        int nrows = 1 + 2 * (int)(sizeof(kHelp)/sizeof(kHelp[0])) + (anyBad ? 1 : 0);
         overlay_backdrop(dev, 0.f, (float)(y - 4), 4096.f, (float)(y + nrows * 24 + 8),
                          0x99000000);
         char kb[36], lbl[32];
@@ -584,7 +802,8 @@ static void overlay_draw(void* dev) {
             }
             snprintf(buf, sizeof buf, "%-16s %s%s", kb, name,
                      cfg_vk_bad(kHelp[i].vk) ? ui_text(T_HELP_BADKEY) : "");
-            overlay_say(g_font, 14, y, buf, OVL_BATTLE); y += 24;
+            y += 24 * overlay_say_wrap(g_font, 14, 14 + 17 * overlay_char_w(g_font), y, buf,
+                                       OVL_BATTLE, 24);
         }
         if (anyBad) {
             snprintf(buf, sizeof buf, ui_text(T_HELP_BADCFG), cfg_bad_list());
@@ -672,6 +891,120 @@ static void overlay_draw(void* dev) {
         y += 12;                   // half a line, so the two blocks read as two blocks
     }
 
+    // Drawn before the save-list menu below, so the editor sits above it on screen.
+    if (showEdit) {
+        int em = edit_mode();
+        overlay_backdrop(dev, 0.f, (float)(y - 4), 4096.f, (float)(y + 5 * 24 + 8), 0x99000000);
+        if (em == EDIT_LABEL) snprintf(buf, sizeof buf, ui_text(T_LABEL_EDIT_HEAD), g_labelEditSlot + 1);
+        else snprintf(buf, sizeof buf, "%s",
+                      ui_text(em == EDIT_CAT_RENAME ? T_SS_CAT_RENAME_HEAD : T_SS_CAT_NAME_HEAD));
+        overlay_say(g_font, 14, y, buf, OVL_BATTLE); y += 24;
+        {
+            const unsigned short* t = (const unsigned short*)label_edit_text();
+            int x0 = 14 + 4 * overlay_char_w(g_font);
+            overlay_line(g_font, 14, y, "  >", OVL_MENU_SEL);
+            if (t && t[0]) overlay_line_w(x0, y, t, OVL_MENU_SEL);
+            overlay_line(g_font, x0 + overlay_width_w(t), y, "_", OVL_MENU_SEL);
+            y += 24;
+        }
+        if (em != EDIT_LABEL) {
+            y += 24 * overlay_say_wrap(g_font, 14, 14, y, ui_text(T_SS_CAT_EDIT_HELP),
+                                       label_edit_bad() ? OVL_INSTANT : OVL_MENU, 24);
+        } else if (label_edit_bad()) {
+            snprintf(buf, sizeof buf, ui_text(T_LABEL_EDIT_FULL), LABEL_TEXT_MAX);
+            y += 24 * overlay_say_wrap(g_font, 14, 14, y, buf, OVL_INSTANT, 24);
+        } else {
+            y += 24 * overlay_say_wrap(g_font, 14, 14, y, ui_text(T_LABEL_EDIT_HELP), OVL_MENU, 24);
+        }
+        { char lk[32]; vk_label(g_ssVk, lk, sizeof lk);
+          snprintf(buf, sizeof buf,
+                   ui_text(em == EDIT_LABEL ? T_LABEL_EDIT_KEYS : T_SS_CAT_EDIT_KEYS), lk); }
+        overlay_say(g_font, 14, y, buf, OVL_MENU); y += 24;
+        y += 12;
+    }
+
+    if (showSort) {
+        char up[32], down[32], k[32], cancel[32];
+        vk_label(g_bsUpVk, up, sizeof up);   vk_label(g_bsDownVk, down, sizeof down);
+        vk_label(g_ssVk, k, sizeof k);       vk_label(g_warpCancelVk, cancel, sizeof cancel);
+        static const ovl_msg kModes[SS_MODES] = { T_SS_FILTER_ALL,
+                                                  T_SS_CAT_PICK_NONE, T_SS_CAT_NEW, T_SS_CAT_RENAME,
+                                                  T_SS_STORY_ASC, T_SS_STORY_DESC, T_SS_NUMBER,
+                                                  T_SS_RENUM };
+        // The heading each row opens a group with; -1 = the row continues the group above it.
+        static const int kGroup[SS_MODES] = { T_SS_GRP_FILTER,
+                                              T_SS_GRP_CAT, -1, -1,
+                                              T_SS_GRP_SORT, -1, -1,
+                                              T_SS_GRP_RENUM };
+        int rows = SS_MODES + 6;              // title + four headings + the rows + the footer
+        overlay_backdrop(dev, 0.f, (float)(y - 4), 4096.f, (float)(y + rows * 24 + 8), 0x99000000);
+        overlay_say(g_font, 14, y, ui_text(T_SS_HEAD), OVL_BATTLE); y += 24;
+        for (int i = 0; i < SS_MODES; i++) {
+            if (kGroup[i] >= 0) {
+                overlay_say(g_font, 14, y, ui_text((ovl_msg)kGroup[i]), OVL_FLASH); y += 24;
+            }
+            char row[160];
+            const char* pick = (i == SS_CAT_PICK) ? cat_name_sel() : NULL;
+            if (i == SS_FILTER && g_filterChapter)
+                snprintf(row, sizeof row, ui_text(T_SS_FILTER_ONE),
+                         g_filterChapter, filter_count_of(g_filterChapter));
+            else if (i == SS_CAT_PICK)
+                snprintf(row, sizeof row,
+                         ui_text(pick ? T_SS_CAT_PICK
+                                      : cat_count() ? T_SS_CAT_PICK_IDLE : T_SS_CAT_PICK_NONE),
+                         cat_name_cur(), pick);
+            else
+                snprintf(row, sizeof row, "%s", ui_text(kModes[i]));
+            snprintf(buf, sizeof buf, "   %s %s", (i == g_ssSel) ? ">" : " ", row);
+            overlay_say(g_font, 14, y, buf, (i == g_ssSel) ? OVL_MENU_SEL : OVL_MENU); y += 24;
+        }
+        if (g_ssSel == SS_FILTER || g_ssSel == SS_CAT_PICK) {
+            char l[32], r[32];
+            vk_label(g_bsLeftVk, l, sizeof l); vk_label(g_bsRightVk, r, sizeof r);
+            snprintf(buf, sizeof buf,
+                     ui_text(g_ssSel == SS_FILTER ? T_SS_FILTER_KEYS : T_SS_CAT_KEYS), l, r);
+        }
+        else                         snprintf(buf, sizeof buf, ui_text(T_SS_FOOT), up, down, k, cancel);
+        overlay_say(g_font, 14, y, buf, OVL_MENU); y += 24;
+        y += 12;
+    }
+
+    if (showLsel) {
+        char up[32], down[32], l[32], r[32], k[32];
+        vk_label(g_bsUpVk, up, sizeof up);       vk_label(g_bsDownVk, down, sizeof down);
+        vk_label(g_bsLeftVk, l, sizeof l);       vk_label(g_bsRightVk, r, sizeof r);
+        vk_label(g_ssVk, k, sizeof k);
+        static const ovl_msg kLselRows[LSEL_ROWS] = { T_LSEL_NOTE, T_SEND_COPY, T_SEND_MOVE };
+        // The heading each row opens a group with; -1 = the row continues the group above it.
+        static const int kLselGroup[LSEL_ROWS] = { T_LSEL_GRP_NOTE, T_LSEL_GRP_SEND, -1 };
+        int rows = LSEL_ROWS + 4;             // title + two headings + the rows + the footer
+        overlay_backdrop(dev, 0.f, (float)(y - 4), 4096.f, (float)(y + rows * 24 + 8), 0x99000000);
+        snprintf(buf, sizeof buf, ui_text(T_LSEL_HEAD), g_lselSlot + 1);
+        overlay_say(g_font, 14, y, buf, OVL_BATTLE); y += 24;
+        for (int i = 0; i < LSEL_ROWS; i++) {
+            if (kLselGroup[i] >= 0) {
+                if (kLselGroup[i] == T_LSEL_GRP_SEND) {
+                    const char* dest = send_dest_name();
+                    snprintf(buf, sizeof buf, ui_text(T_LSEL_GRP_SEND),
+                             dest ? dest : ui_text(T_SEND_NEWCAT));
+                } else {
+                    snprintf(buf, sizeof buf, "%s", ui_text((ovl_msg)kLselGroup[i]));
+                }
+                overlay_say(g_font, 14, y, buf, OVL_FLASH); y += 24;
+            }
+            snprintf(buf, sizeof buf, "   %s %s", (i == g_lselSel) ? ">" : " ",
+                     ui_text(kLselRows[i]));
+            overlay_say(g_font, 14, y, buf, (i == g_lselSel) ? OVL_MENU_SEL : OVL_MENU); y += 24;
+        }
+        // No cancel key here: the game's own save list reads that one as "back" and would take
+        // itself away with it.
+        if (g_lselSel == LSEL_NOTE) snprintf(buf, sizeof buf, ui_text(T_LSEL_KEYS), up, down, k);
+        else snprintf(buf, sizeof buf, ui_text(T_LSEL_SEND_KEYS), up, down, l, r, k);
+        overlay_say(g_font, 14, y, buf, OVL_MENU); y += 24;
+        y += 12;
+    }
+
+
     // One line for whatever the kill mode is set to; instant-win gets the louder colour and sits
     // above game-speed.
     if (a) {
@@ -694,9 +1027,9 @@ static void overlay_draw(void* dev) {
     if (g_swapEnabled && g_swapBtscId) {           // amber, field + battle
         overlay_say(g_font, 14, y, ui_text(T_SWAP), OVL_SWAP); y += 24;
     }
-    // Battle timer (per-fight GAME + REAL) + enemy HP, shown during battle when the toggle is ON.
     if (showBattle) {
-        char t[24];
+        char t[24], lbl[24];
+        overlay_battle_head(g_font, y, ui_text(T_BATTLE_HEAD_TIME)); y += 24;
         int gms = battle_gametime_ms();
         if (gms >= 0) {
             fmt_mmsscc(gms, t, sizeof t);
@@ -708,10 +1041,33 @@ static void overlay_draw(void* dev) {
                     ? (int)((end - g_realStart.QuadPart) * 1000 / g_qpcFreq.QuadPart) : 0;
         fmt_mmsscc(rms, t, sizeof t);
         overlay_battle_row(g_font, y, ui_text(T_TIMER_REAL), t); y += 24;
+        int left = 0, period = 0;
+        if (atb_shift_left_ms(&left, &period)) {
+            // The trailing space is load-bearing: the row is right-aligned as a whole and GAME /
+            // REAL carry two decimals where this carries one -- without it the points misalign.
+            if (left <= 0) snprintf(t, sizeof t, "READY ");
+            else           snprintf(t, sizeof t, "%d.%d ", left / 1000, (left % 1000) / 100);
+            snprintf(lbl, sizeof lbl, ui_text(T_ATB_SHIFT), (period + 500) / 1000);
+            overlay_battle_row(g_font, y, lbl, t); y += 24;
+        }
         int hp = read_via_ptr(RVA_TARGETHP_PTR, OFF_TARGETHP);       // current target HP (asl)
         if (hp > 0) {
+            overlay_battle_head(g_font, y, ui_text(T_BATTLE_HEAD_TARGET)); y += 24;
             snprintf(t, sizeof t, "%d", hp);
             overlay_battle_row(g_font, y, ui_text(T_ENEMY_HP), t); y += 24;
+            uintptr_t a = target_actor(hp);
+            if (a) {
+                // 1000 raw = one gauge segment (the unit the player's own bar shows); 100 raw =
+                // the cost of one ability point.
+                int atb = *(int*)(a + OFF_CHARA_ATB); if (atb < 0) atb = 0;
+                snprintf(t, sizeof t, "%d.%d ", atb / 1000, (atb % 1000) / 100);
+                overlay_battle_row(g_font, y, ui_text(T_ENEMY_ATB), t); y += 24;
+                int st = *(int*)(a + OFF_CHARA_CHAIN + OFF_CHAIN_STATE);
+                int cl = *(int*)(a + OFF_CHARA_CHAIN + OFF_CHAIN_LEFT);
+                int chain = (st && cl > 0) ? cl : 0;   // state 0: +0x18 is stale, not short
+                snprintf(t, sizeof t, "%d.%d ", chain / 1000, (chain % 1000) / 100);
+                overlay_battle_row(g_font, y, ui_text(T_CHAIN_LEFT), t); y += 24;
+            }
         }
     }
     // Warp in-game dialog: the confirm question with its OK/Cancel keys, or a transient status line.
@@ -724,30 +1080,56 @@ static void overlay_draw(void* dev) {
         snprintf(line, sizeof line, ui_text(T_WARP_ASK_KEYS), again, again, cancel);
         overlay_say(g_font, 14, y, line, OVL_WARP_PROMPT); y += 24;
     } else if ((int)(g_flashUntil - GetTickCount()) > 0) {
-        overlay_say(g_font, 14, y, g_flash, g_flashCol); y += 24;
+        y += 24 * overlay_say_wrap(g_font, 14, 14, y, g_flash, g_flashCol, 24);
+    }
+
+    if (g_spriteActive) {                 // buffered text renders here, over any backdrop quad
+        void* sp = g_spriteActive;
+        g_spriteActive = NULL;
+        ((FontOp_t)(*(void***)sp)[SPRITE_VT_END])(sp);
     }
 }
 
 // EndScene hook: draw first, then chain to the original.
 static HRESULT __stdcall hkEndScene(void* dev) {
+#ifdef FF13_DIAG
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
     overlay_draw(dev);
+    QueryPerformanceCounter(&t1);
+    overlay_diag(t1.QuadPart - t0.QuadPart);
+#else
+    overlay_draw(dev);
+#endif
     EndScene_t o = (EndScene_t)g_origEndScene;
     return o ? o(dev) : 0;
+}
+
+static void com_op(void* obj, int slot) {
+    if (!obj) return;
+    void** vt = *(void***)obj;
+    if (vt && vt[slot]) ((FontOp_t)vt[slot])(obj);
 }
 
 // Reset hook: release GPU-side font resources across a device reset (resolution change / device
 // lost), chain to the original, then restore them on success.
 static HRESULT __stdcall hkReset(void* dev, FF13_D3DPP* pp) {
-    g_bbCache = NULL; g_bbCacheDev = NULL;   // Reset recreates the back buffer; refetch lazily
-    if (g_font) {
-        void** fvt = *(void***)g_font;
-        if (fvt && fvt[FONT_VT_ONLOST]) ((FontOp_t)fvt[FONT_VT_ONLOST])(g_font);
+    g_bbCache = NULL; g_bbCacheDev = NULL; g_bbWidth = 0;   // Reset recreates it; refetch lazily
+    // ALL THREE, or the game's own Reset fails with D3DERR_INVALIDCALL: each holds default-pool
+    // GPU objects, and one left unreleased is enough.
+    com_op(g_font,   FONT_VT_ONLOST);
+    com_op(g_fontJp, FONT_VT_ONLOST);
+    com_op(g_sprite, SPRITE_VT_ONLOST);
+    if (g_backdropSB) {
+        ((Release_t)(*(void***)g_backdropSB)[IUNK_VT_RELEASE])(g_backdropSB);
+        g_backdropSB = NULL;
     }
     Reset_t o = (Reset_t)g_origReset;
     HRESULT hr = o ? o(dev, pp) : 0;
-    if (g_font && hr >= 0) {
-        void** fvt = *(void***)g_font;
-        if (fvt && fvt[FONT_VT_ONRESET]) ((FontOp_t)fvt[FONT_VT_ONRESET])(g_font);
+    if (hr >= 0) {
+        com_op(g_font,   FONT_VT_ONRESET);
+        com_op(g_fontJp, FONT_VT_ONRESET);
+        com_op(g_sprite, SPRITE_VT_ONRESET);
     }
     return hr;
 }

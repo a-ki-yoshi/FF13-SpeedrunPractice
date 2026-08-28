@@ -148,6 +148,7 @@ int hk_edge(UINT b, int* was);
 #define RVA_ACTORSECT 0x3795EA       // VA 0x7795EA  add ecx,0xE8   (ecx = the actor)
 #define RVA_STARTBTL 0x0BB5B0          // VA 0x4BB5B0 startBattle(btsc, flags)
 #define RVA_GAMELOG 0x4A5B20              // VA 0x8A5B20
+#define RVA_ASSERT  0xA8B2E0              // VA 0xE8B2E0 the game's assert (dies at +0x96)
 #define RVA_TRACE 0x4A5A60                 // VA 0x8A5A60
 #define RVA_CAMSEQ 0x195620          // VA 0x595620
 #define RVA_CAMREQ      0x0D6C20  // VA 0x4D6C20  __thiscall requestCamArts(BattleMain, req*, int)
@@ -155,6 +156,7 @@ int hk_edge(UINT b, int* was);
 #define RVA_FIELDMGR_PTR 0x23FF124     // VA 0x27FF124, candidate global
 #define RVA_BGMPLAY   0x6CED90       // VA 0xACED90 BgmManager play entry (ecx, arg2 = name)
 #define RVA_BGMLAZY   0x6CF080       // VA 0xACF080 BgmManager::lazyPlay (ecx, arg1 = name)
+#define RVA_BANKPLAY  0x6F7A40       // VA 0xAF7A40 the sound service's "give me a stream"
 #define RVA_ENCCHECK   0x1CEE00       // VA 0x5CEE00 doEncountCheck (ecx = field manager)
 #define BS_MENU_MAX 400   // the 11xxx band alone holds ~395 scenes
 #define BS_NAME_COL 34
@@ -268,6 +270,14 @@ typedef struct ff13_arena_s { uint16_t btsc; const char* arena; uint32_t flags;
                                                    // a field inserted above silently shifts them
         ff13_arena;
 
+// Field objects the story's own hand removes right before a fight, for picks that start without
+// that hand (no event door). Every row is undone once the field is home.
+#define FDROP_AREA 0
+#define FDROP_HIDE 1
+#define FDROP_AREA_EX 2   // dropped via deactivateAreaEx, as the story handles this group
+typedef struct { uint16_t btsc; uint8_t kind; const char* name; } ff13_fielddrop;
+const ff13_fielddrop* field_drops(uint32_t btsc, int* n);
+
 // ---- diagnostic probes (release builds get the no-ops) ----
 #ifdef FF13_DIAG
 void turn_watch_tick(void);
@@ -290,6 +300,7 @@ extern UINT g_warpCancelVk;
 extern UINT g_boVk;
 extern UINT g_saveVk;
 extern UINT g_camUnstickVk;
+extern UINT g_ssVk;
 extern volatile int g_hkFocusOnly;
 extern volatile int g_killMode;
 extern volatile unsigned char g_battleOverlay;
@@ -366,6 +377,16 @@ int bgm_is_outcome_track(const char* n);
 extern volatile uint32_t g_lastBtscId;
 extern volatile uint32_t g_lastTouchedId;
 extern volatile uint32_t g_fieldMgr;
+#define RVA_UNLOADSND 0x7DE370       // VA 0xBDE370 Resource.unloadSoundResource(String, String)
+void vm_unload_sound(const char* name, const char* group);
+int  sound_slots_free(void);
+void sound_make_room(const char* want);
+void sound_give_room_back(void);
+void bank_log_reset(void);
+void bank_log_pump(void);
+void bgm_heal_standdown(void);
+void __cdecl on_bank_play(uint32_t ecx, uint32_t name);
+void __cdecl on_game_assert(uint32_t ecx, uint32_t line, uint32_t* a, uint32_t* unused);
 void __cdecl on_start_battle(uint32_t vmctx);
 extern const uint8_t P_ENC[6];
 extern void* g_encCave;
@@ -387,7 +408,7 @@ extern volatile int g_lchOk;
 extern const uint8_t P_ILC[6];
 extern volatile int g_ilcOk;
 extern volatile int g_looseLoaded;
-void load_loose_specs(uint32_t btsc, const ff13_charaset* cs);
+int load_loose_specs(uint32_t btsc, const ff13_charaset* cs);
 void loose_specs_report(void);
 extern const uint8_t P_LBG[6];
 extern char g_curBg[40];
@@ -447,6 +468,9 @@ extern volatile DWORD g_evNoFightAt;
 extern volatile int   g_evSkipDoor;
 extern volatile uint32_t g_evTouch;
 void vm_activate_area(const char* group);
+void vm_deactivate_area(const char* group);
+void vm_deactivate_area_ex(const char* group);
+void vm_layout_show(const char* inst, int show);
 void vm_party_marker(int group);
 void vm_create_field_chara(const char* name, const char* model);
 void vm_start_event(const char* name, const char* cb, const char* pack, const char* suc, const char* pack2, int script, const char* loadName, const char* loadPack);
@@ -460,6 +484,7 @@ extern volatile int g_ctlLocked;
 void ctl_lock(void);
 void ctl_hold(void);
 // srp_proxy.c -- input silenced at the DirectInput proxy while a pick is being staged
+#define DI_GATE_MAX_MS 30000     // every arm expires on its own; holders re-arm before half-life
 void di_gate_arm(void);
 int  di_gate_left_ms(void);
 void di_gate_lift(void);
@@ -586,6 +611,8 @@ extern volatile uint32_t g_touchSeq;
 void __cdecl on_encount_id(uint32_t id);
 extern const uint8_t P_BGM[9];
 extern const uint8_t P_BGMLAZY[9];
+extern const uint8_t P_BANKPLAY[9];
+extern const uint8_t P_ASSERT[9];
 int bgm_current(char* out /* BGM_NAME_MAX+1 */);
 int bgm_lazy_play(const char* name);
 void bgm_stop(const char* name, float fade);
@@ -599,6 +626,7 @@ void* install_encscene_cave(uintptr_t hookAddr, void* handler);
 
 // ---- battle picker, kill mode and the game-over path (srp_picker.c) ----
 extern volatile uint32_t g_bsStarted;
+extern volatile int g_bsTouchDue;         // a touch hand-off is staged or in flight
 void blackout_hold_on(void);
 int blackout_on(void);
 int is_boss_scene(uint32_t btsc);
@@ -623,6 +651,18 @@ extern UINT g_bsDownVk;
 extern UINT g_bsLeftVk;
 extern UINT g_bsRightVk;
 void zb_remember_sel(uint32_t zone, uint32_t btsc, int mode);
+// The battle actor table: the index into it IS the actor id, and the entries are charas.
+#define RVA_BTL_ACTORS   0x23FD20C   // VA 0x27FD20C -- the battle actor manager (0x4ED600)
+#define ACTOR_SLOTS      0x13        // the bound 0x4ED600 itself checks the id against
+// Chara::getChainObject (0x481460) is `return this + 0x20A8` (common/docs/CHAIN_GAUGE_RE.md).
+#define OFF_CHARA_CHAIN  0x20A8
+#define OFF_CHAIN_STATE  0x00        // 0 = nothing running, 1/2 = a chain, 3 = broken
+#define OFF_CHAIN_LEFT   0x18        // milliseconds left, counted down on the battle clock
+#define CHAIN_BROKEN     3
+// Raw ATB, a plain signed int. Chara::getAtbStages (0x46E900) is (int)(raw/100.0 + 0.1), and that
+// stage count -- not the raw value -- is what 0x548EA0 compares an ability's cost against.
+#define OFF_CHARA_ATB    0x2A0
+uint32_t* actor_table(void);
 extern const uint8_t P_SPECREPL[9];
 extern const uint8_t P_ENCF4[7];
 void preds_verify(void);
@@ -642,6 +682,15 @@ void extra_force_done(void);
 #define RVA_AISTATE   0x149D40       // VA 0x549D40 -- the AI state setter
 extern const uint8_t P_AISTATE[6];
 void __cdecl on_ai_state(uint32_t ecx, uint32_t state, uint32_t* pRet, uint32_t* pUp);
+// The store inside apiAiSetEnemyTarget's worker where the drawn target handle reaches the AI
+// block (common/docs/ENEMY_AI_TARGET_RE.md).
+#define RVA_AITARGET  0x14BE0F       // VA 0x54BE0F
+extern const uint8_t P_AITARGET[11];
+void __cdecl on_ai_target(uint32_t esp);
+// The status-effect roll, one fork before it draws (common/docs/STATUS_ROLL_RE.md).
+#define RVA_STATROLL  0xA5597        // VA 0x4A5597
+extern const uint8_t P_STATROLL[7];
+void __cdecl on_status_roll(uint32_t esp);
 void __cdecl on_ai_afterexec(uint32_t ctx);
 void __cdecl on_spec_replace(uint32_t ecx, uint32_t name);
 extern volatile int      g_homeHave;
@@ -747,6 +796,85 @@ extern char g_saveDir[MAX_PATH];
 void save_sidecars_load(void);
 void save_install_hooks(void);
 void save_poll_tick(DWORD now);
+// save-list sort menu: srp_save.c owns the state and the work, dllmain.c polls the keys and
+// holds the DirectInput gate while it is open, srp_overlay.c draws it.
+#define SS_MODES 8
+// Menu order, and g_ssSel indexes it. save_sort_apply subtracts SS_STORY_ASC to get back to the
+// sort mode ss_collect/ss_stamp know (0 asc, 1 desc, 2 by number), so the three sort rows have to
+// stay adjacent and in that order.
+#define SS_FILTER 0
+#define SS_CAT_PICK 1
+#define SS_CAT_NEW 2
+#define SS_CAT_RENAME 3
+#define SS_STORY_ASC 4           // 4..6 are the three sort rows
+#define SS_RENUM 7
+extern volatile int g_ssOpen;
+extern volatile int g_ssSel;
+extern volatile int g_filterChapter;     // 0 = every chapter
+void ss_menu_open(void);
+void save_sort_apply(void);
+void save_renumber_apply(void);
+void filter_apply(int chapter);
+void filter_menu_refresh(void);
+int  filter_cycle(int dir);
+int  filter_count_of(int chapter);
+void filter_restore(void);
+// 1 = Steam is syncing this game's saves, 0 = it is not, -1 = Steam would not say (callers
+// treat -1 as 0).
+int steam_cloud_on(void);
+#define LABEL_PASTE_NO_ROW    -1
+#define LABEL_PASTE_NO_TEXT   -2
+#define LABEL_PASTE_BAD       -3
+#define LABEL_PASTE_NO_SAVE   -4        // the row is the save screen's "make a new save" one
+#define LABEL_PASTE_NO_WINDOW -5
+#define LABEL_TEXT_MAX        24
+extern volatile int g_labelEdit;
+extern volatile int g_labelEditSlot;
+const wchar_t* label_edit_text(void);
+int  label_edit_bad(void);
+int  label_edit_ready(void);      // is the save list showing a row right now?
+int  label_edit_open(void);
+void label_edit_finish(int commit);
+int  label_edit_tick(char* what, size_t n);
+// What the on-screen text editor is being used for; the label editor has to stay mode 0, so a
+// caller that only knows about labels keeps working.
+#define EDIT_LABEL      0
+#define EDIT_CAT_NEW    1
+#define EDIT_CAT_RENAME 2
+#define EDIT_CAT_SEND   3         // naming the category a save is being sent to
+int  edit_mode(void);
+// ---- save categories: the whole save directory, parked in and out of
+// <save dir>\categories\<name>\.
+#define CATNAME_MAX 24            // characters; the name is used as a directory name
+#define CAT_MAX 16
+void cat_list_refresh(void);
+int  cat_cycle(int dir);
+int  cat_count(void);
+const char* cat_name_cur(void);   // the category in use, UTF-8
+const char* cat_name_sel(void);   // ...the switch target likewise, or NULL when none is picked
+const char* cat_pick(void);       // that target as the filesystem spells it (what cat_switch takes)
+int  cat_switch(const char* target);
+int  cat_edit_open(int rename);
+void cat_edit_tick(void);
+
+// ---- the save list's chooser ------------------------------------------------------------------
+// Row order, and g_lselSel indexes it.
+#define LSEL_NOTE 0
+#define LSEL_COPY 1
+#define LSEL_MOVE 2
+#define LSEL_ROWS 3
+extern volatile int g_lselOpen;
+extern volatile int g_lselSel;
+extern volatile int g_lselSlot;
+int  lsel_open(void);
+void lsel_close(void);
+void menu_screen_tick(void);      // closes our menus when the game changes screen under them
+int  lsel_go(void);
+
+// ---- send the save under the list's cursor to another category --------------------------------
+extern volatile int g_sendDest;   // 0..cat_count()-1 = a parked category, cat_count() = a new one
+int  send_cycle(int dir);
+const char* send_dest_name(void); // where to, UTF-8, or NULL for the new-category stop
 
 // ---- overlay services (srp_overlay.c) ----
 extern volatile unsigned char g_helpOpen;

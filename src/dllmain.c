@@ -417,6 +417,21 @@ static DWORD WINAPI worker(LPVOID unused) {
                  (unsigned)(g_base + RVA_AICOND), cd ? "OK" : "FAIL");
     }
     {
+        // wait_for_bytes answers with the wait in ms and -1 for "never": 0 IS a match.
+        int wt = wait_for_bytes(g_base + RVA_AITARGET, P_AITARGET, (int)sizeof(P_AITARGET), 15000);
+        void* at = wt < 0 ? NULL
+                 : ff13_install_esp_hook(g_base + RVA_AITARGET, P_AITARGET, (int)sizeof(P_AITARGET),
+                                         (void*)on_ai_target);
+        ff13log("[FF13-SRP] AI target store hook @0x%08X: %s\n",
+                (unsigned)(g_base + RVA_AITARGET), at ? "OK" : "FAIL");
+        int wr = wait_for_bytes(g_base + RVA_STATROLL, P_STATROLL, (int)sizeof(P_STATROLL), 15000);
+        void* sr = wr < 0 ? NULL
+                 : ff13_install_esp_hook(g_base + RVA_STATROLL, P_STATROLL, (int)sizeof(P_STATROLL),
+                                         (void*)on_status_roll);
+        (sr ? ff13logv : ff13loga)("[FF13-SRP] status roll hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_STATROLL), sr ? "OK" : "FAIL");
+    }
+    {
         int ws = wait_for_bytes(g_base + RVA_AISTATE, P_AISTATE, (int)sizeof(P_AISTATE), 15000);
         void* st = ws < 0 ? NULL
                  : ff13_install_argptr_hook(g_base + RVA_AISTATE, P_AISTATE,
@@ -673,6 +688,18 @@ static DWORD WINAPI worker(LPVOID unused) {
                  (unsigned)(g_base + RVA_GAMELOG), gl ? "OK" : "FAIL",
                  g_logLevel >= 2 ? "on" : "off");
     }
+    int waitedAsrt = wait_for_bytes(g_base + RVA_ASSERT, P_ASSERT, (int)sizeof(P_ASSERT), 15000);
+    if (waitedAsrt < 0) {
+        ff13loga("[FF13-SRP] assert @0x%08X never matched -> an assertion crash stays nameless\n",
+                 (unsigned)(g_base + RVA_ASSERT));
+    } else {
+        void* as = ff13_install_argptr_hook(g_base + RVA_ASSERT, P_ASSERT, (int)sizeof(P_ASSERT),
+                                            (void*)on_game_assert, 0x10, 4, 4);
+        (as ? ff13logv : ff13loga)("[FF13-SRP] assert hook @0x%08X: %s (an assertion says what it "
+                 "was before the crash report says where)\n",
+                 (unsigned)(g_base + RVA_ASSERT), as ? "OK" : "FAIL");
+    }
+
     // BGM: log every track the game starts, and (while a swap fired) substitute the battle theme.
     // The music is chosen independently of the battle scene, so this is what makes a swapped-in
     // boss actually sound like one.
@@ -700,6 +727,17 @@ static DWORD WINAPI worker(LPVOID unused) {
                                             (void*)on_bgm_lazyplay, 0, 4, 8);
         (lz ? ff13logv : ff13loga)("[FF13-SRP] BGM lazyPlay hook @0x%08X: %s (real fights teach "
                  "their tracks)\n", (unsigned)(g_base + RVA_BGMLAZY), lz ? "OK" : "FAIL");
+    }
+
+    int waitedBp = wait_for_bytes(g_base + RVA_BANKPLAY, P_BANKPLAY, (int)sizeof(P_BANKPLAY), 15000);
+    if (waitedBp < 0) {
+        ff13loga("[FF13-SRP] stream table @0x%08X never matched -> no stream census\n",
+                 (unsigned)(g_base + RVA_BANKPLAY));
+    } else {
+        void* bp = ff13_install_ecx_stackarg_hook(g_base + RVA_BANKPLAY, P_BANKPLAY,
+                                                  (int)sizeof(P_BANKPLAY), (void*)on_bank_play, 8);
+        (bp ? ff13logv : ff13loga)("[FF13-SRP] stream table probe @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_BANKPLAY), bp ? "OK" : "FAIL");
     }
 
     // Resource.loadSoundResource: learn the real (name, group) argument pair, so we can call it
@@ -814,6 +852,14 @@ static DWORD WINAPI worker(LPVOID unused) {
     // screen / postcam x2 / reconcile), each waiting on its own prologue. See srp_save.c.
     save_install_hooks();
 
+    // With the save-list key refused (Steam Cloud, srp_save.c) there is no key left to clear a
+    // restored filter, so the short list it makes would read as saves lost.
+    if (steam_cloud_on() == 1)
+        ff13loga("[FF13-SRP] save menu: Steam Cloud is on for this game -- the save-list key is "
+                 "refused, and the chapter filter stays off\n");
+    else
+        filter_restore();
+
     overlay_init();
 
     ff13loga("[FF13-SRP] ready. help 0x%X = the hotkey list; kill_mode 0x%X = cycling OFF -> "
@@ -836,6 +882,7 @@ static DWORD WINAPI worker(LPVOID unused) {
     int wasArm = 0, wasSup = 0, wasGs = 0, wasCancel = 0, wasBo = 0, wasHelp = 0;
     hk_tap tpKey = { 0, 0, 0 };                  // the warp key's tap-or-hold state
     hk_tap bsKey = { 0, 0, 0 };                  // ...and the picker key's, on the same hold time
+    hk_tap ssKey = { 0, 0, 0 };                  // ...and the save-sort menu's
 
     hk_rep bsUp = { 0, 0 }, bsDown = { 0, 0 },   // the four that repeat while held
            bsLeft = { 0, 0 }, bsRight = { 0, 0 };
@@ -843,6 +890,31 @@ static DWORD WINAPI worker(LPVOID unused) {
     for (;;) {
         Sleep(HK_POLL_MS);
         DWORD hkNow = GetTickCount();
+        menu_screen_tick();
+        // The editor owns every key while it is up: the unconditional continue below is what keeps
+        // a letter being typed from also firing one of the hotkeys polled further down.
+        if (g_labelEdit) {
+            int e = hk_taphold(g_ssVk, &ssKey, hkNow, WARP_HOLD_MS);
+            if (e) label_edit_finish(e == 2);
+            if (edit_mode() == EDIT_LABEL) {
+                char what2[160];
+                int fin = label_edit_tick(what2, sizeof what2);
+                if (fin > 0)      flash_say(ui_text(what2[0] ? T_LABEL_PASTED : T_LABEL_CLEARED));
+                else if (fin < 0) flash_say_c(ui_text(T_LABEL_NO_SAVE), OVL_FLASH_OFF);
+            } else {
+                cat_edit_tick();
+            }
+            if (g_labelEdit) {
+                if (di_gate_left_ms() < DI_GATE_MAX_MS / 2) di_gate_arm();
+                continue;
+            }
+            // Only the list menu closes with its editor; the tidy menu's editors leave it up --
+            // and while one of ours still stands, the gate stands with it.
+            if (g_lselOpen) lsel_close();
+            if (!g_ssOpen && !g_lselOpen) di_gate_lift();
+            else if (di_gate_left_ms() < DI_GATE_MAX_MS / 2) di_gate_arm();
+            continue;
+        }
         // The game installs its own filter after this mod's, so the seat is re-taken on a timer.
         if ((int)(hkNow - crashRearmAt) >= 0) { crashRearmAt = hkNow + 2000; crash_report_rearm(); }
         if (hk_edge(g_helpVk, &wasHelp)) {
@@ -924,7 +996,24 @@ static DWORD WINAPI worker(LPVOID unused) {
         int bsDownFire  = hk_held(g_bsDownVk,  &bsDown,  hkNow);
         int bsLeftFire  = hk_held(g_bsLeftVk,  &bsLeft,  hkNow);
         int bsRightFire = hk_held(g_bsRightVk, &bsRight, hkNow);
-        if (g_bsOpen && g_bsCount > 0) {
+        if (g_lselOpen) {
+            if (bsUpFire)   g_lselSel = (g_lselSel > 0) ? g_lselSel - 1 : LSEL_ROWS - 1;
+            if (bsDownFire) g_lselSel = (g_lselSel + 1 < LSEL_ROWS) ? g_lselSel + 1 : 0;
+            if (g_lselSel != LSEL_NOTE) {
+                if (bsLeftFire)  send_cycle(-1);
+                if (bsRightFire) send_cycle(+1);
+            }
+        } else if (g_ssOpen) {
+            if (bsUpFire)   g_ssSel = (g_ssSel > 0) ? g_ssSel - 1 : SS_MODES - 1;
+            if (bsDownFire) g_ssSel = (g_ssSel + 1 < SS_MODES) ? g_ssSel + 1 : 0;
+            if (g_ssSel == SS_FILTER) {
+                if (bsLeftFire)  { filter_cycle(-1); state_save(); }
+                if (bsRightFire) { filter_cycle(+1); state_save(); }
+            } else if (g_ssSel == SS_CAT_PICK) {
+                if (bsLeftFire)  cat_cycle(-1);
+                if (bsRightFire) cat_cycle(+1);
+            }
+        } else if (g_bsOpen && g_bsCount > 0) {
             if (bsUpFire)   g_bsSel = (g_bsSel > 0) ? g_bsSel - 1 : g_bsCount - 1;
             if (bsDownFire) g_bsSel = (g_bsSel + 1 < g_bsCount) ? g_bsSel + 1 : 0;
             // User-facing: a single step wraps, a PAGE stops at either end. Paging is how you
@@ -945,6 +1034,64 @@ static DWORD WINAPI worker(LPVOID unused) {
             g_homeDue = 0; g_homeHave = 0;
             home_warp_back();
         }
+        // While either menu is open the DirectInput gate is held, so the arrows and the hold do
+        // not also drive the game's own menus. Opening is refused while someone ELSE holds the
+        // gate (a picked fight staging): closing lifts it and would cut that gate short.
+        {
+            int t = hk_taphold(g_ssVk, &ssKey, hkNow, WARP_HOLD_MS);
+            // Only with nothing of ours on screen, so a menu opened before the switch was flipped
+            // can still be closed -- and by zeroing t, so the tap/hold state above still advances.
+            if (t && !g_ssOpen && !g_lselOpen && !g_labelEdit && steam_cloud_on() == 1) {
+                ff13log("[FF13-SRP] save menu: refused -- Steam Cloud is on for this game\n");
+                flash_say_c(ui_text(T_SS_CLOUD), OVL_FLASH_OFF);
+                t = 0;
+            }
+            if (t == 2) {
+                if (g_lselOpen) {
+                    // An editor keeps both the menu and the gate; only a refusal gives it back.
+                    if (!lsel_go() && !g_labelEdit) { lsel_close(); di_gate_lift(); }
+                    else if (!g_lselOpen && !g_labelEdit) di_gate_lift();
+                } else if (g_ssOpen) {
+                    if (g_ssSel == SS_CAT_PICK) {
+                        const char* pick = cat_pick();
+                        if (pick && cat_switch(pick)) { g_ssOpen = 0; di_gate_lift(); }
+                    } else if (g_ssSel == SS_CAT_NEW || g_ssSel == SS_CAT_RENAME) {
+                        if (!cat_edit_open(g_ssSel == SS_CAT_RENAME))
+                            flash_say_c(ui_text(T_LABEL_NO_WINDOW), OVL_FLASH_OFF);
+                    } else if (g_ssSel == SS_FILTER) {
+                        filter_apply(0); state_save();
+                    } else {
+                        if (g_ssSel == SS_RENUM) save_renumber_apply(); else save_sort_apply();
+                        g_ssOpen = 0; di_gate_lift();
+                    }
+                // A refusal here stays silent: on the title screen this same hold is the tidy
+                // menu's confirm, and a complaint would read as that action going wrong.
+                } else if (!g_bsOpen && di_gate_left_ms() < 0 && lsel_open()) {
+                    di_gate_arm();
+                }
+            } else if (t == 1) {
+                if (g_lselOpen) { lsel_close(); di_gate_lift(); }
+                else if (g_ssOpen) { g_ssOpen = 0; di_gate_lift(); }
+                else if (label_edit_ready() && !g_bsOpen && di_gate_left_ms() < 0) {
+                    // lsel_open refuses on the in-game save screen, so that screen falls through
+                    // to the note editor. A live gate is someone else's (a staged fight) and
+                    // closing ours would lift it, so nothing of ours opens over one.
+                    int opened = lsel_open();
+                    int r = opened ? 0 : label_edit_open();
+                    if (r < 0)
+                        flash_say_c(ui_text(r == LABEL_PASTE_NO_SAVE ? T_LABEL_NO_SAVE
+                                          : r == LABEL_PASTE_NO_ROW  ? T_LABEL_NO_ROW
+                                                                     : T_LABEL_NO_WINDOW),
+                                    OVL_FLASH_OFF);
+                    else di_gate_arm();
+                }
+                else if (!g_bsOpen && di_gate_left_ms() < 0) ss_menu_open();
+            }
+            // Re-armed at half-life, not every tick: each arm resets the gate's one-line-per-gate
+            // log latch, and a per-tick re-arm turns that line into a stream.
+            if ((g_ssOpen || g_lselOpen) && di_gate_left_ms() < DI_GATE_MAX_MS / 2)
+                di_gate_arm();
+        }
         // The warp key, field-only and same-zone. HOLD records where you stand, straight away.
         // TAP warps to this zone's point and asks first; tap again and it goes.
         {
@@ -964,6 +1111,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         // while a warp prompt is up.
         if (hk_edge(g_warpCancelVk, &wasCancel)) {
             if (g_warpPrompt)    warp_cancel();
+            else if (g_ssOpen)   { g_ssOpen = 0; di_gate_lift(); }
             else if (g_bsOpen) {
                 g_bsRememberDue = 1;           // ...likewise
                 g_bsOpen = 0;      // no flash: the list vanishing already says it closed
@@ -973,6 +1121,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         // Save anywhere rides this same tick: its hotkeys, the restore state machine and the
         // deferred file work all live in there (srp_save.c).
         save_poll_tick(hkNow);
+        bank_log_pump();
     }
     return 0;
 }

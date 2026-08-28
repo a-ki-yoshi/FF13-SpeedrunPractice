@@ -30,9 +30,8 @@ static DI8C_t g_real = NULL;
 // RawInput, and the exe's one GetAsyncKeyState call checks VK_LCONTROL only. The mod's hotkeys poll
 // GetAsyncKeyState, so they keep working while the gate is up.
 //
-// The gate expires on its own: a stuck gate would eat even the Esc that opens the quit dialog,
-// so a bug elsewhere must not be able to leave the player sealed in.
-#define DI_GATE_MAX_MS 30000
+// The gate expires on its own (DI_GATE_MAX_MS, header): a stuck gate would eat even the Esc that
+// opens the quit dialog, so a bug elsewhere must not be able to leave the player sealed in.
 
 static volatile int   g_diGate      = 0;
 static volatile DWORD g_diGateUntil = 0;

@@ -151,23 +151,31 @@ static void encrypt_block(const uint8_t* pt, uint32_t bc, const uint8_t* table, 
     out[0]=e1; out[1]=e2; out[2]=e3; out[3]=e4; out[4]=e5; out[5]=e6; out[6]=e7; out[7]=e8;
 }
 
-static void cipher_stream(uint8_t* data, size_t n,
+static void cipher_stream(uint8_t* data, size_t n, uint32_t base,
                           void (*fn)(const uint8_t*, uint32_t, const uint8_t*, uint8_t*)) {
     uint8_t table[264]; gen_xor_table(table);
     uint8_t out[8];
-    uint32_t bc = 0;
     for (size_t i=0; i+8<=n; i+=8) {
-        fn(data + i, bc, table, out);
+        fn(data + i, base + (uint32_t)i, table, out);
         memcpy(data + i, out, 8);
-        bc += 8;
     }
+}
+
+// One block-aligned window of a save body, decrypted where it lies. Bounds are the caller's:
+// nothing here knows the file length, so a window running into the unencrypted trailer is
+// silently mangled. Misalignment and an `off` inside the header return without touching `buf`.
+void ff13_decrypt_window(uint8_t* buf, size_t off, size_t len) {
+    if (off < FF13_HEADER_LEN) return;
+    size_t rel = off - FF13_HEADER_LEN;
+    if ((rel & 7u) || (len & 7u)) return;
+    cipher_stream(buf, len, (uint32_t)rel, decrypt_block);
 }
 
 void ff13_decrypt(uint8_t* img, size_t len) {
     if (len <= FF13_HEADER_LEN + FF13_TRAILER_LEN) return;
-    cipher_stream(img + FF13_HEADER_LEN, len - FF13_HEADER_LEN - FF13_TRAILER_LEN, decrypt_block);
+    cipher_stream(img + FF13_HEADER_LEN, len - FF13_HEADER_LEN - FF13_TRAILER_LEN, 0, decrypt_block);
 }
 void ff13_encrypt(uint8_t* img, size_t len) {
     if (len <= FF13_HEADER_LEN + FF13_TRAILER_LEN) return;
-    cipher_stream(img + FF13_HEADER_LEN, len - FF13_HEADER_LEN - FF13_TRAILER_LEN, encrypt_block);
+    cipher_stream(img + FF13_HEADER_LEN, len - FF13_HEADER_LEN - FF13_TRAILER_LEN, 0, encrypt_block);
 }

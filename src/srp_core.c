@@ -35,6 +35,7 @@ UINT g_warpCancelVk = VK_BACK;   // warp: cancel the in-overlay prompt (default 
 UINT g_boVk       = VK_F10;    // battle overlay (timer + enemy HP) toggle (default F10)
 UINT g_saveVk     = VK_F7;     // save-screen hotkey (default F7; ini [hotkeys] save overrides)
 UINT g_camUnstickVk = VK_F8;  // "un-stick camera" hotkey (ini [hotkeys] camera_unstick; 0 = disabled)
+UINT g_ssVk       = VK_F9;     // (default F9; ini [hotkeys] save_tidy)
 // Hotkeys only while the game is the focused window. GetAsyncKeyState reads the keyboard, not the
 // window, so without this every key here fires from inside a browser. ini: [hotkeys] require_focus
 // -- a setting rather than a rule because a wrong focus test takes EVERY hotkey with it, and 0 is
@@ -298,6 +299,7 @@ static const struct { const char* name; UINT* vk; } kHotkeys[] = {
     { "picker_left",    &g_bsLeftVk }, { "picker_right", &g_bsRightVk },
     { "save",           &g_saveVk },
     { "camera_unstick", &g_camUnstickVk },
+    { "save_tidy",      &g_ssVk },
 };
 // "3.0x<arrow>OFF" or "2.0x<arrow>3.0x<arrow>OFF" -- the help row's cycle, in the caller's arrow
 // (the JP arrow only renders where the JP font does, so the caller picks it with the language).
@@ -415,6 +417,17 @@ void config_load(void) {
                         if (!n) { g_listMark[0] = 0;
                             cfg_note_bad("list_mark");
                             ff13loga("[FF13-SRP] config: list_mark '%s' does not fit (max 8 chars) -> no marker\n", val); }
+                        // A digit would be eaten by the renumbering: the mark lands right behind
+                        // the save's number, and header_renumber (srp_save.c) takes the line's
+                        // first run of digits as that number.
+                        for (int i = 0; g_listMark[i]; i++)
+                            if (g_listMark[i] >= L'0' && g_listMark[i] <= L'9') {
+                                g_listMark[0] = 0;
+                                cfg_note_bad("list_mark");
+                                ff13loga("[FF13-SRP] config: list_mark '%s' has a digit in it -> no marker "
+                                         "(digits would be read as part of the save number)\n", val);
+                                break;
+                            }
                     }
                 } else if (cfg_ieq(key, "save_dir")) {
                     if (strlen(val) >= sizeof(g_saveDir)) {
@@ -475,9 +488,10 @@ void state_save(void) {
     // stays the one-hit-kill bit (a 2 there would arm them without instant-win meaning anything to
     // them; the extra strength rides in "instantwin", which they skip), and "gamespeed" carries the
     // STEP -- 0 = off, n = the nth multiplier -- so an older sidecar's 1 restores as the first step.
-    fprintf(f, "suppress %d\ngamespeed %d\nonehit %d\ninstantwin %d\nbattle_overlay %d\n",
+    fprintf(f, "suppress %d\ngamespeed %d\nonehit %d\ninstantwin %d\nbattle_overlay %d\n"
+               "filter %d\n",
             g_suppressEnabled ? 1 : 0, g_gsStep + 1, g_armed ? 1 : 0,
-            g_iwArmed ? 1 : 0, g_battleOverlay ? 1 : 0);
+            g_iwArmed ? 1 : 0, g_battleOverlay ? 1 : 0, g_filterChapter);
     fclose(f);
 }
 void state_load(void) {
@@ -494,13 +508,18 @@ void state_load(void) {
         else if (cfg_ieq(key, "onehit"))         g_armed = on;
         else if (cfg_ieq(key, "instantwin"))     g_iwArmed = on;
         else if (cfg_ieq(key, "battle_overlay")) g_battleOverlay = on;
+        // Recorded here, put into effect by filter_restore once the save headers have been
+        // scanned and the list hook can be installed.
+        else if (cfg_ieq(key, "filter"))         g_filterChapter = (val > 0 && val < 256) ? val : 0;
     }
     fclose(f);
     // Rebuilt from the two bits rather than stored, so a sidecar from a build that never knew about
     // instant-win restores as plain one-hit-kill instead of as nothing.
     kill_mode_apply(g_iwArmed ? KILL_INSTANT : g_armed ? KILL_ONEHIT : KILL_OFF, 0);
-    ff13loga("[FF13-SRP] state: restored suppress=%d gamespeed=%d kill=%s battle_overlay=%d%s\n",
+    ff13loga("[FF13-SRP] state: restored suppress=%d gamespeed=%d kill=%s battle_overlay=%d "
+             "filter=%d%s\n",
              g_suppressEnabled, g_gsEnabled, kill_mode_name_en(g_killMode), g_battleOverlay,
+             g_filterChapter,
              g_killMode != KILL_OFF ? "  (WARNING: this is carried over from a previous session)" : "");
 }
 
