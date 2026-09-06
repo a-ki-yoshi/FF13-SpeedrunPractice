@@ -2,92 +2,78 @@
 ## 更新対象のファイル / Files to update
 
 - dinput8.dll
-- ff13-srpractice.ini (新機能のF9ホットキーについて追加。iniを編集して使っている場合は、その項をコピーして既存のファイルにペーストしておくことをお勧めします。ペーストしなくても動作はします)
+- ff13-srpractice.ini (新しい設定キー`menu_ok`・`list_prev`・`list_next`を追加。iniを編集して使っている場合は、その3項をコピーして既存のファイルにペーストしておくことをお勧めします。ペーストしなくても動作はします)
 
 ## 更新内容
 
 ### 新規
 
-- **セーブデータの整理**(新機能、`save_tidy`キー・既定F9)
-  - 表示する章の絞り込み、カテゴリー管理、並び替え、各データへのメモなど。詳しくはREADMEを参照
-- 戦闘オーバーレイ
-  - CHAIN行: ターゲットのチェーンが切れるまでの残り秒数
-  - ATB行: オプティマチェンジで味方全員のATBが全回復するまでの残り秒数(READY = 次のチェンジで全回復)
-  - TARGET ATB行: 敵ATBのゲージの数値表示
-  - 行構成を整理(TIME / TARGETの見出しでグループ化)
+- セーブデータの整理
+  - Enterなどでも決定可能な設定を追加(`menu_ok`)
+  - タイトル画面 カテゴリーの削除機能を追加
+  - タイトル画面 新しいカテゴリー作成時に使用中カテゴリーの全データをコピーする選択肢を追加
+  - セーブデータ一覧 範囲選択機能を追加。一覧で複数のセーブをまとめてコピー・移動できるように
+  - セーブデータ一覧 削除機能を追加
+  - セーブデータ一覧 AやDなどのキーでゲームのカーソル移動可能な設定を追加(`list_prev`/`list_next`)
 - 任意戦闘呼び出し
-  - 3章 カルラ1戦目(btsc03032): 戦闘後もライブラ値が持続するパターンを追加
-  - 4章 ドレッドノート1戦目(btsc04026): 戦闘後もライブラ値が持続するパターンを追加
-  - 9章 カラヴィンカ1戦目: 戦闘後もライブラ値が持続するパターンを追加
-  - 6章 エンキ エンリル(btsc05027): デプロテが入らないパターン2種を追加
-  - 13章 ジャバウォック バンダースナッチ(btsc12081): ウィークが入らないパターンを追加
-  - 13章 決戦騎ティアマット(btsc12083): 開幕の技を指定するパターン2種を追加
-  - 13章 バルトアンデルス(btsc12090): 1回目のアルテマまでデプロテのみまたはウィークのみ入るパターン2種を追加
-- その他
-  - クラッシュレポート: ゲーム自身のassertによるクラッシュのとき、どのassertかをログに出すようにした
-  - README: リージョンについての記載を追加(海外版でも動作する見込み)
+  - 3章 戦闘爆撃騎カルラ1戦目(btsc03032): ライブラ値持続パターンで戦闘終了時のオプティマの選択位置も戦闘後に保つよう機能追加
+  - 4章 ドレッドノート1戦目(btsc04026): ライブラ値持続パターンで戦闘終了時のオプティマの選択位置も戦闘後に保つよう機能追加
+  - 12章 プラウド・クラッド2戦目(btsc12042): スマッシュアッパーの成功率を下げるパターンを追加
+  - 13章 ヴラディスラウス(btsc12084): デプロテの成功率を下げるパターンを追加
+- ff13-srpractice.ini
+  - ホットキーをキー名(Enter, Space, Up, Downなど)でも指定できるように変更
 
 ### 修正
 
+- セーブデータの整理
+  - 章フィルターを設定した状態でセーブ番号の振り直しの実行直後にセーブ一覧を開いた場合の表示対象の誤りを修正
+  - 中断された整理(番号の振り直し・カテゴリー切替)の復旧が済むまで削除・コピー・移動を受け付けないように修正
+  - ストーリー上の特定のチェックポイント(賛歌の拝廊など)で、どこでもセーブのサムネイルがその場所専用の背景にならない事象を修正
+  - 「進行順(終盤が先頭)」で並べ替えてからセーブ番号の振り直しを実行した後にセーブ一覧を開いた場合の表示順の誤りを修正
+  - 並び替えを改善: 日時が同じセーブは物語上の位置→プレイ時間の順で決める、ミッションの進行(クリア数・受諾)を反映、など
 - 任意戦闘呼び出し
-  - 4章 ドレッドノート1戦目(btsc04026): 余分なオブジェクトが戦闘に写り込む事象を修正
-  - 7章 ウシュムガル2戦目(7037): 戦闘後もライブラ値が持続する設定を別パターンとして分離
-  - 9章 バルトアンデルス(btsc09055)など: 選択時にクラッシュしうる事象の追加修正
-  - 11章 ヒューズ*2(btsc10055): 一覧の表示位置など修正
-  - 12章 守護騎アナヴァタプタ(btsc12001): 同じ戦闘を続けて呼び出すとクラッシュする事象を修正
-  - 12章 プラウド・クラッド2戦目(btsc12042): 防空モードで開幕することがある事象を修正
-  - 13章 オーファン1戦目(btsc12091): 特定条件で余分なオブジェクトが戦闘に写り込む事象を修正
-  - 13章 オーファン2戦目(btsc12092): 特定条件で余分なオブジェクトが戦闘に写り込む事象を修正
-  - 通常の戦闘を挟むと、呼び出した戦闘のBGMが鳴らないことがある事象を修正
-- 戦闘オーバーレイ
-  - 表示中にFPS低下などを極力避けるようパフォーマンス改善
-- その他
-  - 画面の異常や不具合が発生するリスクを軽減する各種対応
+  - 3章 ガスト3(btsc03001): ライブラ値0の状態で開始するように修正
+  - 3章 PSICOM治安猟兵4(btsc03036): 本編どおりスノウの物理攻撃力+30の状態で開始するように修正
+  - 4章 バルバロイ2(btsc04055)など: 形態変化中に倒すと、次の戦闘でその敵が形態変化後の姿から開始する事象を修正
+  - 9章 PSICOM強襲兵2 PSICOM強襲猟兵1(btsc09050): 本編どおりのパーティ・オプティマで開始するように修正
+  - 11章 キングベヒーモス メギストテリウム(btsc11226)など: 呼び出した戦闘の終了後、操作不能になる事象を修正
+  - テージンタワーでの一覧にアルカキルティ大平原のエンカウント6件が混ざっていた事象を修正
+- その他、使いやすいように各種表示を改善
+
 ---
 
 ## What's changed
 
 ### New
 
-- **Save-data tidying** (new feature, the `save_tidy` key, F9 by default)
-  - Filter the list by chapter, manage categories, sort the list, put your own note on a save,
-    and more. See the README for the details
-- Battle overlay
-  - CHAIN row: how long the target's chain gauge still holds
-  - ATB row: how long until a paradigm shift refills the whole party's ATB (READY = the next
-    shift does)
-  - TARGET ATB row: the target's ATB as a figure, in gauge segments
-  - Rows regrouped under TIME / TARGET headings
+- Save-data tidying
+  - A setting so Enter (and other keys) can confirm the menus (`menu_ok`)
+  - Title screen: a category can be deleted
+  - Title screen: when making a new category, an option to copy every save of the one in use into it
+  - Save list: range select -- mark a range in the list to copy or move several saves at once
+  - Save list: delete (a marked range)
+  - Save list: a setting so keys such as A and D move the game's own save cursor (`list_prev`/`list_next`)
 - Battle picker
-  - Ch. 3 Garuda Interceptor #1 (btsc03032): a pattern that keeps your Libra readings after the fight
-  - Ch. 4 Dreadnought #1 (btsc04026): a pattern that keeps your Libra readings after the fight
-  - Ch. 9 Kalavinka Striker #1: a pattern that keeps your Libra readings after the fight
-  - Ch. 6 Enki, Enlil (btsc05027): two "Deprotect will not land" patterns
-  - Ch. 13 Jabberwocky, Bandersnatch (btsc12081): an "Imperil will not land" pattern
-  - Ch. 13 Tiamat Eliminator (btsc12083): two patterns picking what it opens with
-  - Ch. 13 Barthandelus (btsc12090): two patterns where only Deprotect, or only Imperil, lands,
-    until the first Ultima
-- Other
-  - Crash report: when the game crashes on its own assert, the log now names which one
-  - README: a note on regions (the mod is expected to work on non-Japanese installs)
+  - Ch. 3 Garuda Interceptor #1 (btsc03032): on the "Libra readings kept" pattern (its row now reads "Libra readings & paradigm kept"), the paradigm the fight ends on now stays selected after the fight
+  - Ch. 4 Dreadnought #1 (btsc04026): on the "Libra readings kept" pattern (its row now reads "Libra readings & paradigm kept"), the paradigm the fight ends on now stays selected after the fight
+  - Ch. 12 The Proudclad #2 (btsc12042): a "Launch less likely to lift" pattern
+  - Ch. 13 Wladislaus (btsc12084): a "Deprotect less likely to land" pattern
+- ff13-srpractice.ini
+  - Hotkeys can be written as key names (Enter, Space, Up, Down, and so on)
 
 ### Fixed
 
+- Save-data tidying
+  - With a chapter filter on, the save list opened right after a renumber showed the wrong saves
+  - While an interrupted tidy (renumbering, or a category switch) is still unrecovered, delete, copy and move are refused until recovery has run
+  - At certain story checkpoints (such as The Narthex), an anywhere-save's thumbnail did not get the location's own background
+  - After a "story order (endgame first)" sort, the save list opened after a renumber came up in the wrong order
+  - Better sorting: saves with the same date are settled by story position, then play time; mission progress (cleared and accepted) counts as progress
 - Battle picker
-  - Ch. 4 Dreadnought #1 (btsc04026): an object that should not be there appeared in the fight
-  - Ch. 7 Ushumgal Subjugator #2 (7037): keeping your Libra readings after the fight is its own
-    pattern now
-  - Ch. 9 Barthandelus (btsc09055) and others: further fixes for a crash when the fight is
-    selected
-  - Ch. 11 Circuitron*2 (btsc10055): where it sits in the list, and its mark
-  - Ch. 12 Anavatapta Warmech (btsc12001): crash when the same fight was picked twice in a row
-  - Ch. 12 The Proudclad #2 (btsc12042): the fight could open in its air-defence mode
-  - Ch. 13 Orphan #1 (btsc12091): in some cases an object that should not be there appeared in
-    the fight
-  - Ch. 13 Orphan #2 (btsc12092): in some cases an object that should not be there appeared in
-    the fight
-  - The picked fight's BGM could stay silent after an ordinary battle
-- Battle overlay
-  - Performance work, so showing it costs as little frame rate as we can manage
-- Other
-  - Assorted work to make display glitches and other faults less likely
+  - Ch. 3 Ghast*3 (btsc03001): opens with Libra value 0
+  - Ch. 3 PSICOM Warden*4 (btsc03036): opens with Snow's physical attack +30, as the story has it
+  - Ch. 4 Pulsework Soldier*2 (btsc04055) and others: an enemy killed while its form was changed opened the next fight already in that form
+  - Ch. 9 PSICOM Raider*2, PSICOM Infiltrator*1 (btsc09050): opens with the party and paradigms the story gives it
+  - Ch. 11 Behemoth King, Megistotherian (btsc11226) and others: you could end up unable to move after a picked fight
+  - Six Archylte Steppe encounters showed up in Taejin's Tower's list
+- Other: assorted display improvements for ease of use

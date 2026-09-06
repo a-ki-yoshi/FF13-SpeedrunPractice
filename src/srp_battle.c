@@ -552,28 +552,41 @@ int load_loose_specs(uint32_t btsc, const ff13_charaset* cs) {
     }
     // ...and whatever the set that WAS loaded does not hold. Some fights are covered by no single
     // set, so the search fails and nothing at all is loaded; one at a time has no such limit.
-    // cs is the set being loaded, or NULL when none was found.
+    // cs is the set being loaded, or NULL when none was found -- and that NULL has two meanings here:
+    // "no set covers this fight" makes every model loose, "the set already up covers it" makes none
+    // of them loose. One the set holds is still ASKED for -- a set can name a model that is not
+    // resident -- but it must not arm the fight-over reload of that same set: reloading a set cannot
+    // evict a member of itself, and the send is what freezes the AsyncLoader.
     const ff13_scene_models* sm = scene_models(btsc);
+    const ff13_charaset* have = cs ? NULL
+                                   : charaset_by_name(g_csLoaded[0] ? g_csLoaded : g_curCharset);
+    int loose = n;
     if (sm) {
         for (int i = 0; i < sm->n; i++) {
-            const char* nm = kModelName[kModelIdx[sm->first + i]];
-            if (cs) {
-                int held = 0;
-                for (int j = 0; j < cs->n && !held; j++)
-                    if (kCharasetIdx[cs->first + j] == kModelIdx[sm->first + i]) held = 1;
-                if (held) continue;
-            }
+            int mi = kModelIdx[sm->first + i];
+            const char* nm = kModelName[mi];
+            const ff13_charaset* in = cs ? cs : have;
+            int held = 0;
+            for (int j = 0; in && j < in->n && !held; j++)
+                if (kCharasetIdx[in->first + j] == mi) held = 1;
+            if (held && cs) continue;
             vm_load_chara(nm);
             n++;
-            ff13logv("[FF13-SRP] battle picker: \"%s\" is not in %s -- asked for it directly\n",
-                     nm, cs ? cs->name : "any set this fight could use");
+            if (held)
+                ff13logv("[FF13-SRP] battle picker: \"%s\" is in \"%s\" already -- asked for it "
+                         "anyway, but it is not this fight's to take out again\n", nm, have->name);
+            else {
+                loose++;
+                ff13logv("[FF13-SRP] battle picker: \"%s\" is not in %s -- asked for it directly\n",
+                         nm, cs ? cs->name : "any set this fight could use");
+            }
         }
     }
     if (n && !g_lchOk)
         ff13loga("[FF13-SRP] battle picker: ...except the per-character loader never matched, so "
                  "none of that happened\n");
     g_looseScene = n ? btsc : 0;      // read back once the wait is up, not now (async load)
-    if (n) g_looseLoaded = 1;         // ...and something has to take them back out again
+    if (loose) g_looseLoaded = 1;     // ...and something has to take them back out again
     return n;                         // a fight started on top of these is a fight without them
 }
 
@@ -893,6 +906,23 @@ int vm_get_work(int idx) {
     ((vmNative1_t)(uintptr_t)(g_base + RVA_PARTY_GETWORK))(ctx);
     return (int)a[1];                          // answered where the argument was
 }
+// Party.getCapacityLevel() -- the Crystarium stage the story raises (initSetupParty's 2580 step
+// sets 2). Takes NO argument: it PUSHES its answer, so the operand stack is pointed one slot high
+// and the value comes back where the callee lands (0xBDD54B subtracts 8 from [ctx+0x114] before
+// writing the tag at +0 and the value at +4). Safe from the poll thread: the backend (0xB6C690)
+// takes the party lock, reads party + 0x258C and drops it -- no wait, unlike the RVA_SYNCWAIT ones.
+#define RVA_PARTY_GETCAPLV 0x7DD530   // VA 0xBDD530
+int vm_capacity_level(void) {
+    if (!g_base) return -1;
+    uint8_t  ctx[VM_CTX_SIZE];
+    uint32_t a[4];
+    memset(ctx, 0, sizeof ctx);
+    memset(a, 0, sizeof a);
+    *(uint32_t*)(ctx + SB_ARGSTACK_OFF) = (uint32_t)(uintptr_t)(a + 2);
+    ((vmNative1_t)(uintptr_t)(g_base + RVA_PARTY_GETCAPLV))(ctx);
+    return (int)a[1];
+}
+
 void vm_set_work(int idx, int val) {
     if (!g_base) return;
     uint8_t  ctx[VM_CTX_SIZE];
@@ -1185,6 +1215,7 @@ uint32_t party_state_key(void) {
 // the field-encounter path whatever its other fields say.
 static const char* const kPartySnowAlone[1] = { "snow" };
 static const char* const kPartyLightningHope[2] = { "lightning", "hope" };
+static const char* const kPartyLightningHopeFang[3] = { "lightning", "hope", "fang" };
 // Fights whose END has to be taken to the checkpoint although the mod does not stage them: an
 // event fight ends by handing the run to the story, and a picked one has no story to hand it to.
 // "End", not "win": btsc03036 runs the same scripted ending either way, so the outcome is not the
@@ -1207,6 +1238,9 @@ static const struct { uint16_t btsc; const char* const* who; int n; } kScenePart
     // five enemies, and a door would hand the win to bt_vpek_200_cb, which marks a save point and
     // plays the next cutscene on into the story.
     { 4027, kPartyLightningHope, 2 },
+    // btsc09050's party change is a step ABOVE the fight's own chain -- the script that runs after
+    // mv_hiku_010, not the ev_hiku_070 the fight hangs off -- so nothing on the way in sets it.
+    { 9050, kPartyLightningHopeFang, 3 },
 };
 
 // The paradigms a fight is meant to hold, written once it has started. Kept out of the arena table
@@ -1239,7 +1273,32 @@ static const struct { uint16_t btsc; int n; signed char decks[8][3]; } kSceneDec
     { 3036, 3, { { R_COM, -1, -1 },
                  { R_SEN, -1, -1 },
                  { R_RAV, -1, -1 } } },
+    // btsc09050: READ OUT OF THE SCRIPT, not measured off the fight -- setup_hiku070's case 9240.
+    // Slots are lightning / hope / fang, the order the party above is set in.
+    { 9050, 4, { { R_RAV, R_RAV, R_COM },
+                 { R_COM, R_RAV, R_SEN },
+                 { R_COM, R_MED, R_SEN },
+                 { R_COM, R_SYN, R_SAB } } },
 };
+// A stat the story raises on the way into a fight that a save cannot bring with it. Written into the
+// BATTLE actor, never the party record -- the party record is what a save keeps.
+// The target is not named, it is "the one party member this fight has": PC charaspec names are pcNNN
+// and that number is NOT the party's own character id (Snow is "pc001", id 2), so a fight with more
+// than one member would need that mapping settled first.
+// btsc03037 has NO row on purpose: its event door runs initSetupParty(2600), the story's own step
+// and the very thing that raises the stat -- a row there would raise the story's figure again. That
+// same step landing is what `setup` reads out of globalWork[210].
+// `add` is in the units the ARRAY holds -- hundredths for this stat (6500 reads as 65), unscaled for
+// max HP at index 1 -- so a new row's units have to be measured rather than assumed.
+static const ff13_scene_stat kSceneStat[] = {
+    { 3036, ST_ATK_PHY, 3000, 2600, 2 },   // Snow +30: the story fights it at 95, a bare pick at 65
+};
+const ff13_scene_stat* scene_stat(uint32_t btsc) {
+    for (int i = 0; i < (int)(sizeof kSceneStat / sizeof kSceneStat[0]); i++)
+        if (kSceneStat[i].btsc == btsc) return &kSceneStat[i];
+    return NULL;
+}
+
 const signed char (*scene_decks(uint32_t btsc, int* n))[3] {
     for (int i = 0; i < (int)(sizeof kSceneDecks / sizeof kSceneDecks[0]); i++)
         if (kSceneDecks[i].btsc == btsc) { *n = kSceneDecks[i].n; return kSceneDecks[i].decks; }

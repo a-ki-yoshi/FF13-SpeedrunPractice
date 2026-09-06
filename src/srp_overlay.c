@@ -30,24 +30,25 @@ volatile unsigned char g_helpOpen = 0;         // hotkey list on screen; NOT per
 #define OVL_FONT_FACE  "Courier New"
 #define OVL_FONT_FACE_JP "Meiryo UI"
 // The Japanese face runs two points smaller: at the same requested height Meiryo's ideographs fill
-// more of the cell than Courier's letters and read as the larger type on a mixed line. The offset
-// drops its runs a pixel so the two faces sit optically centred on one another.
+// more of the cell than Courier's letters and read as the larger type on a mixed line.
 #define OVL_FONT_H     20
 #define OVL_FONT_H_JP  18
+// Stands in only until the two faces have been asked for their metrics (see g_jpYoff).
 #define OVL_JP_YOFF    ((OVL_FONT_H - OVL_FONT_H_JP) / 2)
 #define OVL_GAMESPEED  0xFFD2FA69   // GAME SPEED     : lime-green
 #define OVL_ONEHIT     0xFFFF3B30   // ONE-HIT KILL   : red-orange (same as INSTANT WIN)
 #define OVL_SUPPRESS   0xFFC772EB   // ENEMY SUPPRESS : violet
 #define OVL_BATTLE     0xFFFFFFFF   // battle overlay : white (the figures themselves)
-#define OVL_BATTLE_HEAD 0xFFA3A8A8  // ...and grey for the TIME / TARGET group headings
+#define OVL_BATTLE_HEAD 0xFFC4CFCF  // ...and grey for the TIME / TARGET group headings
 #define OVL_SWAP       0xFFF5A623   // BATTLE SWAP    : amber
 #define OVL_INSTANT    0xFFFF3B30   // INSTANT WIN    : red-orange
 #define OVL_WARP_PROMPT  0xFF86FDD2   // warp prompt: mint-green
-#define OVL_FLASH   0xFFA3A8A8   // status flash   : grey (same value as OVL_FLASH_OFF; separate
+#define OVL_FLASH   0xFFC4CFCF   // status flash   : grey (same value as OVL_FLASH_OFF; separate
                                     // channels so they CAN differ, not because they must)
 #define OVL_PICK_SEL   0xFFFFF566   // picker: the row you are on
 #define OVL_MENU       0xFF9AD3FE   // save-data menus: their rows, headings' rows and footers
 #define OVL_MENU_SEL   0xFF9FFDF9   // ...and the row the cursor is on (the editor's line, too)
+#define OVL_MENU_OFF   0xFF6489A5   // ...and a row that is drawn but cannot run right now
 
 static volatile DWORD  g_flashCol = OVL_FLASH;   // the colour THIS flash is drawn in
 // Show a status line in the overlay for ~4s, in a colour of the caller's choosing.
@@ -99,6 +100,7 @@ typedef HRESULT (__stdcall *Reset_t)(void*, FF13_D3DPP*);
 typedef ULONG   (__stdcall *Release_t)(void*);
 typedef HRESULT (__stdcall *FontOp_t)(void*);   // OnLostDevice / OnResetDevice
 typedef HRESULT (__stdcall *PreloadChars_t)(void*, UINT first, UINT last);
+typedef BOOL    (__stdcall *GetTextMetricsA_t)(void* font, TEXTMETRICA* tm);
 typedef INT     (__stdcall *DrawTextA_t)(void* font, void* sprite, LPCSTR str, INT count,
                                          RECT* rect, DWORD fmt, DWORD color);   // D3DXFONT::DrawTextA
 typedef INT     (__stdcall *DrawTextW_t)(void* font, void* sprite, const unsigned short* str,
@@ -140,6 +142,7 @@ typedef HRESULT (__stdcall *SBApply_t)(void*);
 #define SB_VT_CAPTURE             4
 #define SB_VT_APPLY               5
 #define IUNK_VT_RELEASE     2
+#define FONT_VT_GETTEXTMETRICSA 6
 #define FONT_VT_PRELOADCHARS 10
 #define FONT_VT_DRAWTEXTA  14
 #define FONT_VT_DRAWTEXTW  15
@@ -164,6 +167,11 @@ static int   g_bbWidth    = 0;
 static void* g_font         = NULL;   // ID3DXFont* (lazily created on the real device)
 static void* g_sprite       = NULL;   // ID3DXSprite* every DrawText draws through
 static void* g_spriteActive = NULL;   // = g_sprite only between Begin/End; what the helpers pass
+// How far a Japanese run drops so both faces sit on ONE baseline. DrawText aligns the cell top to
+// rect.top, putting the baseline at top + tmAscent, so the drop is the two faces' ascent difference
+// -- asked of the fonts themselves, because it belongs to whichever face the machine mapped. Set
+// once at font creation; the fixed nudge stands in until then.
+static int g_jpYoff = OVL_JP_YOFF;
 static volatile LONG g_fontTried    = 0;   // create the font at most once (until device reset)
 static volatile LONG g_overlayReady = 0;   // EndScene hook installed
 
@@ -197,6 +205,19 @@ void vk_label(UINT b, char* out, size_t n) {
     if (name) snprintf(out, n, "%s%s", pre, name);
     else if (vk >= '0' && vk <= 'Z') snprintf(out, n, "%s%c", pre, (char)vk);  // letters / digits
     else snprintf(out, n, "%s0x%X", pre, (unsigned)vk);
+}
+
+// The tidy menus' confirm gesture as one footer phrase: the tidy key's hold confirms whether or not
+// menu_ok is bound, so the phrase names the hold either way.
+void tidy_ok_phrase(char* out, size_t n) {
+    char k[32];
+    if (g_menuOkVk) {
+        vk_label(g_menuOkVk, k, sizeof k);
+        snprintf(out, n, ui_text(T_OK_BOTH), k);
+    } else {
+        vk_label(g_ssVk, k, sizeof k);
+        snprintf(out, n, ui_text(T_OK_HOLD), k);
+    }
 }
 
 
@@ -317,6 +338,16 @@ static int overlay_char_w(void* font) {
     return g_ovlCw;
 }
 
+static int font_ascent(void* font) {
+    if (!font) return 0;
+    void** vt = *(void***)font;
+    if (!vt || !vt[FONT_VT_GETTEXTMETRICSA]) return 0;
+    TEXTMETRICA tm;
+    memset(&tm, 0, sizeof tm);
+    if (!((GetTextMetricsA_t)vt[FONT_VT_GETTEXTMETRICSA])(font, &tm)) return 0;
+    return (int)tm.tmAscent;
+}
+
 // The Japanese text path: UTF-16 through DrawTextW -- the ANSI path would render only on a machine
 // whose codepage happens to be 932. A mixed line is split into runs; runs under 0x80 use the ASCII
 // face so they stay monospaced, which the column maths below assumes of them. An ASCII run's
@@ -382,7 +413,7 @@ static void overlay_line_w(int x, int y, const unsigned short* text, DWORD color
             if (!vt) return;
             DrawTextW_t p = (DrawTextW_t)vt[FONT_VT_DRAWTEXTW];
             if (!p) return;
-            int yy = (runs[k].font == g_fontJp) ? y + OVL_JP_YOFF : y;  // optical centring
+            int yy = (runs[k].font == g_fontJp) ? y + g_jpYoff : y;   // onto the ASCII baseline
             RECT r;
             if (pass == 0) {
 #if OVL_OUTLINE == 0
@@ -571,8 +602,8 @@ static uintptr_t target_actor(int hp) {
         uintptr_t a = tbl[i];
         if (!a || IsBadReadPtr((void*)a, OFF_CHARA_CHAIN + OFF_CHAIN_LEFT + 4)) continue;
         // The table holds the party too, and a party member on the target's exact HP would
-        // answer for it: only the enemy side may match.
-        if (!(*(unsigned char*)(a + OFF_TEAM) & 0x04)) continue;
+        // answer for it: only the enemy side may match. NOT the +0x24E bit (see OFF_TEAM).
+        if (IsBadReadPtr((void*)(a + OFF_GUARD324), 4) || !*(int*)(a + OFF_GUARD324)) continue;
         if (*(int*)(a + OFF_CHARA_HP) != hp) continue;
         return a;
     }
@@ -609,6 +640,11 @@ static void overlay_diag(LONGLONG dt) {
     win = now; g_diagCalls = 0; g_diagDraws = 0; g_diagTicks = 0; g_passN = 0;
 }
 #endif
+
+// Nonzero once the fight has RESOLVED -- the same signal the battle timer stops REAL on, which is
+// well before the battle state machine goes idle. Anything that has to come back out of a fight
+// before the game writes its result down has to do it here rather than at the end.
+int battle_resolved(void) { return read_via_ptr(RVA_TARGET_PTR, OFF_TARGET) != 0; }
 
 // Runs on the game (render) thread from hkEndScene. Creates the font lazily against the REAL
 // device.
@@ -737,6 +773,12 @@ static void overlay_draw(void* dev) {
                              g_fontJp ? " (+ Japanese: " : " (no Japanese font -- names hidden)",
                              g_fontJp ? (face ? OVL_FONT_FACE_JP ")" : "system default, "
                                                OVL_FONT_FACE_JP " not installed)") : "");
+                    if (g_fontJp) {
+                        int aA = font_ascent(g_font), aJ = font_ascent(g_fontJp);
+                        if (aA > 0 && aJ > 0) g_jpYoff = aA - aJ;
+                        ff13loga("[FF13-SRP] overlay: ascent ascii %d, jp %d -> jp runs drawn %+dpx"
+                                 " (one baseline)\n", aA, aJ, g_jpYoff);
+                    }
                     D3DXCreateSprite_t pCS =
                         (D3DXCreateSprite_t)GetProcAddress(hx, "D3DXCreateSprite");
                     void* sp = NULL;
@@ -771,6 +813,7 @@ static void overlay_draw(void* dev) {
             { &g_saveVk,       T_HELP_SAVE },
             { &g_camUnstickVk, T_HELP_CAMERA },
             { &g_ssVk,         T_HELP_SORT },
+            { &g_menuOkVk,     T_HELP_MENU_OK },
             { &g_boVk,         T_HELP_BATTLE_OVL },
             { &g_bsVk,         T_HELP_PICKER },
         };
@@ -897,7 +940,9 @@ static void overlay_draw(void* dev) {
         overlay_backdrop(dev, 0.f, (float)(y - 4), 4096.f, (float)(y + 5 * 24 + 8), 0x99000000);
         if (em == EDIT_LABEL) snprintf(buf, sizeof buf, ui_text(T_LABEL_EDIT_HEAD), g_labelEditSlot + 1);
         else snprintf(buf, sizeof buf, "%s",
-                      ui_text(em == EDIT_CAT_RENAME ? T_SS_CAT_RENAME_HEAD : T_SS_CAT_NAME_HEAD));
+                      ui_text(em == EDIT_CAT_RENAME  ? T_SS_CAT_RENAME_HEAD
+                            : em == EDIT_CAT_NEW_ALL ? T_SS_CAT_NAME_HEAD_ALL
+                                                     : T_SS_CAT_NAME_HEAD));
         overlay_say(g_font, 14, y, buf, OVL_BATTLE); y += 24;
         {
             const unsigned short* t = (const unsigned short*)label_edit_text();
@@ -908,32 +953,38 @@ static void overlay_draw(void* dev) {
             y += 24;
         }
         if (em != EDIT_LABEL) {
-            y += 24 * overlay_say_wrap(g_font, 14, 14, y, ui_text(T_SS_CAT_EDIT_HELP),
-                                       label_edit_bad() ? OVL_INSTANT : OVL_MENU, 24);
+            int b = label_edit_bad();
+            y += 24 * overlay_say_wrap(g_font, 14, 14, y,
+                                       ui_text(b == EDIT_BAD_EXISTS ? T_SS_CAT_EXISTS
+                                             : b == EDIT_BAD_NAME   ? T_SS_CAT_BADNAME
+                                                                    : T_SS_CAT_EDIT_HELP),
+                                       b ? OVL_INSTANT : OVL_MENU, 24);
         } else if (label_edit_bad()) {
             snprintf(buf, sizeof buf, ui_text(T_LABEL_EDIT_FULL), LABEL_TEXT_MAX);
             y += 24 * overlay_say_wrap(g_font, 14, 14, y, buf, OVL_INSTANT, 24);
         } else {
             y += 24 * overlay_say_wrap(g_font, 14, 14, y, ui_text(T_LABEL_EDIT_HELP), OVL_MENU, 24);
         }
-        { char lk[32]; vk_label(g_ssVk, lk, sizeof lk);
+        { char lk[32], ok[40]; vk_label(g_ssVk, lk, sizeof lk); tidy_ok_phrase(ok, sizeof ok);
           snprintf(buf, sizeof buf,
-                   ui_text(em == EDIT_LABEL ? T_LABEL_EDIT_KEYS : T_SS_CAT_EDIT_KEYS), lk); }
+                   ui_text(em == EDIT_LABEL ? T_LABEL_EDIT_KEYS : T_SS_CAT_EDIT_KEYS), ok, lk); }
         overlay_say(g_font, 14, y, buf, OVL_MENU); y += 24;
         y += 12;
     }
 
     if (showSort) {
-        char up[32], down[32], k[32], cancel[32];
+        char up[32], down[32], cancel[32], ok[40];
         vk_label(g_bsUpVk, up, sizeof up);   vk_label(g_bsDownVk, down, sizeof down);
-        vk_label(g_ssVk, k, sizeof k);       vk_label(g_warpCancelVk, cancel, sizeof cancel);
+        vk_label(g_warpCancelVk, cancel, sizeof cancel); tidy_ok_phrase(ok, sizeof ok);
         static const ovl_msg kModes[SS_MODES] = { T_SS_FILTER_ALL,
-                                                  T_SS_CAT_PICK_NONE, T_SS_CAT_NEW, T_SS_CAT_RENAME,
+                                                  T_SS_CAT_PICK_NONE, T_SS_CAT_NEW,
+                                                  T_SS_CAT_NEW_ALL, T_SS_CAT_RENAME,
+                                                  T_SS_CAT_DEL_IDLE,
                                                   T_SS_STORY_ASC, T_SS_STORY_DESC, T_SS_NUMBER,
                                                   T_SS_RENUM };
         // The heading each row opens a group with; -1 = the row continues the group above it.
         static const int kGroup[SS_MODES] = { T_SS_GRP_FILTER,
-                                              T_SS_GRP_CAT, -1, -1,
+                                              T_SS_GRP_CAT, -1, -1, -1, -1,
                                               T_SS_GRP_SORT, -1, -1,
                                               T_SS_GRP_RENUM };
         int rows = SS_MODES + 6;              // title + four headings + the rows + the footer
@@ -944,7 +995,7 @@ static void overlay_draw(void* dev) {
                 overlay_say(g_font, 14, y, ui_text((ovl_msg)kGroup[i]), OVL_FLASH); y += 24;
             }
             char row[160];
-            const char* pick = (i == SS_CAT_PICK) ? cat_name_sel() : NULL;
+            const char* pick = (i == SS_CAT_PICK || i == SS_CAT_DEL) ? cat_name_sel() : NULL;
             if (i == SS_FILTER && g_filterChapter)
                 snprintf(row, sizeof row, ui_text(T_SS_FILTER_ONE),
                          g_filterChapter, filter_count_of(g_filterChapter));
@@ -953,53 +1004,81 @@ static void overlay_draw(void* dev) {
                          ui_text(pick ? T_SS_CAT_PICK
                                       : cat_count() ? T_SS_CAT_PICK_IDLE : T_SS_CAT_PICK_NONE),
                          cat_name_cur(), pick);
+            else if (i == SS_CAT_DEL && pick)
+                // The armed variant also wants the confirm phrase; the idle one ignores it.
+                snprintf(row, sizeof row,
+                         ui_text(cat_del_armed() ? T_SS_CAT_DEL_ARM : T_SS_CAT_DEL), pick, ok);
             else
                 snprintf(row, sizeof row, "%s", ui_text(kModes[i]));
             snprintf(buf, sizeof buf, "   %s %s", (i == g_ssSel) ? ">" : " ", row);
             overlay_say(g_font, 14, y, buf, (i == g_ssSel) ? OVL_MENU_SEL : OVL_MENU); y += 24;
         }
-        if (g_ssSel == SS_FILTER || g_ssSel == SS_CAT_PICK) {
+        if (g_ssSel == SS_FILTER || g_ssSel == SS_CAT_PICK || g_ssSel == SS_CAT_DEL) {
             char l[32], r[32];
             vk_label(g_bsLeftVk, l, sizeof l); vk_label(g_bsRightVk, r, sizeof r);
             snprintf(buf, sizeof buf,
-                     ui_text(g_ssSel == SS_FILTER ? T_SS_FILTER_KEYS : T_SS_CAT_KEYS), l, r);
+                     ui_text(g_ssSel == SS_FILTER   ? T_SS_FILTER_KEYS
+                           : g_ssSel == SS_CAT_PICK ? T_SS_CAT_KEYS
+                                                    : T_SS_CAT_DEL_KEYS), l, r, ok);
         }
-        else                         snprintf(buf, sizeof buf, ui_text(T_SS_FOOT), up, down, k, cancel);
+        else                         snprintf(buf, sizeof buf, ui_text(T_SS_FOOT), up, down, ok, cancel);
         overlay_say(g_font, 14, y, buf, OVL_MENU); y += 24;
         y += 12;
     }
 
     if (showLsel) {
-        char up[32], down[32], l[32], r[32], k[32];
+        char up[32], down[32], l[32], r[32], k[32], ok[40];
         vk_label(g_bsUpVk, up, sizeof up);       vk_label(g_bsDownVk, down, sizeof down);
         vk_label(g_bsLeftVk, l, sizeof l);       vk_label(g_bsRightVk, r, sizeof r);
-        vk_label(g_ssVk, k, sizeof k);
-        static const ovl_msg kLselRows[LSEL_ROWS] = { T_LSEL_NOTE, T_SEND_COPY, T_SEND_MOVE };
-        // The heading each row opens a group with; -1 = the row continues the group above it.
-        static const int kLselGroup[LSEL_ROWS] = { T_LSEL_GRP_NOTE, T_LSEL_GRP_SEND, -1 };
-        int rows = LSEL_ROWS + 4;             // title + two headings + the rows + the footer
+        vk_label(g_ssVk, k, sizeof k);           tidy_ok_phrase(ok, sizeof ok);
+        // No group headings: every row acts on the save in the title, and the range rows must not
+        // read as part of the send.
+        int rows = LSEL_ROWS + 2;             // title + the rows + the footer
         overlay_backdrop(dev, 0.f, (float)(y - 4), 4096.f, (float)(y + rows * 24 + 8), 0x99000000);
-        snprintf(buf, sizeof buf, ui_text(T_LSEL_HEAD), g_lselSlot + 1);
+        // The key that changes WHICH save rides the line that names it, not the footer.
+        char pick[80] = "";
+        if (g_listPrevVk && g_listNextVk) {
+            char pp[32], pn[32];
+            vk_label(g_listPrevVk, pp, sizeof pp);
+            vk_label(g_listNextVk, pn, sizeof pn);
+            snprintf(pick, sizeof pick, ui_text(T_LSEL_PICK), pp, pn);
+        }
+        snprintf(buf, sizeof buf, ui_text(T_LSEL_HEAD), g_lselSlot + 1, pick);
         overlay_say(g_font, 14, y, buf, OVL_BATTLE); y += 24;
         for (int i = 0; i < LSEL_ROWS; i++) {
-            if (kLselGroup[i] >= 0) {
-                if (kLselGroup[i] == T_LSEL_GRP_SEND) {
-                    const char* dest = send_dest_name();
-                    snprintf(buf, sizeof buf, ui_text(T_LSEL_GRP_SEND),
-                             dest ? dest : ui_text(T_SEND_NEWCAT));
-                } else {
-                    snprintf(buf, sizeof buf, "%s", ui_text((ovl_msg)kLselGroup[i]));
-                }
-                overlay_say(g_font, 14, y, buf, OVL_FLASH); y += 24;
-            }
-            snprintf(buf, sizeof buf, "   %s %s", (i == g_lselSel) ? ">" : " ",
-                     ui_text(kLselRows[i]));
-            overlay_say(g_font, 14, y, buf, (i == g_lselSel) ? OVL_MENU_SEL : OVL_MENU); y += 24;
+            char row[256];
+            int anc = range_anchor(), rn = range_shown_count();
+            const char* dest = send_dest_name();
+            if (!dest) dest = ui_text(T_SEND_NEWCAT);
+            if (i == LSEL_MARK && anc >= 0)
+                snprintf(row, sizeof row, "%s", ui_text(T_LSEL_MARK_CLR));
+            else if (i == LSEL_MARK)
+                snprintf(row, sizeof row, ui_text(T_LSEL_MARK_SET), g_lselSlot + 1);
+            else if (i == LSEL_DEL && range_del_armed())
+                snprintf(row, sizeof row, ui_text(T_LSEL_DEL_ARM), range_del_count(), ok);
+            else if (i == LSEL_DEL && range_del_ready())
+                snprintf(row, sizeof row, ui_text(T_LSEL_DEL), anc + 1, g_lselSlot + 1, rn);
+            else if (i == LSEL_DEL)
+                snprintf(row, sizeof row, "%s", ui_text(T_LSEL_DEL_IDLE));
+            else if ((i == LSEL_COPY || i == LSEL_MOVE) && anc >= 0 && rn > 0)
+                snprintf(row, sizeof row, ui_text(i == LSEL_COPY ? T_SEND_COPY_N : T_SEND_MOVE_N),
+                         anc + 1, g_lselSlot + 1, rn, dest);
+            else if (i == LSEL_COPY || i == LSEL_MOVE)
+                snprintf(row, sizeof row, ui_text(i == LSEL_COPY ? T_SEND_COPY : T_SEND_MOVE), dest);
+            else
+                snprintf(row, sizeof row, "%s", ui_text(T_LSEL_NOTE));
+            snprintf(buf, sizeof buf, "   %s %s", (i == g_lselSel) ? ">" : " ", row);
+            // A row that cannot run stays dim even under the cursor: the ">" marks where you are.
+            DWORD col = (i == LSEL_DEL && !range_del_ready()) ? OVL_MENU_OFF
+                      : (i == g_lselSel)                     ? OVL_MENU_SEL : OVL_MENU;
+            overlay_say(g_font, 14, y, buf, col); y += 24;
         }
         // No cancel key here: the game's own save list reads that one as "back" and would take
         // itself away with it.
-        if (g_lselSel == LSEL_NOTE) snprintf(buf, sizeof buf, ui_text(T_LSEL_KEYS), up, down, k);
-        else snprintf(buf, sizeof buf, ui_text(T_LSEL_SEND_KEYS), up, down, l, r, k);
+        if (g_lselSel == LSEL_NOTE || g_lselSel == LSEL_MARK || g_lselSel == LSEL_DEL)
+            snprintf(buf, sizeof buf, ui_text(T_LSEL_KEYS), up, down, ok, k);
+        else snprintf(buf, sizeof buf, ui_text(T_LSEL_SEND_KEYS), up, down, l, r,
+                      ui_text(g_lselSel == LSEL_COPY ? T_SEND_DEST_COPY : T_SEND_DEST_MOVE), ok, k);
         overlay_say(g_font, 14, y, buf, OVL_MENU); y += 24;
         y += 12;
     }

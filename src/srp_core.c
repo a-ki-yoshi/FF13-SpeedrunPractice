@@ -19,8 +19,8 @@
 #include "srp_internal.h"
 
 // FF13-SpeedrunPractice -- speedrun practice DLL for FINAL FANTASY XIII (Steam).
-// Features: ABOUT.md (developer-facing) / README.md (user-facing). Why this ships as a dinput8
-// proxy and which slots are usable: CLAUDE.md. What -DFF13_DIAG leaves out: build.sh.
+// Features: ABOUT.md (developer-facing) / release/README.md (user-facing). Why this ships as a
+// dinput8 proxy and which slots are usable: CLAUDE.md. What -DFF13_DIAG leaves out: build.sh.
 
 // ---- config (ff13-srpractice.ini next to the exe; loaded once at worker start) ----
 // These defaults ARE the shipped layout: ff13-srpractice.ini.example, README.ja.md and the key
@@ -36,6 +36,15 @@ UINT g_boVk       = VK_F10;    // battle overlay (timer + enemy HP) toggle (defa
 UINT g_saveVk     = VK_F7;     // save-screen hotkey (default F7; ini [hotkeys] save overrides)
 UINT g_camUnstickVk = VK_F8;  // "un-stick camera" hotkey (ini [hotkeys] camera_unstick; 0 = disabled)
 UINT g_ssVk       = VK_F9;     // (default F9; ini [hotkeys] save_tidy)
+UINT g_menuOkVk   = VK_RETURN; // tidy-menu confirm (default Enter; ini [hotkeys] menu_ok). Safe as
+                               // a game key because those menus hold the DirectInput gate; acted on
+                               // ONLY while one of them is up.
+// Walks THE GAME'S save selection while our save-list menu is up (default A/D; ini [hotkeys]
+// list_prev/list_next; see di_fake_dik -- the gate has the keyboard, so the game is handed a
+// keystroke rather than allowed the real one). Nothing of OURS moves on these, and they are acted
+// on only over the save list, never in the picker, which holds no gate.
+UINT g_listPrevVk  = 'A';
+UINT g_listNextVk  = 'D';
 // Hotkeys only while the game is the focused window. GetAsyncKeyState reads the keyboard, not the
 // window, so without this every key here fires from inside a browser. ini: [hotkeys] require_focus
 // -- a setting rather than a rule because a wrong focus test takes EVERY hotkey with it, and 0 is
@@ -244,8 +253,9 @@ static void cfg_language(const char* val, const char* where) {
                                           : g_uiLang == OVL_LANG_EN ? "en" : "auto");
 }
 // Parses a binding into a VK plus modifier bits (the modifiers ride in the bits above the key
-// code): a function-key name, "0xNN" hex, or a single letter or digit, each optionally behind
-// Ctrl+ / Shift+ / Alt+ prefixes in any order and case; 0 = invalid.
+// code): a function-key name, "0xNN" hex, a single letter or digit, or a named key (Enter, Space,
+// the arrows...), each optionally behind Ctrl+ / Shift+ / Alt+ prefixes in any order and case;
+// 0 = invalid.
 // Fn cannot be supported -- the keyboard handles it and it never becomes a key code the OS sees.
 static int cfg_ieqn(const char* a, const char* b, size_t n) {
     for (size_t i = 0; i < n; i++)
@@ -281,6 +291,22 @@ static UINT cfg_parse_vk(const char* v) {
         vk = (UINT)(v[0] >= 'a' ? v[0] - 'a' + 'A' : v[0]);   // VK for a letter IS its uppercase
     } else if (klen == 1 && v[0] >= '0' && v[0] <= '9') {
         vk = (UINT)v[0];                                      // ...and for a digit, its ASCII
+    } else {
+        // Esc stays out on purpose -- it is the game's own quit-dialog key.
+        static const struct { const char* n; UINT k; } kNamed[] = {
+            { "enter", VK_RETURN }, { "return", VK_RETURN }, { "space", VK_SPACE },
+            { "tab", VK_TAB },      { "backspace", VK_BACK },
+            { "up", VK_UP },        { "down", VK_DOWN },
+            { "left", VK_LEFT },    { "right", VK_RIGHT },
+            { "home", VK_HOME },    { "end", VK_END },
+            { "pageup", VK_PRIOR }, { "pagedown", VK_NEXT },
+            { "insert", VK_INSERT }, { "delete", VK_DELETE },
+        };
+        for (int i = 0; i < (int)(sizeof kNamed / sizeof kNamed[0]); i++)
+            if (klen == strlen(kNamed[i].n) && cfg_ieqn(v, kNamed[i].n, klen)) {
+                vk = kNamed[i].k;
+                break;
+            }
     }
     return vk ? (vk | mods) : 0;   // unrecognized -> caller keeps the default and warns
 }
@@ -300,6 +326,8 @@ static const struct { const char* name; UINT* vk; } kHotkeys[] = {
     { "save",           &g_saveVk },
     { "camera_unstick", &g_camUnstickVk },
     { "save_tidy",      &g_ssVk },
+    { "menu_ok",        &g_menuOkVk },
+    { "list_prev",      &g_listPrevVk }, { "list_next",  &g_listNextVk },
 };
 // "3.0x<arrow>OFF" or "2.0x<arrow>3.0x<arrow>OFF" -- the help row's cycle, in the caller's arrow
 // (the JP arrow only renders where the JP font does, so the caller picks it with the language).
@@ -357,9 +385,10 @@ void config_load(void) {
                 } else {
                     for (int i = 0; i < (int)(sizeof(kHotkeys) / sizeof(kHotkeys[0])); i++) {
                         if (!cfg_ieq(key, kHotkeys[i].name)) continue;
-                        // Any key can be turned off: 0 is never a real binding, and hk_edge /
-                        // hk_down on 0 cannot fire, so an unbound key simply stops existing.
-                        if (cfg_ieq(val, "off") || cfg_ieq(val, "none") || cfg_ieq(val, "0")) {
+                        // Any key can be unbound: 0 is never a real binding, and hk_edge /
+                        // hk_down on 0 cannot fire. off / none stay accepted for the ini.examples
+                        // up to 1.3.0 that taught them. NOT "0": that is the digit key, a binding.
+                        if (!val[0] || cfg_ieq(val, "off") || cfg_ieq(val, "none")) {
                             *kHotkeys[i].vk = 0;
                             break;
                         }
@@ -468,6 +497,16 @@ void config_load(void) {
         }
         fclose(f);
     }
+    // menu_ok on the tidy key's PHYSICAL key collapses the two-confirm deletes into one gesture:
+    // the edge arms and the hold confirms inside the arm window. By hk_key, so a modifier does not
+    // make it safe: letting the modifier up with the key still held is a fresh press to hk_taphold.
+    if (g_menuOkVk && hk_key(g_menuOkVk) == hk_key(g_ssVk)) {
+        // NOT cfg_bad_vk: that channel means "did not parse, the DEFAULT is in force", and neither
+        // half is true here. Written at every log level on purpose.
+        ff13loga("[FF13-SRP] config: menu_ok is bound to the tidy key itself -> menu_ok off "
+                 "(a hold still confirms)\n");
+        g_menuOkVk = 0;
+    }
     char mark[32] = {0};   // back to narrow for the log line
     WideCharToMultiByte(CP_UTF8, 0, g_listMark, -1, mark, sizeof(mark), NULL, NULL);
     ff13loga("[FF13-SRP] config: help=0x%X kill_mode=0x%X enemy_suppress=0x%X game_speed=0x%X "
@@ -489,9 +528,9 @@ void state_save(void) {
     // them; the extra strength rides in "instantwin", which they skip), and "gamespeed" carries the
     // STEP -- 0 = off, n = the nth multiplier -- so an older sidecar's 1 restores as the first step.
     fprintf(f, "suppress %d\ngamespeed %d\nonehit %d\ninstantwin %d\nbattle_overlay %d\n"
-               "filter %d\n",
+               "filter %d\nsort %d\n",
             g_suppressEnabled ? 1 : 0, g_gsStep + 1, g_armed ? 1 : 0,
-            g_iwArmed ? 1 : 0, g_battleOverlay ? 1 : 0, g_filterChapter);
+            g_iwArmed ? 1 : 0, g_battleOverlay ? 1 : 0, g_filterChapter, g_sortMode);
     fclose(f);
 }
 void state_load(void) {
@@ -511,15 +550,16 @@ void state_load(void) {
         // Recorded here, put into effect by filter_restore once the save headers have been
         // scanned and the list hook can be installed.
         else if (cfg_ieq(key, "filter"))         g_filterChapter = (val > 0 && val < 256) ? val : 0;
+        else if (cfg_ieq(key, "sort"))           g_sortMode = (val >= 0 && val <= 2) ? val : 0;
     }
     fclose(f);
     // Rebuilt from the two bits rather than stored, so a sidecar from a build that never knew about
     // instant-win restores as plain one-hit-kill instead of as nothing.
     kill_mode_apply(g_iwArmed ? KILL_INSTANT : g_armed ? KILL_ONEHIT : KILL_OFF, 0);
     ff13loga("[FF13-SRP] state: restored suppress=%d gamespeed=%d kill=%s battle_overlay=%d "
-             "filter=%d%s\n",
+             "filter=%d sort=%d%s\n",
              g_suppressEnabled, g_gsEnabled, kill_mode_name_en(g_killMode), g_battleOverlay,
-             g_filterChapter,
+             g_filterChapter, g_sortMode,
              g_killMode != KILL_OFF ? "  (WARNING: this is carried over from a previous session)" : "");
 }
 

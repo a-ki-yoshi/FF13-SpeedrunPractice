@@ -108,6 +108,8 @@ static char g_csRestore[40];                   // set to put back when the fight
 // over can freeze the AsyncLoader thread for the rest of the session (see cs_restore_watch).
 static volatile uint32_t g_decksRestoreFor = 0;  // fight whose party the picker set, decks pending
 static volatile int   g_selBefore = -1;          // paradigm in hand when the pick was made
+static volatile int   g_selLast = -1;            // ...the last one seen in hand inside the fight
+static volatile int   g_selWant = -1;            // ...and the one the field is owed, chosen at fight-over
 static volatile int   g_selRestoreDue = 0;       // ...and whether the field still owes it back
 static volatile DWORD g_selRestoreFrom = 0;
 // One pass over a fight's drop rows, run at pick time and again at the touch hand-off. The
@@ -137,6 +139,8 @@ static volatile DWORD g_csRestoreFrom = 0;
 static volatile DWORD g_csRestoreStable = 0;
 static volatile DWORD g_csRestoreEarliest = 0;   // a short fight holds the set for its retry
 static volatile int   g_csRestoreHold = 0;       // ...timed from the field coming back, not the win
+static volatile int   g_csRestoreLate = 0;       // the conclusion outlasted the cap; said once
+static volatile DWORD g_csFieldBackAt = 0;       // ...and when the field came back, to time it from
 volatile uint32_t g_bsStarted = 0;      // scene the picker last started
 static volatile int   g_openLogN = 0;   // opening transforms logged for this fight
 static volatile int   g_swapLogN = 0;   // ...and charaspec swaps
@@ -690,12 +694,39 @@ static void bs_scan(void) {
 const uint8_t P_SPECREPL[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x20,0x02,0x00,0x00};
 #define SPEC_NAME_LEN 16             // the game's own fixed key width, NUL-padded
 
-// The last charaspec a picked fight installed, keyed by SCENE and not by actor: a fight can hold
-// one object per form (enemy0 m154, enemy2 m154_x1), so what carries over between picks is the
-// shape.
-#define FORMLEFT_N 4
-static volatile uint32_t g_formLeftScene[FORMLEFT_N];
-static char              g_formLeftNm[FORMLEFT_N][SPEC_NAME_LEN + 1];
+// The last charaspec put on each SCENE OBJECT (the id at actor+8). The object outlives the fight
+// and the next one binds a fresh actor to it, so the shape it was left in is what carries over --
+// neither the actor (recycled) nor the scene (two objects of one enemy end in different forms) is
+// the key (measured; CODE_NOTES).
+#define OBJFORM_N 16
+static struct { uint32_t obj; char nm[SPEC_NAME_LEN + 1]; DWORD at; } g_objForm[OBJFORM_N];
+#define OFF_ACTOR_OBJ 0x08           // the actor's scene object id; -1 = none
+
+static void obj_form_note(uint32_t actor, const char* nm) {
+    if (!actor || IsBadReadPtr((void*)(uintptr_t)(actor + OFF_ACTOR_OBJ), 4)
+        || IsBadReadPtr((void*)(uintptr_t)(actor + OFF_GUARD324), 4)) return;
+    uint32_t obj = *(uint32_t*)(uintptr_t)(actor + OFF_ACTOR_OBJ);
+    if (obj == 0xFFFFFFFFu) return;
+    if (!*(uint32_t*)(uintptr_t)(actor + OFF_GUARD324)) return;      // enemies only (see iw_is_enemy)
+    int slot = -1;
+    for (int i = 0; i < OBJFORM_N; i++) if (g_objForm[i].obj == obj) { slot = i; break; }
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < OBJFORM_N; i++)
+            if (!g_objForm[i].obj || (int)(g_objForm[i].at - g_objForm[slot].at) < 0) slot = i;
+    }
+    g_objForm[slot].obj = obj; g_objForm[slot].at = GetTickCount();
+    strncpy(g_objForm[slot].nm, nm, SPEC_NAME_LEN); g_objForm[slot].nm[SPEC_NAME_LEN] = 0;
+}
+
+// -> the name this actor's object was last left in, or NULL if it was never swapped.
+static const char* obj_form_left(uint32_t actor) {
+    if (!actor || IsBadReadPtr((void*)(uintptr_t)(actor + OFF_ACTOR_OBJ), 4)) return NULL;
+    uint32_t obj = *(uint32_t*)(uintptr_t)(actor + OFF_ACTOR_OBJ);
+    if (obj == 0xFFFFFFFFu) return NULL;
+    for (int i = 0; i < OBJFORM_N; i++) if (g_objForm[i].obj == obj) return g_objForm[i].nm;
+    return NULL;
+}
 
 // The fights that offer a form, and the charaspec each form is. Picker mode 1..n indexes `forms`;
 // the label in btsc_picker.tsv and the charaspec installed here come from the same row.
@@ -743,9 +774,12 @@ static const struct { uint16_t btsc; const char* base;
 // `until` names the abilities whose execution ends the pin instead of a count. When it is set,
 // `misses` is not read at all and the pin fails EVERY roll of its status until one of them goes
 // off; `base` is then the enemy whose action door decides that, and must be filled in too.
+// `scale` outranks both: a percent there leaves the roll alone and keeps that much of the chance the
+// game just worked out, for the whole fight. 50 = half as likely.
 static const struct { uint16_t btsc; uint8_t status[DBF_MAX];
                       const char* on[DBF_MAX]; uint8_t misses[DBF_MAX];
-                      const char* base; const char* until[DBF_UNTIL_MAX]; } kDbfMiss[] = {
+                      const char* base; const char* until[DBF_UNTIL_MAX];
+                      uint8_t scale[DBF_MAX]; } kDbfMiss[] = {
     // Sunleth Waterscape. The counts are per enemy and are what the user asked to rehearse, not
     // anything the fight imposes; btsc_picker.tsv's row labels spell them out and must agree.
     { 5027, { ST_DEPROTECT, ST_DEPROTECT },
@@ -762,8 +796,35 @@ static const struct { uint16_t btsc; uint8_t status[DBF_MAX];
              { "m320", "m320" },                       // 1 = Imperil only, 2 = Deprotect only
              {  0,      0     }, "m320",
              { "m320_ac700", "m320_ac701", "m320_ac702", "m320_ac703" } },
+    // Orphan's Cradle, Wladislaus.
+    { 12084, { ST_DEPROTECT },
+             { "m242" },
+             {  0     }, NULL, { NULL },
+             { 45     } },
 };
 #define DBF_MISS_N ((int)(sizeof(kDbfMiss)/sizeof(kDbfMiss[0])))
+
+// ---- launch pin: the break reaction that will not lift ---------------------------------------
+// The fourth mode table, sharing the numbering of the three around it. `scale` is the percent of the
+// launch's real success rate to keep, for the whole fight -- as kDbfMiss's scale, except that what
+// is scaled is an integer resistance, not a float chance. See common/docs/LAUNCH_ROLL_RE.md.
+#define LAU_MAX 4
+static const struct { uint16_t btsc; const char* on[LAU_MAX]; uint8_t scale[LAU_MAX]; } kLauMiss[] = {
+    // Eden, the Proudclad's second fight. Launch is one roll against the target's blast resistance,
+    // 50 on m154. m154_pw, the later form, carries the same 50 and the spec match covers it.
+    { 12042, { "m154" }, { 40 } },
+};
+#define LAU_MISS_N ((int)(sizeof(kLauMiss)/sizeof(kLauMiss[0])))
+
+static int laumiss_count(uint32_t btsc) {
+    for (int i = 0; i < LAU_MISS_N; i++) {
+        if (kLauMiss[i].btsc != btsc) continue;
+        int n = 0;
+        while (n < LAU_MAX && kLauMiss[i].on[n]) n++;
+        return n;
+    }
+    return 0;
+}
 
 static int dbfmiss_count(uint32_t btsc) {
     for (int i = 0; i < DBF_MISS_N; i++) {
@@ -826,6 +887,18 @@ static int librakeep_count(uint32_t btsc) {
     return 0;
 }
 
+// The kept rows that also keep the paradigm the fight ENDS on in hand: the first half of a
+// back-to-back pair whose second half opens on it in the story. User-specified; btsc09041 was not
+// asked for, and btsc07037's next fight changes the party.
+static const uint16_t kSelKeepMode[] = { 3032, 4026 };
+#define SEL_KEEPMODE_N ((int)(sizeof(kSelKeepMode)/sizeof(kSelKeepMode[0])))
+
+static int selkeep_count(uint32_t btsc) {
+    for (int i = 0; i < SEL_KEEPMODE_N; i++)
+        if (kSelKeepMode[i] == (uint16_t)btsc) return 1;
+    return 0;
+}
+
 // How many choices this fight offers, 0 for "it has none".
 static int aimode_count(uint32_t btsc) {
     for (int i = 0; i < AI_FORMS_N; i++) {
@@ -836,6 +909,8 @@ static int aimode_count(uint32_t btsc) {
     }
     int n = dbfmiss_count(btsc);
     if (n) return n;
+    n = laumiss_count(btsc);
+    if (n) return n;
     n = openmode_count(btsc);
     return n ? n : librakeep_count(btsc);
 }
@@ -843,6 +918,7 @@ static int aimode_count(uint32_t btsc) {
 // Long enough to cover the preload cap plus the minutes of fighting before the form comes up, short
 // enough that a pin can never reach a later fight.
 #define AIPIN_ARM_MS 300000
+#define AIPIN_LONG_ARM_MS 1800000   // a pin that only the fight ending takes down (see aipin_arm)
 #ifdef FF13_DIAG
 static char              g_formSeen[SPEC_NAME_LEN + 1];
 static volatile DWORD    g_formWatch = 0;
@@ -885,8 +961,19 @@ static volatile int      g_dbfStatus = 0;
 static volatile int      g_dbfLeft   = 0;
 static volatile DWORD    g_dbfUntil  = 0;
 static char              g_dbfUntilAct[ACT_NAME_LEN + 1];  // "" = a count ends this pin, not an ability
+// >0 = the rolls are not forced at all; this percent of their chance is kept, for the whole fight.
+static volatile int      g_dbfScale  = 0;
+static volatile int      g_dbfLandN  = 0;   // rolls that came up yes, against the same enemy
+#define DBF_LAND_LOG_MAX 300
 static volatile int      g_dbfUntilSeen = 0;   // the AI's answer right now IS that ability
-static volatile int      g_dbfMissN  = 0;      // forced misses so far, for the standdown line
+static volatile int      g_dbfMissN  = 0;      // rolls this pin has acted on, for the standdown line
+// The launch pin's own state. g_lauScale is the whole switch: the percent of the real rate kept.
+static char              g_lauOn[SPEC_NAME_LEN + 1];
+static volatile int      g_lauScale  = 0;
+static volatile DWORD    g_lauUntil  = 0;
+static volatile int      g_lauRollN  = 0;   // launch rolls this pin has acted on...
+static volatile int      g_lauDownN  = 0;   // ...and how many of them left the target on the ground
+#define LAU_LOG_MAX 300
 // ...and its mirror image, which the opening pin uses: a roll made to LAND. No enemy goes with it
 // -- the rider belongs to the pinned enemy's own attack, so the target is whoever it hit.
 static volatile int      g_dbfLandStatus = 0;
@@ -915,6 +1002,7 @@ static char              g_openAimOn[SPEC_NAME_LEN + 1];   // ...and the spec it
 // 1 = this pick's Libra gain is held across the way back. Armed per pick rather than looked up by
 // scene at fight-over, so a fight that offers the mode still resets when its plain row was chosen.
 static volatile int      g_libraKeepPick = 0;
+static volatile int      g_selKeepPick   = 0;   // ...and the paradigm it ends on stays in hand
 
 // Arm the pin for a fight the picker is about to start. mode 0 (or a fight with no forms) clears it,
 // so a plain pick disarms whatever an earlier one left behind.
@@ -925,18 +1013,34 @@ static void aipin_arm(uint32_t btsc, int mode) {
     g_formActSaid = 0; g_formActBent = 0; g_formSwapEnds = 0; g_formAimUntil = 0;
     g_formFlag = 0; g_formFlagPool = 0;
     g_aimHoldUntil = 0; g_aimHoldFrom = 0; g_aimHoldSaid = 0;
-    g_dbfOn[0] = 0; g_dbfStatus = 0; g_dbfLeft = 0;
+    g_dbfOn[0] = 0; g_dbfStatus = 0; g_dbfLeft = 0; g_dbfScale = 0;
+    g_dbfLandN = 0;
     g_dbfUntilAct[0] = 0; g_dbfUntilSeen = 0; g_dbfMissN = 0;
     g_dbfLandStatus = 0; g_dbfLandLeft = 0; g_dbfLandWant = 0; g_dbfLandSeen = 0;
+    g_lauOn[0] = 0; g_lauScale = 0; g_lauRollN = 0; g_lauDownN = 0;
     g_openPin = 0; g_openBent = 0; g_openSkip = 0;
     g_openIgn = 0; g_openDecided = 0; g_openWho = 0; g_openAimed = 0;
     g_openAimOn[0] = 0;
-    g_libraKeepPick = 0;
+    g_libraKeepPick = 0; g_selKeepPick = 0;
     if (librakeep_count(btsc)) {
         if (mode != 1) return;
         g_libraKeepPick = 1;
+        g_selKeepPick = selkeep_count(btsc);
         ff13logv("[FF13-SRP] battle picker: btsc%05u mode %d -- what this fight teaches about its "
-                 "enemies is kept, not put back\n", btsc, mode);
+                 "enemies is kept, not put back%s\n", btsc, mode,
+                 g_selKeepPick ? ", and neither is the paradigm it ends on" : "");
+        return;
+    }
+    for (int i = 0; i < LAU_MISS_N; i++) {
+        if (kLauMiss[i].btsc != btsc) continue;
+        if (mode <= 0 || mode > laumiss_count(btsc)) return;
+        strncpy(g_lauOn, kLauMiss[i].on[mode - 1], SPEC_NAME_LEN);
+        g_lauOn[SPEC_NAME_LEN] = 0;
+        // AIPIN_ARM_MS would expire mid-fight on a rehearsed boss and read as the pin breaking.
+        g_lauUntil = GetTickCount() + AIPIN_LONG_ARM_MS;
+        g_lauScale = kLauMiss[i].scale[mode - 1];   // armed last: the hook tests this one
+        ff13logv("[FF13-SRP] launch pin: btsc%05u mode %d armed -- every launch roll against %s "
+                 "keeps %d%% of the chance it would have had\n", btsc, mode, g_lauOn, g_lauScale);
         return;
     }
     for (int i = 0; i < DBF_MISS_N; i++) {
@@ -946,6 +1050,16 @@ static void aipin_arm(uint32_t btsc, int mode) {
         g_dbfOn[SPEC_NAME_LEN] = 0;
         g_dbfStatus = kDbfMiss[i].status[mode - 1];
         g_dbfUntil  = GetTickCount() + AIPIN_ARM_MS;
+        if (kDbfMiss[i].scale[mode - 1]) {
+            // AIPIN_ARM_MS would expire mid-fight on a rehearsed boss and read as the pin breaking.
+            g_dbfUntil = GetTickCount() + AIPIN_LONG_ARM_MS;
+            g_dbfScale = kDbfMiss[i].scale[mode - 1];
+            g_dbfLeft  = -1;                          // armed last: the hook tests this one
+            ff13logv("[FF13-SRP] miss pin: btsc%05u mode %d armed -- every roll of status %d "
+                     "against %s keeps %d%% of the chance it would have had\n",
+                     btsc, mode, g_dbfStatus, g_dbfOn, g_dbfScale);
+            return;
+        }
         if (kDbfMiss[i].until[0]) {
             // g_formBase is what both of the doors that end this pin resolve the actor by, so an
             // ability-ended pin has to fill it in even though it bends nothing about the enemy.
@@ -1508,10 +1622,20 @@ static void aim_hold(void) {
 // A pin belongs to ONE fight and is taken down with it, never left to run out its window: an armed
 // pin keeps a per-frame writer alive, and the actors it names are gone.
 static void aipin_battle_over(void) {
+    if (g_dbfScale && g_dbfMissN)
+        ff13log("[FF13-SRP] miss pin: fight over -- status %d on %s: %d of %d rolls landed (%d%%)%s\n",
+                g_dbfStatus, g_dbfOn, g_dbfLandN, g_dbfMissN,
+                g_dbfLandN * 100 / g_dbfMissN, g_dbfScale ? ", chance scaled" : ", nothing bent");
+    if (g_lauScale && g_lauRollN)
+        ff13log("[FF13-SRP] launch pin: fight over -- %s: %d of %d launch rolls lifted it (%d%%), "
+                "%d%% of the real rate kept\n", g_lauOn, g_lauRollN - g_lauDownN, g_lauRollN,
+                (g_lauRollN - g_lauDownN) * 100 / g_lauRollN, g_lauScale);
     // Before the guard below: an ability-ended pin has no count to run out, so the fight ending is
     // the only thing that stops it, and an unspent count-ended one would outlive its fight too.
-    g_dbfOn[0] = 0; g_dbfStatus = 0; g_dbfLeft = 0;
+    g_dbfOn[0] = 0; g_dbfStatus = 0; g_dbfLeft = 0; g_dbfScale = 0;
+    g_dbfLandN = 0;
     g_dbfUntilAct[0] = 0; g_dbfUntilSeen = 0;
+    g_lauOn[0] = 0; g_lauScale = 0; g_lauRollN = 0; g_lauDownN = 0;
     if (!g_formBase[0] && !g_aimHoldUntil) return;
     g_formWant[0] = 0; g_formAct[0] = 0; g_formAim[0] = 0; g_formBase[0] = 0;
     g_formUntil = 0; g_formActBent = 0; g_formAimUntil = 0; g_formSwapEnds = 0;
@@ -1803,6 +1927,38 @@ const uint8_t P_STATROLL[7] = {0x83,0xBD,0x74,0xFF,0xFF,0xFF,0x00};
                                    // 0 would let a chance of 0 through
 #define SR_LAND_BITS 0x3F800000u   // 1.0f: the draw is 0..1, so a certain chance cannot lose it
 
+// Reading and scaling the chance float without one FPU instruction: the cave saves no FPU state
+// (see above). The reading is `(1.m) << (exp - 127)` in fixed point; the roll branch is only reached
+// with a positive chance, so no sign or zero case is live.
+static int chance_permille(uint32_t bits) {
+    uint32_t e = (bits >> 23) & 0xFFu;
+    if ((bits & 0x80000000u) || e == 0) return 0;
+    uint64_t m = 0x800000u | (bits & 0x7FFFFFu);
+    int sh = 150 - (int)e;                              // value = m >> sh
+    if (sh > 43) return 0;                              // smaller than a thousandth of a percent
+    if (sh < 0) return 99999;                           // past certain; the compare cannot lose
+    uint64_t v = m * 1000u;
+    if (sh > 0) v += 1ull << (sh - 1);                  // rounded: 0.45 reads 45.0%, not 44.9%
+    return (int)(v >> sh);
+}
+
+// ...and pct/100 of it, in Q10 on the mantissa followed by a renormalise, which at pct <= 100 costs
+// at most two shifts. Exact to float32 for 50 / 30 / 25 / 10, within a ulp elsewhere (measured).
+static uint32_t chance_scaled(uint32_t bits, int pct) {
+    uint32_t e = (bits >> 23) & 0xFFu;
+    if ((bits & 0x80000000u) || e == 0) return SR_MISS_BITS;
+    uint64_t v = (((uint64_t)(0x800000u | (bits & 0x7FFFFFu)) * (uint32_t)pct) << 10) / 100u;
+    if (!v) return SR_MISS_BITS;
+    int e2 = (int)e;
+    while (v >= ((uint64_t)0x1000000u << 10)) { v >>= 1; e2++; }
+    while (v <  ((uint64_t)0x800000u  << 10)) { v <<= 1; e2--; }
+    uint32_t m2 = (uint32_t)((v + (1u << 9)) >> 10);
+    if (m2 >= 0x1000000u) { m2 >>= 1; e2++; }
+    // Too small to hold a normal exponent is a chance no rehearsal cares about keeping honest.
+    if (e2 <= 0 || e2 >= 255) return SR_MISS_BITS;
+    return ((uint32_t)e2 << 23) | (m2 & 0x7FFFFFu);
+}
+
 void __cdecl on_status_roll(uint32_t esp) {
     int miss = (g_dbfLeft != 0 && g_dbfOn[0]);
     // Not while a go is still being let past: the forced land would be spent on the go that was let
@@ -1822,6 +1978,17 @@ void __cdecl on_status_roll(uint32_t esp) {
     char nm[SPEC_NAME_LEN + 1];
     if (!actor_name_of(chara, nm)) return;
     int reg = *(int32_t*)(uintptr_t)(ebp - SR_REGIST);
+    if (isMiss && spec_is(nm, g_dbfOn) && g_dbfScale) {
+        uint32_t* pc = (uint32_t*)(uintptr_t)(ebp - SR_CHANCE);
+        int was = chance_permille(*pc);
+        *pc = chance_scaled(*pc, g_dbfScale);
+        int now = chance_permille(*pc);
+        g_dbfMissN++;
+        ff13logv("[FF13-SRP] miss pin: status %d on %s scaled to %d%% -- %d.%d%% -> %d.%d%% "
+                 "(%d%% base, %d resist), %d rolls so far\n", g_dbfStatus, nm, g_dbfScale,
+                 was / 10, was % 10, now / 10, now % 10, pct, reg, g_dbfMissN);
+        return;
+    }
     if (isMiss && spec_is(nm, g_dbfOn)) {
         *(uint32_t*)(uintptr_t)(ebp - SR_CHANCE) = SR_MISS_BITS;
         if (g_dbfLeft > 0) --g_dbfLeft;
@@ -1850,6 +2017,81 @@ void __cdecl on_status_roll(uint32_t esp) {
                      force ? " -- MADE TO LAND" : " -- left to the dice");
         }
     }
+}
+
+// The store the roll's compare falls through to when the dice say yes (0x4A55D1): the only "it
+// landed" reachable from a roll. Same frame and the same esp as the roll hook -- the rand call
+// between them is balanced and nothing else moves esp. The x87 stack is EMPTY here (fcomip and fstp
+// popped both), which is what this cave needs: it saves the integer registers and nothing else.
+const uint8_t P_STATLAND[7] = {0xC7,0x45,0xC4,0x01,0x00,0x00,0x00};
+
+void __cdecl on_status_land(uint32_t esp) {
+    if (!g_dbfScale || !g_dbfOn[0] || !prb_ptr_ok(esp)) return;
+    uint32_t ebp = esp + SR_EBP;
+    int pct = *(int32_t*)(uintptr_t)(ebp - SR_PERCENT);
+    if (pct < 1 || pct > 99) return;                 // not the frame this hook was cut for
+    uint32_t chara = *(uint32_t*)(uintptr_t)(ebp - SR_TARGET);
+    if (!prb_ptr_ok(chara)) return;
+    char nm[SPEC_NAME_LEN + 1];
+    if (!actor_name_of(chara, nm) || !spec_is(nm, g_dbfOn)) return;
+    int st = *(int32_t*)(uintptr_t)(ebp - SR_STATUS);
+    int p  = chance_permille(*(uint32_t*)(uintptr_t)(ebp - SR_CHANCE));
+    int reg = *(int32_t*)(uintptr_t)(ebp - SR_REGIST);
+    // Every status that lands on the pinned enemy is logged, not only the pinned one: a debuff with
+    // no line here came from somewhere this hook cannot see.
+    if (st == g_dbfStatus) g_dbfLandN++;
+    if (g_dbfLandN + g_dbfMissN <= DBF_LAND_LOG_MAX * 2)
+        ff13logv("[FF13-SRP] miss pin: LANDED status %d on %s at %d.%d%% (%d%% base, %d resist)%s\n",
+                 st, nm, p / 10, p % 10, pct, reg,
+                 st == g_dbfStatus ? "" : " -- not the pinned status");
+}
+
+// The hit reaction's resist fork (0x4A7E79): BattleChara::hitDamageSource has settled which reaction
+// the hit carries and how much the target resists it, and has not drawn yet. esp-relative throughout
+// -- the function realigns esp on entry, so ebp is not a fixed distance away -- and no push is
+// outstanding at this instruction.
+const uint8_t P_LAUNCH[8] = {0x83,0xBC,0x24,0x2C,0x03,0x00,0x00,0x00};
+#define LAU_REGIST 0x32C   // esp + : how much the target resists this reaction, 0..100
+#define LAU_KIND   0x340   // esp + : which reaction, 4 = the launch (3 is the slam, same fork)
+#define LAU_TARGET 0x348   // esp + : the chara being hit
+#define LAU_BLAST  4       // HIT_REACTION_KIND_BLAST, what Launch carries once the target is broken
+
+void __cdecl on_launch_roll(uint32_t esp) {
+    if (!g_lauScale || !g_lauOn[0] || !prb_ptr_ok(esp)) return;
+    if ((int)(GetTickCount() - g_lauUntil) >= 0) { g_lauScale = 0; return; }
+    if (*(int32_t*)(uintptr_t)(esp + LAU_KIND) != LAU_BLAST) return;
+    int* pr = (int*)(uintptr_t)(esp + LAU_REGIST);
+    int was = *pr;
+    if (was < 0 || was > 100) return;                // not the frame this hook was cut for
+    uint32_t chara = *(uint32_t*)(uintptr_t)(esp + LAU_TARGET);
+    if (!prb_ptr_ok(chara)) return;
+    char nm[SPEC_NAME_LEN + 1];
+    if (!actor_name_of(chara, nm) || !spec_is(nm, g_lauOn)) return;
+    // Scaled on the SUCCESS side, so the percent means what it does on the miss pin: 50 = half as
+    // likely to go up, whatever the fight's own resistance happens to be.
+    int up = ((100 - was) * g_lauScale + 50) / 100;
+    *pr = 100 - up;
+    g_lauRollN++;
+    if (g_lauRollN <= LAU_LOG_MAX)
+        ff13logv("[FF13-SRP] launch pin: %s scaled to %d%% -- %d%% -> %d%% chance of going up, "
+                 "%d rolls so far\n", nm, g_lauScale, 100 - was, up, g_lauRollN);
+}
+
+// The store that downgrades the reaction to plain damage (0x4A7ECD), reached only when the roll says
+// the target keeps its feet. The kind it overwrites is still readable: the cave runs before it.
+const uint8_t P_LAUNCHRES[11] = {0xC7,0x84,0x24,0x40,0x03,0x00,0x00,0x01,0x00,0x00,0x00};
+
+void __cdecl on_launch_resist(uint32_t esp) {
+    if (!g_lauScale || !g_lauOn[0] || !prb_ptr_ok(esp)) return;
+    if (*(int32_t*)(uintptr_t)(esp + LAU_KIND) != LAU_BLAST) return;
+    uint32_t chara = *(uint32_t*)(uintptr_t)(esp + LAU_TARGET);
+    if (!prb_ptr_ok(chara)) return;
+    char nm[SPEC_NAME_LEN + 1];
+    if (!actor_name_of(chara, nm) || !spec_is(nm, g_lauOn)) return;
+    g_lauDownN++;
+    if (g_lauDownN <= LAU_LOG_MAX)
+        ff13logv("[FF13-SRP] launch pin: %s stayed down (%d resist), %d of %d rolls so far\n",
+                 nm, *(int32_t*)(uintptr_t)(esp + LAU_REGIST), g_lauDownN, g_lauRollN);
 }
 
 // `this` is the AI block and its first field is the actor id. Resolve the chara THROUGH that id,
@@ -2076,19 +2318,16 @@ void __cdecl on_spec_replace(uint32_t ecx, uint32_t name) {
     cur[SPEC_NAME_LEN] = 0;
     for (int i = 0; cur[i]; i++)
         if ((unsigned char)cur[i] < 0x20 || (unsigned char)cur[i] > 0x7E) { cur[i] = 0; break; }
-    if (g_bsStarted) {
-        if (g_swapLogN < 8) {
-            g_swapLogN++;
-            ff13logv("[FF13-SRP] battle: charaspec swap -> \"%s\"\n", cur);
-        }
-        int slot = -1;
-        for (int i = 0; i < FORMLEFT_N; i++) if (g_formLeftScene[i] == g_bsStarted) { slot = i; break; }
-        if (slot < 0) for (int i = 0; i < FORMLEFT_N; i++) if (!g_formLeftScene[i]) { slot = i; break; }
-        if (slot < 0) slot = 0;                     // four fights back is as far as this remembers
-        g_formLeftScene[slot] = g_bsStarted;
-        strncpy(g_formLeftNm[slot], cur, SPEC_NAME_LEN);
-        g_formLeftNm[slot][SPEC_NAME_LEN] = 0;
+    if (g_swapLogN < 8) {
+        g_swapLogN++;
+        ff13logv("[FF13-SRP] battle: charaspec swap -> \"%s\" on actor %08X (object %08X)%s\n", cur, ecx,
+                 (ecx && !IsBadReadPtr((void*)(uintptr_t)(ecx + OFF_ACTOR_OBJ), 4))
+                     ? *(uint32_t*)(uintptr_t)(ecx + OFF_ACTOR_OBJ) : 0xFFFFFFFFu,
+                 g_bsStarted ? "  (picked fight)" : "");
     }
+    // Every fight, not only a picked one: a walked-into fight leaves its objects behind just the
+    // same, and a pick right after it binds to them.
+    obj_form_note(ecx, cur);
     if (!g_formBase[0]) return;
     // A form OF the pinned enemy: "m097_x", never plain "m097" -- the fight installs the base spec
     // itself, and treating that as the change would spend the pin before the fight starts.
@@ -2168,9 +2407,17 @@ static int          g_keepParty[3];      // ...and who was fighting when they we
 static int          g_keepN = 0;
 static int          g_keepSel = 0;       // which deck was in hand at the pick (0 for table decks)
 static volatile int g_keepGuard = 0;     // 1 = apply g_decksWant only if the party is unchanged
+// The stat this fight is meant to be fought with (scene_stat), and what the actor had before.
+static const ff13_scene_stat* g_statWant = NULL;
+static volatile uint32_t g_statFor  = 0;   // the picked fight it is armed for, 0 = nothing armed
+static volatile int      g_statBase = -1;  // the actor's own figure, once one has been seen
+static volatile int      g_statAgain = 0;  // how many times something wrote over it
+static volatile uint32_t g_statActor = 0;  // ...and which actor, so the fight's end can undo it
+static volatile int g_statDone = 0;        // the raise has already been taken back out
 static void tp_sample(void);        // reads the party's TP; defined with the refund work below
 static void libra_sample(void);     // ...and the Datalog's Libra arrays, likewise
 static void libra_keep_take(uint32_t btsc);  // ...and holds what it scanned across the way back
+static void libra_zero_take(uint32_t btsc);  // ...and unscans the few fights the story meets cold
 #ifdef FF13_DIAG
 static void libra_diag_before(uint32_t btsc); // which species a fight writes, measured either way
 static void libra_diag_point(const char* when, int last);
@@ -2344,9 +2591,35 @@ static void bs_start_selected(void) {
             }
         }
     }
+    // ...and the stat the story brings to this fight, if it is one of the few that has one. Not when
+    // the story's own setup has already landed it: initSetupParty records how far it has got in
+    // globalWork[210], and btsc03037's door runs setup_hgcr190 (= initSetupParty(2600)) itself.
+    g_statWant = scene_stat(want);
+    g_statFor  = g_statWant ? want : 0;
+    g_statBase = -1; g_statAgain = 0; g_statActor = 0; g_statDone = 0;
+    if (g_statWant) {
+        int got = vm_get_work(SETUP_PROGRESS_WORK), cap = vm_capacity_level();
+        const char* why = (got >= g_statWant->setup) ? "the setup step has run"
+                        : (cap >= g_statWant->capLv) ? "the Crystarium is already at that stage"
+                                                     : NULL;
+        if (why) {
+            const ff13_scene_stat* had = g_statWant;
+            g_statWant = NULL; g_statFor = 0;
+            ff13logv("[FF13-SRP] battle picker: btsc%05u adds nothing to status %d -- %s (setup "
+                     "progress %d/%d, Crystarium stage %d/%d)\n", want, had->stat, why,
+                     got, had->setup, cap, had->capLv);
+        } else {
+            ff13logv("[FF13-SRP] battle picker: btsc%05u is fought with status %d +%d on its one "
+                     "party member (setup progress %d/%d, Crystarium stage %d/%d) -- it goes into "
+                     "the battle actor once the fight is up and comes back out at the end\n", want,
+                     g_statWant->stat, g_statWant->add, got, g_statWant->setup, cap,
+                     g_statWant->capLv);
+        }
+    }
     // ...and which paradigm was in hand, so the field gets it back however the fight ends. The game
     // does this itself on the ordinary way back, but not for every fight -- see sel_restore_watch.
     g_selBefore = deck_sel_live();
+    g_selLast = -1;
     tp_sample();               // TP as it stands now: what the fight gets back afterwards
     // ...and what is known about the enemies. Taking no snapshot is what leaves a kept fight's scan
     // alone; any snapshot still pending from an earlier fight is dropped with it, because putting
@@ -2357,6 +2630,9 @@ static void bs_start_selected(void) {
     // Taken for every fight, whether or not this pick keeps its scan: for an ordinary one it is
     // what the scan is put back TO, and for a kept one it is what the gain is measured against.
     libra_sample();
+    // ...and for the handful of fights the story only ever meets cold, take the scan back off the
+    // enemy before the fight is set up: the record it fights with is filled from the store here.
+    libra_zero_take(want);
     g_homeHave = 0; g_homeDue = 0; g_homeAt = 0;
     // Rows that ask for it keep the spot (the mapset and music heals read it) but never warp back:
     // an arena fight's own end already puts the party somewhere sensible, and the warp from there
@@ -3145,15 +3421,6 @@ void encinfo_probe(const char* when) {
 // Rows come from the battle's own stage, turned half round so the boss looks back down it at the
 // party (the scene authors its facing as -179.5 degrees). Row 3 is where the scene puts it.
 // [battle_swap] arena_place_matrix = 0 turns it off.
-// Is `name` one of the models this scene names? The only actors whose shape is ours to correct.
-static int scene_names_model(uint32_t btsc, const char* name) {
-    const ff13_scene_models* sm = scene_models(btsc);
-    if (!sm) return 0;
-    for (int i = 0; i < sm->n; i++)
-        if (!strcmp(kModelName[kModelIdx[sm->first + i]], name)) return 1;
-    return 0;
-}
-
 // 0x471140 takes a string OBJECT, not a char buffer -- built the way its own callers build it.
 typedef void (__thiscall *specInstall_t)(void* actor, void* name, int mode);
 static void spec_install(uint32_t actor, const char* spec) {
@@ -3208,30 +3475,26 @@ void __cdecl on_place_join(uint32_t esp) {
                  nm, who, (double)o[12], (double)o[13], (double)o[14],
                  g_bsStarted ? "  (picked fight)" : "");
     }
-    // A picked fight opens in the shape the LAST one left the scene object in. The name at +0x1A40
-    // is the actor's own and never a form of it, and 0x471140's own two callers pass mode 0.
-    // Enemies this fight names only: pc* must not be touched.
-    if (g_bsStarted && g_specFixN < 6 && !IsBadReadPtr((void*)(f - PLACE_THIS_OFF), 4)) {
+    // The build binds the actor and installs its spec without telling the scene object, so an
+    // object left as m063_x1 still shows that while the actor reads m063; the actor's own name
+    // through 0x471140 (mode 0, as its callers pass) re-applies it. +0x1A40 is what the scene
+    // names for this actor, so a scene that opens in a variant is left alone. Only objects an
+    // enemy swap was seen on are in the table, so pc* are never touched.
+    if (g_specFixN < 8 && !IsBadReadPtr((void*)(f - PLACE_THIS_OFF), 4)) {
         uint32_t self2 = *(uint32_t*)(f - PLACE_THIS_OFF);
         char nm2[20] = {0};
         if (self2 && !IsBadReadPtr((void*)(uintptr_t)(self2 + OFF_ACTOR_NAME), 16)) {
             memcpy(nm2, (const void*)(uintptr_t)(self2 + OFF_ACTOR_NAME), 16); nm2[16] = 0;
+            for (int i = 0; nm2[i]; i++)
+                if ((unsigned char)nm2[i] < 0x20 || (unsigned char)nm2[i] > 0x7E) { nm2[i] = 0; break; }
         }
-        int slot = -1;
-        if (nm2[0] && scene_names_model(g_bsStarted, nm2))
-            for (int i = 0; i < FORMLEFT_N; i++) if (g_formLeftScene[i] == g_bsStarted) { slot = i; break; }
-        // Only a form OF THIS actor -- "m154_x1" for an m154, never another enemy's spec and never
-        // the base itself.
-        if (slot >= 0) {
-            const char* left = g_formLeftNm[slot];
-            size_t bl = strlen(nm2);
-            if (!strncmp(left, nm2, bl) && left[bl] == '_') {
-                g_specFixN++;
-                ff13logv("[FF13-SRP] battle picker: btsc%05u was left as \"%s\" -- \"%.16s\" put "
-                         "back to what the scene names\n", g_bsStarted, left, nm2);
-                spec_install(self2, nm2);
-                g_formLeftScene[slot] = 0; g_formLeftNm[slot][0] = 0;
-            }
+        const char* left = nm2[0] ? obj_form_left(self2) : NULL;
+        if (left && strcmp(left, nm2)) {
+            g_specFixN++;
+            ff13logv("[FF13-SRP] battle: object %08X was left as \"%s\" -- \"%s\" put back on actor "
+                     "%08X%s\n", *(uint32_t*)(uintptr_t)(self2 + OFF_ACTOR_OBJ), left, nm2, self2,
+                     g_bsStarted ? "  (picked fight)" : "");
+            spec_install(self2, nm2);       // goes through the swap hook, which notes the new name
         }
     }
     if (!g_placeMatrix || !g_placeBoss) return;          // only while we are staging an arena fight
@@ -3467,6 +3730,153 @@ static void libra_sample(void) {
         return;
     }
     g_libraHave = 1;
+}
+
+// ---- fights the story reaches with the enemy never scanned ------------------------------------
+// For a fight whose only place to stand and pick from is PAST it: the story meets these enemies
+// unscanned and an ordinary pick would not. Zeroed at the pick, because each species' record is
+// filled FROM the store as the fight is set up (0x4C40D0). The ordinary put-back restores it -- a
+// lowering the snapshot already covers -- and libra_zero_undo is only for the paths that miss it.
+static const uint16_t kLibraZero[] = { 3001 };
+#define LIBRA_ZERO_N ((int)(sizeof(kLibraZero)/sizeof(kLibraZero[0])))
+#define LIBRA_ZERO_MAX 4
+// VA 0xB5D410: charaspec name -> its row in the r_monsbk datasheet, -1 for a species with no row.
+// The row IS the index into both Datalog arrays, so nothing here has to know a species number.
+// The argument is a FIXED 16-BYTE KEY, not a C string: the game's own callers hand it the field at
+// spec+8, built by 0x4112B0 (16 bytes zeroed, up to 16 chars copied, no terminator). A pointer to a
+// 5-byte literal answered -1 for a species that is in the sheet (measured).
+#define RVA_MONSBK_ROW 0x75D410
+#define MONSBK_KEY_LEN 16
+typedef int (__cdecl *monsbkRow_t)(const char* key16);
+// Bits 51..55 of the mask are the five scan stages (openLibraProp(51+n)); everything else is one
+// property each. Counting them is what "Libra value" means on screen.
+#define LIBRA_STAGE_BITS(m1) (((m1) >> (51 - 32)) & 0x1Fu)
+
+static struct { uint16_t idx; uint32_t mask[2]; uint8_t pts; } g_libraZeroRows[LIBRA_ZERO_MAX];
+static volatile int g_libraZeroN = 0;
+
+static int librazero_wanted(uint32_t btsc) {
+    for (int i = 0; i < LIBRA_ZERO_N; i++) if (kLibraZero[i] == (uint16_t)btsc) return 1;
+    return 0;
+}
+
+static int stage_count(uint32_t m1) {
+    unsigned b = LIBRA_STAGE_BITS(m1), n = 0;
+    while (b) { n += b & 1u; b >>= 1; }
+    return (int)n;
+}
+
+// The lookup pushes its own sheet name as its first argument, so the check is that constant rather
+// than a byte pattern: base-independent, and a different function there cannot pass it.
+static int libra_row_ok(void) {
+    const uint8_t* fn = (const uint8_t*)(uintptr_t)(g_base + RVA_MONSBK_ROW);
+    if (IsBadReadPtr((void*)fn, 11)) return 0;
+    if (fn[0] != 0x55 || fn[1] != 0x8B || fn[2] != 0xEC || fn[6] != 0x68) return 0;
+    const char* sheet = *(const char* const*)(fn + 7);
+    return sheet && !IsBadReadPtr((void*)sheet, 9) && memcmp(sheet, "r_monsbk", 9) == 0;
+}
+
+static void libra_zero_undo(const char* why);
+
+static void libra_zero_take(uint32_t btsc) {
+    libra_zero_undo("another fight was picked");   // an outstanding one goes back before a new one
+    if (!librazero_wanted(btsc)) return;
+    if (!g_libraHave) {
+        ff13loga("[FF13-SRP] battle picker: btsc%05u wants its enemies unscanned, but there is no "
+                 "Libra snapshot to put back afterwards -- left alone\n", btsc);
+        return;
+    }
+    if (!libra_row_ok()) {
+        ff13loga("[FF13-SRP] battle picker: btsc%05u wants its enemies unscanned, but the r_monsbk "
+                 "lookup is not at 0x%08X -- left alone\n", btsc, (unsigned)(g_base + RVA_MONSBK_ROW));
+        return;
+    }
+    const ff13_scene_models* sm = scene_models(btsc);
+    if (!sm || !sm->n) {
+        ff13loga("[FF13-SRP] battle picker: btsc%05u wants its enemies unscanned, but the scene "
+                 "lists no models -- left alone\n", btsc);
+        return;
+    }
+    const char* spec[LIBRA_ZERO_MAX];
+    int row[LIBRA_ZERO_MAX], rn = 0;
+    for (int i = 0; i < sm->n && rn < LIBRA_ZERO_MAX; i++) {
+        const char* nm = kModelName[kModelIdx[sm->first + i]];
+        char key[MONSBK_KEY_LEN];
+        size_t kl = strlen(nm);
+        if (kl > sizeof key) kl = sizeof key;
+        memset(key, 0, sizeof key);
+        memcpy(key, nm, kl);
+        int r = ((monsbkRow_t)(uintptr_t)(g_base + RVA_MONSBK_ROW))(key);
+        if (r < 0 || r >= LIBRA_SPECIES) {
+            // The key goes out as bytes: a -1 cannot otherwise separate "not in the sheet" from
+            // a key that is not shaped the way the sheet is read.
+            char hex[MONSBK_KEY_LEN * 2 + 1];
+            for (int b = 0; b < MONSBK_KEY_LEN; b++)
+                sprintf(hex + b * 2, "%02X", (unsigned char)key[b]);
+            ff13logv("[FF13-SRP] battle picker: btsc%05u enemy \"%s\" has no r_monsbk row (%d, key "
+                     "%s) -- nothing to unscan for it\n", btsc, nm, r, hex);
+            continue;
+        }
+        spec[rn] = nm; row[rn] = r; rn++;
+    }
+    if (!rn) return;
+    uint8_t* dl = libra_datalog();
+    if (!dl) return;
+    ((lockEnter_t)(uintptr_t)(g_base + RVA_LOCK_ENTER))(dl + OFF_LIBRA_LOCK, 0);
+    uint32_t* mask = (uint32_t*)(dl + OFF_LIBRA_MASK);
+    uint8_t*  pts  = (uint8_t*)(dl + OFF_LIBRA_PTS);
+    int n = 0, full = 0;
+    for (int k = 0; k < rn; k++) {
+        int i = row[k];
+        g_libraZeroRows[n].idx     = (uint16_t)i;
+        g_libraZeroRows[n].mask[0] = mask[i*2];
+        g_libraZeroRows[n].mask[1] = mask[i*2+1];
+        g_libraZeroRows[n].pts     = pts[i];
+        n++;
+        if (mask[i*2] == 0xFFFFFFFFu && mask[i*2+1] == 0xFFFFFFFFu) full++;
+        ff13log("[FF13-SRP] battle picker: btsc%05u \"%s\" (r_monsbk row %d) unscanned -- mask "
+                "%08X %08X -> 00000000 00000000 (%d of 5 stages -> 0), points %u -> 0\n",
+                btsc, spec[k], i, mask[i*2], mask[i*2+1], stage_count(mask[i*2+1]),
+                (unsigned)pts[i]);
+        mask[i*2] = 0; mask[i*2+1] = 0; pts[i] = 0;
+    }
+    // The fully-scanned count is kept by hand by the game's own mask writer and never decremented by
+    // it, so a species dropped out of it has to be taken off here or the count reads high.
+    if (full) dl[OFF_LIBRA_FULLN] = (uint8_t)(dl[OFF_LIBRA_FULLN] > full
+                                              ? dl[OFF_LIBRA_FULLN] - full : 0);
+    ((lockLeave_t)(uintptr_t)(g_base + RVA_LOCK_LEAVE))(dl + OFF_LIBRA_LOCK);
+    g_libraZeroN = n;
+}
+
+// Only ever RAISES: the rows are OR'd back and the points taken as the higher of the two, so it is
+// safe on a stale record -- unlike the general put-back, which is a lowering and is dropped when the
+// field does not come back. After a put-back that already restored the snapshot it is a no-op.
+static void libra_zero_undo(const char* why) {
+    int n = g_libraZeroN;
+    g_libraZeroN = 0;
+    if (!n) return;
+    uint8_t* dl = libra_datalog();
+    if (!dl) return;
+    ((lockEnter_t)(uintptr_t)(g_base + RVA_LOCK_ENTER))(dl + OFF_LIBRA_LOCK, 0);
+    uint32_t* mask = (uint32_t*)(dl + OFF_LIBRA_MASK);
+    uint8_t*  pts  = (uint8_t*)(dl + OFF_LIBRA_PTS);
+    int back = 0, full = 0;
+    for (int k = 0; k < n; k++) {
+        int i = g_libraZeroRows[k].idx;
+        if (i < 0 || i >= LIBRA_SPECIES) continue;
+        uint32_t m0 = mask[i*2] | g_libraZeroRows[k].mask[0];
+        uint32_t m1 = mask[i*2+1] | g_libraZeroRows[k].mask[1];
+        int wasFull = (mask[i*2] == 0xFFFFFFFFu && mask[i*2+1] == 0xFFFFFFFFu);
+        if (m0 != mask[i*2] || m1 != mask[i*2+1] || pts[i] < g_libraZeroRows[k].pts) back++;
+        mask[i*2] = m0; mask[i*2+1] = m1;
+        if (pts[i] < g_libraZeroRows[k].pts) pts[i] = g_libraZeroRows[k].pts;
+        if (!wasFull && m0 == 0xFFFFFFFFu && m1 == 0xFFFFFFFFu) full++;
+    }
+    if (full) dl[OFF_LIBRA_FULLN] = (uint8_t)(dl[OFF_LIBRA_FULLN] + full);
+    ((lockLeave_t)(uintptr_t)(g_base + RVA_LOCK_LEAVE))(dl + OFF_LIBRA_LOCK);
+    if (back)
+        ff13log("[FF13-SRP] battle picker: what was unscanned for the pick is back for %d "
+                "species (%s)\n", back, why);
 }
 
 #ifdef FF13_DIAG
@@ -3742,6 +4152,113 @@ static void staging_disarm(void) {
     g_decksRestoreFor = 0;
     g_decksWantFor = 0; g_decksWantN = 0; g_decksWant = NULL;
     g_decksAgainAt = 0;
+    g_statFor = 0; g_statWant = NULL; g_statBase = -1;
+}
+
+// The fight's one player character, or 0 when there is not exactly one. Found by charaspec NAME:
+// PC actors are "pcNNN", enemies "mNNN". The side bits do NOT separate them this early, and the
+// number is not the party's own character id (Snow is "pc001", measured).
+#define STAT_ACTOR_SPAN (OFF_ACTOR_STATS + ACTOR_STAT_LAYER * 0x100 + 0x40 * 4)
+static uint32_t lone_pc_actor(void) {
+    uint32_t* tbl = actor_table();
+    if (!tbl) return 0;
+    uint32_t found = 0;
+    char nm[SPEC_NAME_LEN + 1];
+    for (int i = 0; i < ACTOR_SLOTS; i++) {
+        uint32_t a = tbl[i];
+        if (!a || IsBadReadPtr((void*)(uintptr_t)a, STAT_ACTOR_SPAN)) continue;
+        if (!actor_name_of(a, nm) || nm[0] != 'p' || nm[1] != 'c') continue;
+        if (found) return 0;                    // more than one: the row does not say which
+        found = a;
+    }
+    return found;
+}
+
+// "pcNNN" -> the party's own character id. NNN is the MODEL index minus one (the game's own
+// mot/pc/sk_c001_lt .. sk_c006_fa), and the character ids run in a different order, so the two
+// numbers are NOT the same -- Snow is "pc001" and character 2. -1 = not one of the six.
+static int pc_actor_charid(const char* nm) {
+    static const signed char kPcToChar[6] = { 0, 2, 1, 3, 4, 5 };
+    if (!nm || nm[0] != 'p' || nm[1] != 'c') return -1;
+    for (int i = 2; i < 5; i++) if (nm[i] < '0' || nm[i] > '9') return -1;
+    int n = (nm[2] - '0') * 100 + (nm[3] - '0') * 10 + (nm[4] - '0');
+    return (n >= 0 && n < 6) ? kPcToChar[n] : -1;
+}
+
+// The actor holds a status as five layers: layer 0 is the character's own figure, layer 4 is what
+// getStatus reads, and the game rebuilds 4 from 0 during a fight (measured), so BOTH are written.
+// Layer 0 is also the only base there is -- the array Party.getStatus names (roster record + 0xC88)
+// reads 0 for all six in ordinary play -- and the `setup` gate at the pick is what keeps it honest.
+static int stat_layer(uint32_t a, int layer) {
+    return *(int*)(uintptr_t)(a + OFF_ACTOR_STATS + (uintptr_t)layer * 0x100
+                              + (uintptr_t)g_statWant->stat * 4);
+}
+static void stat_layer_set(uint32_t a, int layer, int v) {
+    *(int*)(uintptr_t)(a + OFF_ACTOR_STATS + (uintptr_t)layer * 0x100
+                       + (uintptr_t)g_statWant->stat * 4) = v;
+}
+// Take the raise back out of the actor. Called when the fight RESOLVES, not when the battle state
+// ends: the game writes the fight's figures down somewhere between those two moments, and undoing at
+// the end left the next pick starting from the raised figure (measured).
+static void stat_undo(const char* when) {
+    if (g_statDone || g_statBase < 0 || !g_statActor || !g_statWant) return;
+    g_statDone = 1;
+    int want = g_statBase + g_statWant->add, n = 0;
+    if (!IsBadReadPtr((void*)(uintptr_t)g_statActor, STAT_ACTOR_SPAN))
+        for (int L = 0; L <= ACTOR_STAT_LAYER; L += ACTOR_STAT_LAYER)
+            if (stat_layer(g_statActor, L) == want) {
+                stat_layer_set(g_statActor, L, g_statBase); n++;
+            }
+    ff13logv("[FF13-SRP] battle picker: status %d back to %d at \"%s\" (%d of 2 layer(s) still had "
+             "%d)\n", g_statWant->stat, g_statBase, when, n, want);
+}
+
+static void stat_pump(void) {
+    if (!g_statWant || !g_statFor || g_statDone) return;
+    uint32_t a = lone_pc_actor();
+    if (!a) return;
+    if (g_statBase >= 0 && battle_resolved()) { stat_undo("the fight resolved"); return; }
+    if (g_statBase < 0) {
+        // Wait for the actor to be BUILT: a base captured from a still-zero slot would hold the
+        // character at the raise alone for the whole fight.
+        if (stat_layer(a, ACTOR_STAT_LAYER) <= 0 || *(int*)(uintptr_t)(a + OFF_MAXHP) <= 0) return;
+        char nm[SPEC_NAME_LEN + 1];
+        if (!actor_name_of(a, nm)) nm[0] = 0;
+        int base = stat_layer(a, 0);        // the actor's own figure, which is the story's by now
+        if (base <= 0) return;
+        g_statBase = base;
+        g_statActor = a;
+        ff13logv("[FF13-SRP] battle picker: \"%s\" (char %d) status %d %d -> %d (shown %d -> %d) "
+                 "for btsc%05u  [layers %d %d %d %d %d]\n", nm[0] ? nm : "?", pc_actor_charid(nm),
+                 g_statWant->stat, base, base + g_statWant->add, base / 100,
+                 (base + g_statWant->add) / 100, g_statFor, stat_layer(a, 0), stat_layer(a, 1),
+                 stat_layer(a, 2), stat_layer(a, 3), stat_layer(a, 4));
+        stat_layer_set(a, ACTOR_STAT_LAYER, base + g_statWant->add);
+        stat_layer_set(a, 0, base + g_statWant->add);
+        return;
+    }
+    int want = g_statBase + g_statWant->add;
+    int had4 = stat_layer(a, ACTOR_STAT_LAYER), had0 = stat_layer(a, 0);
+    if (had4 == want && had0 == want) return;
+    stat_layer_set(a, ACTOR_STAT_LAYER, want);
+    stat_layer_set(a, 0, want);
+    if (g_statAgain++ == 0)
+        ff13logv("[FF13-SRP] battle picker: status %d read %d (layer 0 %d) -- put at %d again "
+                 "(further times are counted, not logged)\n", g_statWant->stat, had4, had0, want);
+}
+
+// The actor OUTLIVES the fight: two picks in a row came up on the same actor object (measured), and
+// anything left on it follows the party into an ordinary encounter as well.
+static void stat_battle_over(void) {
+    if (!g_statWant || !g_statFor) { g_statFor = 0; g_statWant = NULL; g_statBase = -1; return; }
+    int want = g_statBase + g_statWant->add;
+    stat_undo("the fight ended");        // backstop: normally the resolve already did it
+    ff13logv("[FF13-SRP] battle picker: btsc%05u was fought at status %d %d (its own %d), put back "
+             "%d time(s)%s\n", g_statFor, g_statWant->stat, g_statBase < 0 ? -1 : want,
+             g_statBase, g_statAgain,
+             g_statBase < 0 ? "  <- NEVER APPLIED: no single \"pc*\" actor was found" : "");
+    g_statFor = 0; g_statWant = NULL; g_statBase = -1; g_statAgain = 0; g_statActor = 0;
+    g_statDone = 0;
 }
 
 static void touch_stall_probe(DWORD now) {
@@ -3824,10 +4341,11 @@ static int async_loader_type(void) {
 }
 
 // The paradigm the pick was made in, put back on the field -- the game does it itself for some
-// fights and deliberately not for others (CODE_NOTES). Only ever the DECK IN HAND is written, never
-// the decks themselves. Must wait for the field to settle: the game's own restore lands at
-// fight-over and the field's init writes after it, and writing into that leaves the menu showing
-// one paradigm and the party fighting in another.
+// fights and deliberately not for others (CODE_NOTES) -- or, for a row that keeps it, the one the
+// fight ended on. Only ever the DECK IN HAND is written, never the decks themselves. Must wait for
+// the field to settle: the game's own restore lands at fight-over and the field's init writes
+// after it, and writing into that leaves the menu showing one paradigm and the party fighting in
+// another.
 #define SEL_RESTORE_SETTLE_MS 1200
 static void sel_restore_watch(DWORD now) {
     if (!g_selRestoreDue) return;
@@ -3836,15 +4354,20 @@ static void sel_restore_watch(DWORD now) {
     if ((int)(now - (g_selRestoreFrom + SEL_RESTORE_SETTLE_MS)) < 0) return;
     g_selRestoreDue = 0;
     int cur = deck_sel_live();
-    if (g_selBefore < 0 || cur < 0) return;              // nothing was in hand; nothing to put back
-    if (cur == g_selBefore) {
-        ff13logv("[FF13-SRP] battle picker: paradigm %d is still the one in hand -- left alone\n",
-                 cur);
+    if (g_selWant < 0 || cur < 0) return;                // nothing was in hand; nothing to put back
+    if (cur == g_selWant) {
+        (g_selKeepPick ? ff13log : ff13logv)("[FF13-SRP] battle picker: paradigm %d is still the "
+                 "one in hand -- %s\n", cur,
+                 g_selKeepPick ? "kept for the second half, as this row asks" : "left alone");
         return;
     }
-    vm_set_optima_deck(g_selBefore);
-    ff13log("[FF13-SRP] battle picker: paradigm back to %d (the fight ended on %d)\n",
-             g_selBefore, cur);
+    vm_set_optima_deck(g_selWant);
+    if (g_selKeepPick)
+        ff13log("[FF13-SRP] battle picker: paradigm %d back in hand for the second half -- the fight "
+                "ended on it and the way back had reset it to %d\n", g_selWant, cur);
+    else
+        ff13log("[FF13-SRP] battle picker: paradigm back to %d (the fight ended on %d)\n",
+                g_selWant, cur);
 }
 
 // The other half of the field drop in bs_start_selected. Same settle as the paradigm above: the
@@ -3879,6 +4402,19 @@ static void field_drop_watch(DWORD now) {
 #define CS_RESTORE_SETTLE_MS 800
 #define CS_RESTORE_CAP_MS  15000
 #define CS_RESTORE_RETRY_MS 30000   // how long a short fight's set stays loaded for the retry
+#define CS_RESTORE_DRAIN_MS  2500   // the conclusion's own measured length, 1.2-1.6s, with room
+
+// doEncountCheck's third gate is a pending-JOBS counter whose last decrement is the tail of the
+// end-of-encounter work; sending a chrset into that is the freeze itself. The loader going idle is
+// NOT the same question (measured: idle from 200ms after the fight, the counter still draining), so
+// an unreadable counter counts as draining, never as drained.
+static int enc_jobs_draining(DWORD now) {
+    uint32_t bits, val; int ok;
+    encount_gates(&bits, &val, &ok);
+    if (!ok) return !g_csFieldBackAt || (int)(now - (g_csFieldBackAt + CS_RESTORE_DRAIN_MS)) < 0;
+    return val != 0;
+}
+
 static void cs_restore_watch(DWORD now) {
     if (!g_csRestorePend[0]) return;
     if (g_bsStarted || g_bsTouchDue) { g_csRestoreStable = 0; return; }   // a pick is live: hold
@@ -3892,7 +4428,8 @@ static void cs_restore_watch(DWORD now) {
     if ((int)(now - g_csRestoreEarliest) < 0) return;
     // On the field or not at all, cap or no cap: what the cap gives up on is the LOADER going idle.
     // A chrset sent into a fight is the thing this watch exists to prevent.
-    if (field_zone_state() != 3) { g_csRestoreStable = 0; return; }
+    if (field_zone_state() != 3) { g_csRestoreStable = 0; g_csFieldBackAt = 0; return; }
+    if (!g_csFieldBackAt) g_csFieldBackAt = now;
     // ...and in the zone it was the set OF: the hold is long enough to walk out of the zone or to
     // load another save, and sending it then replaces the models the field actually has.
     uint32_t zoneNow = field_zone_id();
@@ -3905,9 +4442,19 @@ static void cs_restore_watch(DWORD now) {
         return;
     }
     if ((int)(now - (g_csRestoreEarliest + CS_RESTORE_CAP_MS)) < 0) {
-        if (async_loader_type() != 0) { g_csRestoreStable = 0; return; }
+        if (async_loader_type() != 0 || enc_jobs_draining(now)) { g_csRestoreStable = 0; return; }
         if (!g_csRestoreStable) { g_csRestoreStable = now + CS_RESTORE_SETTLE_MS; return; }
         if ((int)(now - g_csRestoreStable) < 0) return;
+    } else if (enc_jobs_draining(now)) {
+        // The cap gives up on the LOADER, never on the conclusion: a set left loaded costs a field
+        // with holes in it, sending into the conclusion costs the session.
+        if (!g_csRestoreLate) {
+            g_csRestoreLate = 1;
+            ff13loga("[FF13-SRP] battle picker: the end-of-encounter work has not drained in %dms "
+                     "-- \"%s\" waits rather than freezing the loader\n",
+                     CS_RESTORE_CAP_MS, g_csRestorePend);
+        }
+        return;
     } else {
         ff13loga("[FF13-SRP] battle picker: the loader never went idle in %dms -- sending \"%s\" "
                  "back anyway\n", CS_RESTORE_CAP_MS, g_csRestorePend);
@@ -4046,6 +4593,7 @@ static void refund_watch(void) {
 #endif
         libra_put_back();
         libra_keep_apply();      // ...and for a kept fight, put its own gain back instead
+        libra_zero_undo("the field is back");   // no-op when the put-back above already did it
         // The restart put the checkpoint's party back, which is not the one this fight is fought
         // with. But only where the party came with a fight the mod also stages: a fight with no door
         // is walked into like any other encounter, and re-issuing a party change on the FIELD after
@@ -4063,6 +4611,8 @@ static void refund_watch(void) {
         // taught in the meantime. Dropped.
         int had = g_libraHave;
         g_libraHave = 0;
+        // What THIS mod unscanned goes back regardless: it is a raise, so a stale one costs nothing.
+        libra_zero_undo("the field did not come back");
         ff13logv("[FF13-SRP] battle picker: the field did not come back in %dms (state %d) -- what "
                  "the fight used is still on the tally for the next one%s\n",
                  REFUND_WAIT_MS, field_zone_state(),
@@ -5011,6 +5561,11 @@ static void pump_battle_live(DWORD now) {
         if (inb) {
             if (!g_bsInFight) ctl_unlock();    // the battle owns input now; the field gets its back
             g_bsInFight = 1;
+            // Read while the fight is up, not at fight-over: the game's own put-back lands at
+            // fight-over, and whether that is before or after the battle state clears is not
+            // settled, so the last reading from inside the fight is the one that counts.
+            { int s = deck_sel_live(); if (s >= 0) g_selLast = s; }
+            if (g_statFor == g_bsStarted) stat_pump();
             // Any targetable enemy HP means something spawned. Timing cannot be used here: with
             // one-hit-kill or game-speed on, a perfectly normal fight is over in a few seconds.
             if (read_via_ptr(RVA_TARGETHP_PTR, OFF_TARGETHP) > 0) g_bsSawEnemy = 1;
@@ -5024,6 +5579,7 @@ static void pump_battle_live(DWORD now) {
                 mark_empty_scene(g_bsStarted);
             g_bsStarted = 0; g_bsInFight = 0; g_bsSawEnemy = 0;
             aipin_battle_over();
+            stat_battle_over();
 #ifdef FF13_DIAG
             // Read here as well as after the way back: this is the last moment before the restart,
             // so a scan that is present now and gone later was taken by the restart, not by us.
@@ -5137,8 +5693,10 @@ static void pump_battle_live(DWORD now) {
             // else -- which is why the tidy-up is timed. The trip back sits in STATE_ENCOUNT_BACK
             // for three to four seconds and how much of that is ours is not yet settled.
             DWORD tidyAt = GetTickCount(), bgmMs = 0;
-            // Whatever paradigm this fight ended on, the field gets the pick's own back.
-            g_selRestoreDue = (g_selBefore >= 0);
+            // Whatever paradigm this fight ended on, the field gets the pick's own back -- or, for
+            // a pick that keeps it, the one the fight ended on, for the second half to open on.
+            g_selWant = g_selKeepPick ? g_selLast : g_selBefore;
+            g_selRestoreDue = (g_selWant >= 0);
             g_selRestoreFrom = tidyAt;
             // NOT issued here: a chrset sent while the encounter is still concluding freezes the
             // AsyncLoader for the session. cs_restore_watch sends it once the field is back.
@@ -5149,6 +5707,8 @@ static void pump_battle_live(DWORD now) {
                 g_csRestoreFrom = GetTickCount();
                 g_csRestoreZone = field_zone_id();
                 g_csRestoreStable = 0;
+                g_csRestoreLate = 0;
+                g_csFieldBackAt = 0;
                 // A short fight holds its set: "pick it again -- the models are loaded now" is only
                 // true while they are, and a retry that finds them loaded has no load to race.
                 // g_csLoaded stays set for the same reason; the watch clears it when it fires.
@@ -5167,6 +5727,8 @@ static void pump_battle_live(DWORD now) {
                 g_csRestoreFrom = GetTickCount();
                 g_csRestoreZone = field_zone_id();
                 g_csRestoreStable = 0;
+                g_csRestoreLate = 0;
+                g_csFieldBackAt = 0;
                 g_csRestoreEarliest = g_csRestoreFrom;
                 g_csRestoreHold = wasShort;
                 ff13log("[FF13-SRP] battle picker: fight over -> \"%s\" will be reloaded once the "

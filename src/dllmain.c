@@ -86,6 +86,9 @@ int hk_edge(UINT b, int* was) {
 // Hold the warp key this long and it records instead of warping. A hold IS the deliberation, so
 // recording asks for no confirmation.
 #define WARP_HOLD_MS         640
+// How long the game is shown the arrow handed to it. Long enough to survive a frame at any frame
+// rate, short enough that the game's own key repeat never starts and one press is one step.
+#define LIST_STEP_MS          60
 
 // One key, two gestures: returns 1 when the key was released without reaching the hold (a tap) and
 // 2 the moment the hold is reached, while the key is still down. The tap can only land on RELEASE
@@ -118,6 +121,68 @@ static int hk_held(UINT b, hk_rep* s, DWORD now) {
     s->was = down;
     return fire && hk_active();
 }
+
+// The gate must not lift under a key the game acts on that is still physically down: the game's
+// next DirectInput read would see it as freshly pressed, and over the load list a confirm LOADS the
+// save under the cursor. Asked of the RAW key -- not hk_down, whose exact-modifier test calls a
+// modified binding "released" the moment the modifier goes up with the key still down.
+static int gate_keys_down(void) {
+    const UINT k[] = { g_menuOkVk, g_ssVk, g_warpCancelVk };
+    for (int i = 0; i < (int)(sizeof k / sizeof k[0]); i++)
+        if (k[i] && (GetAsyncKeyState((int)hk_key(k[i])) & 0x8000)) return 1;
+    return 0;
+}
+static volatile int   g_liftWait = 0;
+static volatile DWORD g_liftWaitAt = 0;   // deadline base: a stuck key must not seal the player in
+// All three keys, not the one that ended the menu: a screen change ends one with no trigger at
+// all, and an editor's close cannot tell which key committed it.
+void menu_gate_release(void) {
+    if (gate_keys_down()) {
+        // Dated from the FIRST wait: menu_screen_tick calls this on every screen change, and
+        // re-stamping would push the stuck-key deadline out for as long as screens keep changing.
+        if (!g_liftWait) g_liftWaitAt = GetTickCount();
+        g_liftWait = 1;
+        di_gate_arm();                 // sealed until the worker sees them up
+    } else {
+        g_liftWait = 0;
+        di_gate_lift();
+    }
+}
+
+// Only ever called with one of the tidy menus already up: opening them stays with the tidy key.
+static void tidy_confirm(void) {
+    // The confirm must land on the row the game shows NOW: the poll's own follow ran a tick ago and
+    // a pad can have moved the cursor since. An arrow WE injected this tick is not covered -- the
+    // game has not read it yet, so g_shownSlot still names the row being left.
+    lsel_follow_now();
+    if (g_lselOpen) {
+        // An editor keeps both the menu and the gate; only a refusal gives it back.
+        if (!lsel_go() && !g_labelEdit) { lsel_close(); menu_gate_release(); }
+        else if (!g_lselOpen && !g_labelEdit) menu_gate_release();
+    } else if (g_ssOpen) {
+        if (g_ssSel == SS_CAT_PICK) {
+            // Left open on purpose: the "using" row wearing the new name is the receipt.
+            const char* pick = cat_pick();
+            if (pick) cat_switch(pick);
+        } else if (g_ssSel == SS_CAT_DEL) {
+            // Left open either way: the first confirm only asks, and after a delete the
+            // next category is already under the row.
+            cat_del_hold();
+        } else if (g_ssSel == SS_CAT_NEW || g_ssSel == SS_CAT_NEW_ALL
+                   || g_ssSel == SS_CAT_RENAME) {
+            int em = g_ssSel == SS_CAT_RENAME  ? EDIT_CAT_RENAME
+                   : g_ssSel == SS_CAT_NEW_ALL ? EDIT_CAT_NEW_ALL : EDIT_CAT_NEW;
+            if (!cat_edit_open(em))
+                flash_say_c(ui_text(T_LABEL_NO_WINDOW), OVL_FLASH_OFF);
+        } else if (g_ssSel == SS_FILTER) {
+            filter_apply(0); state_save();
+        } else {
+            if (g_ssSel == SS_RENUM) save_renumber_apply(); else save_sort_apply();
+            g_ssOpen = 0; menu_gate_release();
+        }
+    }
+}
+
 static DWORD WINAPI worker(LPVOID unused) {
     (void)unused;
     g_base = (uintptr_t)GetModuleHandleA(NULL);
@@ -430,6 +495,24 @@ static DWORD WINAPI worker(LPVOID unused) {
                                          (void*)on_status_roll);
         (sr ? ff13logv : ff13loga)("[FF13-SRP] status roll hook @0x%08X: %s\n",
                  (unsigned)(g_base + RVA_STATROLL), sr ? "OK" : "FAIL");
+        int wl = wait_for_bytes(g_base + RVA_STATLAND, P_STATLAND, (int)sizeof(P_STATLAND), 15000);
+        void* sl = wl < 0 ? NULL
+                 : ff13_install_esp_hook(g_base + RVA_STATLAND, P_STATLAND, (int)sizeof(P_STATLAND),
+                                         (void*)on_status_land);
+        (sl ? ff13logv : ff13loga)("[FF13-SRP] status land hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_STATLAND), sl ? "OK" : "FAIL");
+        int wu = wait_for_bytes(g_base + RVA_LAUNCH, P_LAUNCH, (int)sizeof(P_LAUNCH), 15000);
+        void* lr = wu < 0 ? NULL
+                 : ff13_install_esp_hook(g_base + RVA_LAUNCH, P_LAUNCH, (int)sizeof(P_LAUNCH),
+                                         (void*)on_launch_roll);
+        (lr ? ff13logv : ff13loga)("[FF13-SRP] launch roll hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_LAUNCH), lr ? "OK" : "FAIL");
+        int wd = wait_for_bytes(g_base + RVA_LAUNCHRES, P_LAUNCHRES, (int)sizeof(P_LAUNCHRES), 15000);
+        void* ld = wd < 0 ? NULL
+                 : ff13_install_esp_hook(g_base + RVA_LAUNCHRES, P_LAUNCHRES,
+                                         (int)sizeof(P_LAUNCHRES), (void*)on_launch_resist);
+        (ld ? ff13logv : ff13loga)("[FF13-SRP] launch resist hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_LAUNCHRES), ld ? "OK" : "FAIL");
     }
     {
         int ws = wait_for_bytes(g_base + RVA_AISTATE, P_AISTATE, (int)sizeof(P_AISTATE), 15000);
@@ -868,34 +951,70 @@ static DWORD WINAPI worker(LPVOID unused) {
              "0x%X = every " SUPPRESS_PREFIX "* group; game_speed 0x%X = %s then off; "
              "warp 0x%X = warp (tap) / record (hold), field + same-zone; battle_overlay 0x%X = "
              "timer+HP toggle; battle_picker 0x%X = open the fight picker; save 0x%X = save where "
-             "you stand and come back to it; camera_unstick 0x%X = free the camera after one.\n",
+             "you stand and come back to it; camera_unstick 0x%X = free the camera after one; "
+             "menu_ok 0x%X = confirm in the tidy menus.\n",
              g_helpVk,
              g_armVk, g_iwInstGate ? "live" : "MISSING", kill_mode_name_en(g_killMode),
              g_supVk, g_gsVk, gs_steps_str(), g_warpVk, g_boVk,
-             g_bsVk, g_saveVk, g_camUnstickVk);
+             g_bsVk, g_saveVk, g_camUnstickVk, g_menuOkVk);
     ff13loga("[FF13-SRP] hotkeys: %s\n", g_hkFocusOnly
              ? "only while the game window has focus ([hotkeys] require_focus = 0 to lift that)"
              : "always, focus or not ([hotkeys] require_focus = 0)");
 
     // Hotkey polling. Every press goes through hk_edge, which is also where "not while the game is
     // in the background" lives.
-    int wasArm = 0, wasSup = 0, wasGs = 0, wasCancel = 0, wasBo = 0, wasHelp = 0;
+    int wasArm = 0, wasSup = 0, wasGs = 0, wasCancel = 0, wasBo = 0, wasHelp = 0, wasMok = 0;
     hk_tap tpKey = { 0, 0, 0 };                  // the warp key's tap-or-hold state
     hk_tap bsKey = { 0, 0, 0 };                  // ...and the picker key's, on the same hold time
     hk_tap ssKey = { 0, 0, 0 };                  // ...and the save-sort menu's
 
     hk_rep bsUp = { 0, 0 }, bsDown = { 0, 0 },   // the four that repeat while held
            bsLeft = { 0, 0 }, bsRight = { 0, 0 };
+    hk_rep lPrev = { 0, 0 }, lNext = { 0, 0 };   // ...and the two that walk the game's own list
     DWORD crashRearmAt = 0;
     for (;;) {
         Sleep(HK_POLL_MS);
         DWORD hkNow = GetTickCount();
         menu_screen_tick();
+        if (g_liftWait) {
+            // A menu of ours reopening owns the gate now. An editor being torn down is NOT that
+            // case: menu_screen_tick closed it a statement earlier and the flag outlives the tick,
+            // so the editor branch below releases again.
+            if (g_ssOpen || g_lselOpen || g_labelEdit) g_liftWait = 0;
+            else if (di_gate_left_ms() < 0) g_liftWait = 0;
+            else if ((int)(hkNow - g_liftWaitAt) > DI_GATE_MAX_MS) {
+                // A key that never reads as released (stuck, or a remapper ate the up) must not
+                // seal the player in. This hands the game the press the wait exists to swallow,
+                // so it is logged at every level: "it loaded a save by itself" needs a trace.
+                ff13loga("[FF13-SRP] input gate: a held key never came up in %dms -- lifting anyway"
+                         " (the game may read it as a fresh press)\n", DI_GATE_MAX_MS);
+                g_liftWait = 0;
+                di_gate_lift();
+            } else if (!gate_keys_down()) {
+                g_liftWait = 0;
+                di_gate_lift();
+            } else if (di_gate_left_ms() < DI_GATE_MAX_MS / 2) di_gate_arm();
+        }
+        // Stepped every tick like the arrows, so a key already down when a menu opens does not
+        // read as a fresh press.
+        int mok = hk_edge(g_menuOkVk, &wasMok);
         // The editor owns every key while it is up: the unconditional continue below is what keeps
-        // a letter being typed from also firing one of the hotkeys polled further down.
+        // a letter being typed from also firing one of the hotkeys polled further down. Their
+        // edge/tap state still has to advance, though -- a key pressed or released across the
+        // editor session would otherwise fire as fresh the tick the editor closes.
         if (g_labelEdit) {
+            hk_edge(g_helpVk, &wasHelp);   hk_edge(g_armVk, &wasArm);
+            hk_edge(g_supVk, &wasSup);     hk_edge(g_gsVk, &wasGs);
+            hk_edge(g_boVk, &wasBo);       hk_edge(g_warpCancelVk, &wasCancel);
+            hk_taphold(g_bsVk, &bsKey, hkNow, WARP_HOLD_MS);
+            hk_taphold(g_warpVk, &tpKey, hkNow, WARP_HOLD_MS);
+            hk_held(g_bsUpVk, &bsUp, hkNow);       hk_held(g_bsDownVk, &bsDown, hkNow);
+            hk_held(g_bsLeftVk, &bsLeft, hkNow);   hk_held(g_bsRightVk, &bsRight, hkNow);
+            hk_held(g_listPrevVk, &lPrev, hkNow);  hk_held(g_listNextVk, &lNext, hkNow);
+            save_keys_step();   // ...and the two the save loop owns: the continue skips its tick
             int e = hk_taphold(g_ssVk, &ssKey, hkNow, WARP_HOLD_MS);
             if (e) label_edit_finish(e == 2);
+            else if (mok) label_edit_finish(1);
             if (edit_mode() == EDIT_LABEL) {
                 char what2[160];
                 int fin = label_edit_tick(what2, sizeof what2);
@@ -911,7 +1030,7 @@ static DWORD WINAPI worker(LPVOID unused) {
             // Only the list menu closes with its editor; the tidy menu's editors leave it up --
             // and while one of ours still stands, the gate stands with it.
             if (g_lselOpen) lsel_close();
-            if (!g_ssOpen && !g_lselOpen) di_gate_lift();
+            if (!g_ssOpen && !g_lselOpen) menu_gate_release();
             else if (di_gate_left_ms() < DI_GATE_MAX_MS / 2) di_gate_arm();
             continue;
         }
@@ -996,10 +1115,20 @@ static DWORD WINAPI worker(LPVOID unused) {
         int bsDownFire  = hk_held(g_bsDownVk,  &bsDown,  hkNow);
         int bsLeftFire  = hk_held(g_bsLeftVk,  &bsLeft,  hkNow);
         int bsRightFire = hk_held(g_bsRightVk, &bsRight, hkNow);
+        // Stepped every tick for the same reason. Acted on only over the save list, where the gate
+        // is up: the picker holds no gate, so a press over it reaches the game as well.
+        int lPrevFire = hk_held(g_listPrevVk, &lPrev, hkNow);
+        int lNextFire = hk_held(g_listNextVk, &lNext, hkNow);
+        // The menu then follows the row the game reports (save_poll_tick), the path a pad takes.
+        if (g_lselOpen && (lPrevFire || lNextFire)) {
+            di_fake_dik(lPrevFire ? DIK_LEFT : DIK_RIGHT, LIST_STEP_MS);
+            ff13logv("[FF13-SRP] save list: handing the game a %s from save %d\n",
+                     lPrevFire ? "left" : "right", g_lselSlot + 1);
+        }
         if (g_lselOpen) {
             if (bsUpFire)   g_lselSel = (g_lselSel > 0) ? g_lselSel - 1 : LSEL_ROWS - 1;
             if (bsDownFire) g_lselSel = (g_lselSel + 1 < LSEL_ROWS) ? g_lselSel + 1 : 0;
-            if (g_lselSel != LSEL_NOTE) {
+            if (g_lselSel == LSEL_COPY || g_lselSel == LSEL_MOVE) {
                 if (bsLeftFire)  send_cycle(-1);
                 if (bsRightFire) send_cycle(+1);
             }
@@ -1009,7 +1138,7 @@ static DWORD WINAPI worker(LPVOID unused) {
             if (g_ssSel == SS_FILTER) {
                 if (bsLeftFire)  { filter_cycle(-1); state_save(); }
                 if (bsRightFire) { filter_cycle(+1); state_save(); }
-            } else if (g_ssSel == SS_CAT_PICK) {
+            } else if (g_ssSel == SS_CAT_PICK || g_ssSel == SS_CAT_DEL) {
                 if (bsLeftFire)  cat_cycle(-1);
                 if (bsRightFire) cat_cycle(+1);
             }
@@ -1034,9 +1163,12 @@ static DWORD WINAPI worker(LPVOID unused) {
             g_homeDue = 0; g_homeHave = 0;
             home_warp_back();
         }
-        // While either menu is open the DirectInput gate is held, so the arrows and the hold do
-        // not also drive the game's own menus. Opening is refused while someone ELSE holds the
-        // gate (a picked fight staging): closing lifts it and would cut that gate short.
+        // While either menu is open the DirectInput gate is held, so the arrows, the hold and
+        // menu_ok do not also drive the game's own menus. Opening is refused while someone ELSE
+        // holds the gate (a picked fight staging): closing lifts it and would cut that gate short.
+        // menu_ok acts BEFORE the tidy key so a same-tick tap cannot open a menu it then confirms,
+        // and never opens anything itself -- outside these menus the key belongs to the game.
+        if (mok && (g_lselOpen || g_ssOpen)) tidy_confirm();
         {
             int t = hk_taphold(g_ssVk, &ssKey, hkNow, WARP_HOLD_MS);
             // Only with nothing of ours on screen, so a menu opened before the switch was flipped
@@ -1047,31 +1179,16 @@ static DWORD WINAPI worker(LPVOID unused) {
                 t = 0;
             }
             if (t == 2) {
-                if (g_lselOpen) {
-                    // An editor keeps both the menu and the gate; only a refusal gives it back.
-                    if (!lsel_go() && !g_labelEdit) { lsel_close(); di_gate_lift(); }
-                    else if (!g_lselOpen && !g_labelEdit) di_gate_lift();
-                } else if (g_ssOpen) {
-                    if (g_ssSel == SS_CAT_PICK) {
-                        const char* pick = cat_pick();
-                        if (pick && cat_switch(pick)) { g_ssOpen = 0; di_gate_lift(); }
-                    } else if (g_ssSel == SS_CAT_NEW || g_ssSel == SS_CAT_RENAME) {
-                        if (!cat_edit_open(g_ssSel == SS_CAT_RENAME))
-                            flash_say_c(ui_text(T_LABEL_NO_WINDOW), OVL_FLASH_OFF);
-                    } else if (g_ssSel == SS_FILTER) {
-                        filter_apply(0); state_save();
-                    } else {
-                        if (g_ssSel == SS_RENUM) save_renumber_apply(); else save_sort_apply();
-                        g_ssOpen = 0; di_gate_lift();
-                    }
+                if (g_lselOpen || g_ssOpen) {
+                    tidy_confirm();
                 // A refusal here stays silent: on the title screen this same hold is the tidy
                 // menu's confirm, and a complaint would read as that action going wrong.
                 } else if (!g_bsOpen && di_gate_left_ms() < 0 && lsel_open()) {
                     di_gate_arm();
                 }
             } else if (t == 1) {
-                if (g_lselOpen) { lsel_close(); di_gate_lift(); }
-                else if (g_ssOpen) { g_ssOpen = 0; di_gate_lift(); }
+                if (g_lselOpen) { lsel_close(); menu_gate_release(); }
+                else if (g_ssOpen) { g_ssOpen = 0; menu_gate_release(); }
                 else if (label_edit_ready() && !g_bsOpen && di_gate_left_ms() < 0) {
                     // lsel_open refuses on the in-game save screen, so that screen falls through
                     // to the note editor. A live gate is someone else's (a staged fight) and
@@ -1111,7 +1228,7 @@ static DWORD WINAPI worker(LPVOID unused) {
         // while a warp prompt is up.
         if (hk_edge(g_warpCancelVk, &wasCancel)) {
             if (g_warpPrompt)    warp_cancel();
-            else if (g_ssOpen)   { g_ssOpen = 0; di_gate_lift(); }
+            else if (g_ssOpen)   { g_ssOpen = 0; menu_gate_release(); }
             else if (g_bsOpen) {
                 g_bsRememberDue = 1;           // ...likewise
                 g_bsOpen = 0;      // no flash: the list vanishing already says it closed

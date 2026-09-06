@@ -84,7 +84,7 @@ typedef enum {
     T_SS_GRP_FILTER,      //  heading over the row that picks what the list shows
     T_SS_FILTER_ALL,      //  that row, with no chapter picked
     T_SS_FILTER_ONE,      //  ...and with one: %d = chapter, %d = how many saves it holds
-    T_SS_FILTER_KEYS,     //  the footer while that row is the one selected: two %s = left, right
+    T_SS_FILTER_KEYS,     //  the footer while that row is selected: two %s = left, right, confirm
     T_LABEL_PASTED,       //  the note was written; it shows the next time the list is drawn
     T_LABEL_CLEARED,      //  ...and the same for one taken off
     T_LABEL_NO_ROW,       //  the key was pressed with no save list on screen
@@ -94,10 +94,10 @@ typedef enum {
     T_LABEL_NO_WINDOW,    //  the editor could not take the game's window
     T_LABEL_EDIT_HEAD,    //  %d = the save being labelled
     T_LABEL_EDIT_HELP,    //  what can go in, and how
-    T_LABEL_EDIT_KEYS,    //  what the editor's keys do; %s = its own key
+    T_LABEL_EDIT_KEYS,    //  what the editor's keys do: the confirm phrase, its own key
     T_LABEL_EDIT_FULL,    //  %d = the length limit; shown when a keystroke was refused
     T_SS_RENUM,           //  the last row: it renames files
-    T_SS_FOOT,            //  four %s = up, down, apply (held), close
+    T_SS_FOOT,            //  four %s = up, down, the confirm phrase, close
     T_SS_DONE,            //  %d = saves re-stamped
     T_SS_RENUM_DONE,      //  %d = saves renumbered
     T_SS_RENUM_FAIL,
@@ -110,32 +110,63 @@ typedef enum {
     T_SS_CAT_PICK_NONE,   //  ...and with no other category to switch to: %s = the one in use
     T_SS_CAT_PICK_IDLE,   //  ...and with others parked but none picked yet: %s = the one in use
     T_SS_CAT_NEW,         //  start a category seeded with a copy of the newest save
+    T_SS_CAT_NEW_ALL,     //  ...seeded with a copy of every save in the one in use
     T_SS_CAT_RENAME,      //  ...and give the one in use another name
-    T_SS_CAT_KEYS,        //  the footer while the first row is selected: two %s = left, right
+    T_SS_CAT_DEL,         //  ...and throw a parked one away: %s = the one picked
+    T_SS_CAT_DEL_IDLE,    //  ...with none picked
+    T_SS_CAT_DEL_ARM,     //  ...asking for the second confirm: %s = the one picked, %s = the phrase
+    T_SS_CAT_DEL_KEYS,    //  the footer while that row is selected: left, right, confirm
+    T_SS_CAT_DEL_DONE,    //  %s = the category deleted
+    T_SS_CAT_DEL_FAIL,
+    T_SS_CAT_KEYS,        //  the footer while the first row is selected: left, right, confirm
     T_SS_CAT_DONE,        //  %s = the category now in use, %d = files stashed, %d brought back
     T_SS_CAT_NOTITLE,     //  a switch was asked for somewhere the files must not move
     T_SS_CAT_FAIL,
     T_SS_CAT_RENAMED,     //  %s = the new name
-    T_SS_CAT_EXISTS,
-    T_SS_CAT_BADNAME,
+    T_SS_CAT_EXISTS,      //  drawn inside the editor when the committed name is already taken
+    T_SS_CAT_BADNAME,     //  ...and when the filesystem cannot take it
     T_SS_CAT_NAME_HEAD,   //  the editor's title, naming a new category
+    T_SS_CAT_NAME_HEAD_ALL, //  ...one that copies every save
     T_SS_CAT_RENAME_HEAD, //  ...and renaming the one in use
     T_SS_CAT_EDIT_HELP,   //  what can go in a category's name, and how
-    T_SS_CAT_EDIT_KEYS,   //  what the editor's keys do there; %s = its own key
+    T_SS_CAT_EDIT_KEYS,   //  what the editor's keys do there: the confirm phrase, its own key
     T_SEND_NEWCAT,        //  the destination stop that stands for a category not made yet
-    T_SEND_COPY,          //  the two rows: what the send does to the original
+    T_SEND_COPY,          //  the two rows: what the send does to the original, %s = where to
     T_SEND_MOVE,
-    T_SEND_KEYS,          //  six %s = up, down, left, right, go (held), close
+    T_SEND_DEST_COPY,     //  what left/right picks, named for the row it is on
+    T_SEND_DEST_MOVE,
+    T_SEND_KEYS,          //  six %s = up, down, left, right, the confirm phrase, close
     T_SEND_FULL,          //  %s = the category with no free save number left
     T_SEND_COPIED,        //  %d = the save sent, %s = the category, %d = its number there
     T_SEND_MOVED,         //  likewise
     T_SEND_FAIL,
-    T_LSEL_HEAD,          //  the save list chooser's title: %d = the save under the cursor
+    T_LSEL_HEAD,          //  the save list chooser's title: %d = the save under the cursor, %s =
+                          //  how to move that cursor (empty when list_prev/list_next are unbound)
+    T_LSEL_PICK,          //  ...tacked onto that title: two %s = the keys that walk the game's list
     T_LSEL_NOTE,          //  the note row
-    T_LSEL_KEYS,          //  its footer on the note row: two %s = up, down, one = its own key
-    T_LSEL_SEND_KEYS,     //  ...and on a send row: up, down, left, right, its own key
-    T_LSEL_GRP_NOTE,      //  heading over the note row
-    T_LSEL_GRP_SEND,      //  ...and over the two send rows: %s = where they would send it
+    T_LSEL_KEYS,          //  its footer on the note row: up, down, the confirm phrase, its own key
+    T_LSEL_SEND_KEYS,     //  ...on a send row: up, down, left, right, what they pick, confirm, key
+    T_LSEL_MARK_SET,      //  the range row, idle: %d = the save it would mark as one end
+    T_LSEL_MARK_CLR,      //  ...and armed
+    T_SEND_COPY_N,        //  ...with a range armed: %d = the two ends, %d = the count, %s = where to
+    T_SEND_MOVE_N,
+    T_RANGE_MARKED,       //  %d = the save just marked
+    T_RANGE_CLEARED,
+    T_RANGE_GONE,         //  a marked or cursor save that no longer resolves to a file
+    T_RANGE_ROW_GONE,     //  ...the CURSOR end only: the mark still stands
+    T_SEND_N_FULL,        //  %s = destination, %d = its free numbers, %d = the count needed
+    T_SEND_N_PART,        //  %d = sent, %d = the count asked for
+    T_SEND_N_COPIED,      //  %d = the count, %s = the destination
+    T_SEND_N_MOVED,       //  likewise
+    T_LSEL_DEL,           //  the delete row over a range: %d = the two ends, %d = the count
+    T_LSEL_DEL_IDLE,      //  ...with no range marked, when the row cannot run
+    T_LSEL_DEL_ARM,       //  ...asking for the second confirm: %d = the count, %s = the phrase
+    T_DEL_NEED_RANGE,     //  confirmed with no range marked: what to do first
+    T_DEL_N_DONE,         //  %d = the count deleted
+    T_DEL_FAIL,
+    T_OK_HOLD,            //  the confirm phrase with menu_ok off: %s = the tidy key, held
+    T_OK_BOTH,            //  ...and with menu_ok bound: %s = that key; the hold still confirms too
+    T_HELP_MENU_OK,       //  the help row for menu_ok
     T_COUNT
 } ovl_msg;
 
@@ -198,7 +229,7 @@ static const char* const kOvlEn[T_COUNT] = {
     /* T_SS_GRP_FILTER      */ " Which saves the list shows",
     /* T_SS_FILTER_ALL      */ "every chapter",
     /* T_SS_FILTER_ONE      */ "Chapter %d only (%d saves)",
-    /* T_SS_FILTER_KEYS     */ "  [%s/%s]=pick a chapter  hold=show every chapter",
+    /* T_SS_FILTER_KEYS     */ "  [%s/%s]=pick a chapter  %s=show every chapter",
     /* T_LABEL_PASTED       */ "Note saved. It appears once the save list is drawn again -- go back to the title screen, for instance. \nSaving over that save clears it.",
     /* T_LABEL_CLEARED      */ "Note taken off. It goes once the save list is drawn again -- go back to the title screen, for instance.",
     /* T_LABEL_NO_ROW       */ "NOTE: open the game's save list and put the cursor on a save first",
@@ -208,10 +239,10 @@ static const char* const kOvlEn[T_COUNT] = {
     /* T_LABEL_NO_WINDOW    */ "NOTE: the game's window would not take the editor",
     /* T_LABEL_EDIT_HEAD    */ "NOTE ON SAVE %d",
     /* T_LABEL_EDIT_HELP    */ "  Type it, or paste text copied outside the game with Ctrl+V. Typing is ASCII only; a paste can be anything.",
-    /* T_LABEL_EDIT_KEYS    */ "  hold [%s]=set   tap=cancel   (empty = no label)",
+    /* T_LABEL_EDIT_KEYS    */ "  %s=set   tap [%s]=cancel   (empty = no label)",
     /* T_LABEL_EDIT_FULL    */ "  that one did not go in: %d characters at most, and no comma",
     /* T_SS_RENUM           */ "into story order",
-    /* T_SS_FOOT            */ "  [%s/%s]=move  hold [%s]=run  [%s]=close",
+    /* T_SS_FOOT            */ "  [%s/%s]=move  %s=run  [%s/tap]=close",
     /* T_SS_DONE            */ "SORT: %d saves re-ordered",
     /* T_SS_RENUM_DONE      */ "RENUMBER: %d saves given new numbers",
     /* T_SS_RENUM_FAIL      */ "RENUMBER: a save could not be renamed -- nothing was changed",
@@ -224,32 +255,62 @@ static const char* const kOvlEn[T_COUNT] = {
     /* T_SS_CAT_PICK_NONE   */ "using '%s' (no other category)",
     /* T_SS_CAT_PICK_IDLE   */ "using '%s'",
     /* T_SS_CAT_NEW         */ "new category with a copy of the latest save (stash the rest)",
+    /* T_SS_CAT_NEW_ALL     */ "new category with a copy of every save (a twin of this one)",
     /* T_SS_CAT_RENAME      */ "rename the current category",
-    /* T_SS_CAT_KEYS        */ "  [%s/%s]=pick a category  hold=switch",
+    /* T_SS_CAT_DEL         */ "delete '%s'",
+    /* T_SS_CAT_DEL_IDLE    */ "delete a category (none picked)",
+    /* T_SS_CAT_DEL_ARM     */ "confirm: delete '%s' -- %s again to run",
+    /* T_SS_CAT_DEL_KEYS    */ "  [%s/%s]=pick a category to delete (not the one in use)  %s=delete",
+    /* T_SS_CAT_DEL_DONE    */ "CATEGORY: deleted '%s' (to the Recycle Bin)",
+    /* T_SS_CAT_DEL_FAIL    */ "CATEGORY: delete failed -- see the log",
+    /* T_SS_CAT_KEYS        */ "  [%s/%s]=pick a category  %s=switch",
     /* T_SS_CAT_DONE        */ "CATEGORY: now on '%s' (%d out, %d in)",
     /* T_SS_CAT_NOTITLE     */ "CATEGORY: title screen only (close the save list first)",
     /* T_SS_CAT_FAIL        */ "CATEGORY: switch failed -- see the log",
     /* T_SS_CAT_RENAMED     */ "CATEGORY: renamed to '%s'",
-    /* T_SS_CAT_EXISTS      */ "CATEGORY: one with that name already exists",
-    /* T_SS_CAT_BADNAME     */ "CATEGORY: that name cannot be used",
+    /* T_SS_CAT_EXISTS      */ "  A category with that name already exists -- change the name",
+    /* T_SS_CAT_BADNAME     */ "  That name cannot be used -- change the name",
     /* T_SS_CAT_NAME_HEAD   */ "NAME THE NEW CATEGORY",
+    /* T_SS_CAT_NAME_HEAD_ALL */ "NAME THE NEW CATEGORY (a copy of every save)",
     /* T_SS_CAT_RENAME_HEAD */ "RENAME THE CATEGORY",
     /* T_SS_CAT_EDIT_HELP   */ "  Type it, or paste text copied outside the game with Ctrl+V. These cannot go in: \\ / : * ? \" < > | ,",
-    /* T_SS_CAT_EDIT_KEYS   */ "  hold [%s]=set   tap=cancel",
+    /* T_SS_CAT_EDIT_KEYS   */ "  %s=set   tap [%s]=cancel",
     /* T_SEND_NEWCAT        */ "<new category>",
-    /* T_SEND_COPY          */ "copy (the original stays)",
-    /* T_SEND_MOVE          */ "move (leaves this category)",
-    /* T_SEND_KEYS          */ "  [%s/%s]=choose  [%s/%s]=where to  hold [%s]=go  [%s]=close",
+    /* T_SEND_COPY          */ "copy -> %s",
+    /* T_SEND_MOVE          */ "move -> %s",
+    /* T_SEND_DEST_COPY     */ "where to copy",
+    /* T_SEND_DEST_MOVE     */ "where to move",
+    /* T_SEND_KEYS          */ "  [%s/%s]=choose  [%s/%s]=where to  %s=go  [%s]=close",
     /* T_SEND_FULL          */ "SEND: '%s' has no free save number",
     /* T_SEND_COPIED        */ "SEND: save %d copied to '%s' as save %d",
     /* T_SEND_MOVED         */ "SEND: save %d moved to '%s' as save %d (reopen the list to see it go)",
     /* T_SEND_FAIL          */ "SEND: failed -- see the log",
-    /* T_LSEL_HEAD          */ "WHAT TO DO WITH SAVE %d",
+    /* T_LSEL_HEAD          */ "WHAT TO DO WITH SAVE %d%s",
+    /* T_LSEL_PICK          */ "   ([%s/%s] = another save)",
     /* T_LSEL_NOTE          */ "write or edit it",
-    /* T_LSEL_KEYS          */ "  [%s/%s]=choose  hold [%s]=go  tap=close",
-    /* T_LSEL_SEND_KEYS     */ "  [%s/%s]=choose  [%s/%s]=where to  hold [%s]=go  tap=close",
-    /* T_LSEL_GRP_NOTE      */ " Note",
-    /* T_LSEL_GRP_SEND      */ " Send to another category -> %s",
+    /* T_LSEL_KEYS          */ "  [%s/%s]=choose  %s=go  tap [%s]=close",
+    /* T_LSEL_SEND_KEYS     */ "  [%s/%s]=choose  [%s/%s]=%s  %s=go  tap [%s]=close",
+    /* T_LSEL_MARK_SET      */ "select a range (save data %d is one end)",
+    /* T_LSEL_MARK_CLR      */ "clear the range mark",
+    /* T_SEND_COPY_N        */ "copy saves %d-%d as listed (%d of them) -> %s",
+    /* T_SEND_MOVE_N        */ "move saves %d-%d as listed (%d of them) -> %s",
+    /* T_RANGE_MARKED       */ "RANGE: starts at save data %d -- now put the cursor on the other end",
+    /* T_RANGE_CLEARED      */ "RANGE: mark cleared",
+    /* T_RANGE_GONE         */ "RANGE: the picked rows cannot be resolved -- mark cleared",
+    /* T_RANGE_ROW_GONE    */ "RANGE: this row is gone -- put the cursor on a save that is still there",
+    /* T_SEND_N_FULL        */ "SEND: '%s' has %d free number(s), %d needed",
+    /* T_SEND_N_PART        */ "SEND: stopped at %d of %d -- see the log",
+    /* T_SEND_N_COPIED      */ "SEND: %d saves copied to '%s'",
+    /* T_SEND_N_MOVED       */ "SEND: %d saves moved to '%s' (reopen the list to see them go)",
+    /* T_LSEL_DEL          */ "delete saves %d-%d as listed (%d of them)",
+    /* T_LSEL_DEL_IDLE     */ "delete a range of saves (none marked)",
+    /* T_LSEL_DEL_ARM      */ "confirm: delete %d save(s) -- %s again to run",
+    /* T_DEL_NEED_RANGE    */ "DELETE: mark a range first -- the row above starts one",
+    /* T_DEL_N_DONE        */ "DELETE: %d saves to the Recycle Bin (reopen the list to see them go)",
+    /* T_DEL_FAIL          */ "DELETE: failed -- see the log",
+    /* T_OK_HOLD           */ "hold [%s]",
+    /* T_OK_BOTH           */ "[%s/hold]",
+    /* T_HELP_MENU_OK      */ "Save menus -- run the selected row (the tidy key's hold works too)",
 };
 
 // UTF-8. "" = not translated, falls back to the English above.
@@ -314,7 +375,7 @@ static const char* const kOvlJp[T_COUNT] = {
     /* T_SS_GRP_FILTER      */ " セーブデータ一覧に表示する範囲",
     /* T_SS_FILTER_ALL      */ "すべての章",
     /* T_SS_FILTER_ONE      */ "第%d章のみ (%d件)",
-    /* T_SS_FILTER_KEYS     */ "  [%s/%s]=章を選ぶ  長押し=すべての章に戻す",
+    /* T_SS_FILTER_KEYS     */ "  [%s/%s]=章を選ぶ  %s=すべての章に戻す",
     /* T_LABEL_PASTED       */ "メモを保存しました。一旦タイトル画面に戻るなどでセーブ一覧を再表示すると表示されます。\nセーブデータを上書き保存するとメモは消えます。",
     /* T_LABEL_CLEARED      */ "メモを外しました。一旦タイトル画面に戻るなどでセーブ一覧を再表示すると反映されます。",
     /* T_LABEL_NO_ROW       */ "LABEL: セーブ一覧を開き、対象にカーソルを合わせてから押してください",
@@ -324,10 +385,10 @@ static const char* const kOvlJp[T_COUNT] = {
     /* T_LABEL_NO_WINDOW    */ "LABEL: ゲームのウィンドウを取得できませんでした",
     /* T_LABEL_EDIT_HEAD    */ "セーブ%d のメモ",
     /* T_LABEL_EDIT_HELP    */ "  入力するか、ゲーム外でコピーしたテキストを Ctrl+V で貼り付け。手入力は半角のみ。ペーストであれば全角やマルチバイトも可",
-    /* T_LABEL_EDIT_KEYS    */ "  [%s]長押し=決定   短押し=中止   (空にすると外す)",
+    /* T_LABEL_EDIT_KEYS    */ "  %s=決定   [%s]短押し=中止   (空にすると外す)",
     /* T_LABEL_EDIT_FULL    */ "  今の入力は無効: %d文字まで、, は使えません",
     /* T_SS_RENUM           */ "進行順に振り直す",
-    /* T_SS_FOOT            */ "  [%s/%s]=選択  [%s]長押し=実行  [%s]=閉じる",
+    /* T_SS_FOOT            */ "  [%s/%s]=選択  %s=実行  [%s/短押し]=閉じる",
     /* T_SS_DONE            */ "SORT: セーブ%d件を並べ替えました",
     /* T_SS_RENUM_DONE      */ "RENUMBER: セーブ%d件の番号を振り直しました",
     /* T_SS_RENUM_FAIL      */ "RENUMBER: リネームできないファイルがあったため、何も変更していません",
@@ -340,32 +401,62 @@ static const char* const kOvlJp[T_COUNT] = {
     /* T_SS_CAT_PICK_NONE   */ "使用中: %s (他のカテゴリーなし)",
     /* T_SS_CAT_PICK_IDLE   */ "使用中: %s",
     /* T_SS_CAT_NEW         */ "新しいカテゴリーを作って切替 (最新の1件をコピー)",
+    /* T_SS_CAT_NEW_ALL     */ "新しいカテゴリーを作って切替 (全件コピー)",
     /* T_SS_CAT_RENAME      */ "使用中のカテゴリーの名前を変更",
-    /* T_SS_CAT_KEYS        */ "  [%s/%s]=切替先を選ぶ  長押し=切替",
+    /* T_SS_CAT_DEL         */ "「%s」を削除",
+    /* T_SS_CAT_DEL_IDLE    */ "カテゴリーを削除 (未選択)",
+    /* T_SS_CAT_DEL_ARM     */ "削除の確認: 「%s」 — もう一度%sで実行",
+    /* T_SS_CAT_DEL_KEYS    */ "  [%s/%s]=削除するカテゴリーを選ぶ (使用中は削除不可)  %s=削除",
+    /* T_SS_CAT_DEL_DONE    */ "カテゴリー: 「%s」を削除しました (ごみ箱へ)",
+    /* T_SS_CAT_DEL_FAIL    */ "カテゴリー削除: 失敗 (ログ参照)",
+    /* T_SS_CAT_KEYS        */ "  [%s/%s]=切替先を選ぶ  %s=切替",
     /* T_SS_CAT_DONE        */ "カテゴリー切替: 「%s」へ (退避%d件 / 復帰%d件)",
     /* T_SS_CAT_NOTITLE     */ "カテゴリー切替: タイトル画面でのみ実行できます (一覧は閉じてから)",
     /* T_SS_CAT_FAIL        */ "カテゴリー切替: 失敗 (ログ参照)",
     /* T_SS_CAT_RENAMED     */ "カテゴリー: 「%s」に改名",
-    /* T_SS_CAT_EXISTS      */ "カテゴリー: 同名のカテゴリーがあります",
-    /* T_SS_CAT_BADNAME     */ "カテゴリー: その名前は使えません",
+    /* T_SS_CAT_EXISTS      */ "  同名のカテゴリーがあります。名前を変えてください",
+    /* T_SS_CAT_BADNAME     */ "  その名前は使えません。名前を変えてください",
     /* T_SS_CAT_NAME_HEAD   */ "新しいカテゴリーの名前",
+    /* T_SS_CAT_NAME_HEAD_ALL */ "新しいカテゴリーの名前 (全件コピー)",
     /* T_SS_CAT_RENAME_HEAD */ "カテゴリーの新しい名前",
     /* T_SS_CAT_EDIT_HELP   */ "  入力するか、ゲーム外でコピーしたテキストを Ctrl+V で貼り付け。使えない文字: \\ / : * ? \" < > | ,",
-    /* T_SS_CAT_EDIT_KEYS   */ "  [%s]長押し=決定   短押し=中止",
+    /* T_SS_CAT_EDIT_KEYS   */ "  %s=決定   [%s]短押し=中止",
     /* T_SEND_NEWCAT        */ "<新しいカテゴリー>",
-    /* T_SEND_COPY          */ "コピー (元は残す)",
-    /* T_SEND_MOVE          */ "移動 (このカテゴリーから消える)",
-    /* T_SEND_KEYS          */ "  [%s/%s]=選択  [%s/%s]=送り先  [%s]長押し=実行  [%s]=閉じる",
+    /* T_SEND_COPY          */ "コピー → %s",
+    /* T_SEND_MOVE          */ "移動 → %s",
+    /* T_SEND_DEST_COPY     */ "コピー先カテゴリー",
+    /* T_SEND_DEST_MOVE     */ "移動先カテゴリー",
+    /* T_SEND_KEYS          */ "  [%s/%s]=選択  [%s/%s]=送り先  %s=実行  [%s]=閉じる",
     /* T_SEND_FULL          */ "送り先「%s」に空き番号がありません",
     /* T_SEND_COPIED        */ "セーブ%dを「%s」のセーブ%dへコピーしました",
     /* T_SEND_MOVED         */ "セーブ%dを「%s」のセーブ%dへ移動しました (一覧は開き直すと反映)",
     /* T_SEND_FAIL          */ "送り: 失敗 (ログ参照)",
-    /* T_LSEL_HEAD          */ "セーブ%d の操作",
+    /* T_LSEL_HEAD          */ "セーブ%dの操作%s",
+    /* T_LSEL_PICK          */ "   ([%s/%s]=別のセーブを選ぶ)",
     /* T_LSEL_NOTE          */ "メモを書く/編集する",
-    /* T_LSEL_KEYS          */ "  [%s/%s]=選択  [%s]長押し=実行  短押し=閉じる",
-    /* T_LSEL_SEND_KEYS     */ "  [%s/%s]=選択  [%s/%s]=送り先  [%s]長押し=実行  短押し=閉じる",
-    /* T_LSEL_GRP_NOTE      */ " メモ",
-    /* T_LSEL_GRP_SEND      */ " 別のカテゴリーへ送る → %s",
+    /* T_LSEL_KEYS          */ "  [%s/%s]=選択  %s=実行  [%s]短押し=閉じる",
+    /* T_LSEL_SEND_KEYS     */ "  [%s/%s]=選択  [%s/%s]=%s  %s=実行  [%s]短押し=閉じる",
+    /* T_LSEL_MARK_SET      */ "範囲選択 (セーブデータ%dを始点にする)",
+    /* T_LSEL_MARK_CLR      */ "範囲選択を解除",
+    /* T_SEND_COPY_N        */ "コピー (一覧上のセーブ%d〜%dの%d件) → %s",
+    /* T_SEND_MOVE_N        */ "移動 (一覧上のセーブ%d〜%dの%d件) → %s",
+    /* T_RANGE_MARKED       */ "範囲の始点: セーブデータ%d — もう一方の端にカーソルを移す",
+    /* T_RANGE_CLEARED      */ "範囲選択を解除しました",
+    /* T_RANGE_GONE         */ "範囲を特定できません — 解除しました",
+    /* T_RANGE_ROW_GONE    */ "この行はもうありません — 実在するセーブへカーソルを移してください",
+    /* T_SEND_N_FULL        */ "送り先「%s」の空きは%d件 — %d件には足りません",
+    /* T_SEND_N_PART        */ "送り: %d/%d件で停止 (ログ参照)",
+    /* T_SEND_N_COPIED      */ "セーブ%d件を「%s」へコピーしました",
+    /* T_SEND_N_MOVED       */ "セーブ%d件を「%s」へ移動しました (一覧は開き直すと反映)",
+    /* T_LSEL_DEL          */ "削除 (一覧上のセーブ%d〜%dの%d件)",
+    /* T_LSEL_DEL_IDLE     */ "範囲を削除 (先に範囲選択が必要)",
+    /* T_LSEL_DEL_ARM      */ "削除の確認: %d件 — もう一度%sで実行",
+    /* T_DEL_NEED_RANGE    */ "削除: 先に上の「範囲選択」の行で始点を決めてください",
+    /* T_DEL_N_DONE        */ "セーブ%d件をごみ箱へ削除しました (一覧は開き直すと反映)",
+    /* T_DEL_FAIL          */ "削除: 失敗 (ログ参照)",
+    /* T_OK_HOLD           */ "[%s]長押し",
+    /* T_OK_BOTH           */ "[%s/長押し]",
+    /* T_HELP_MENU_OK      */ "セーブ整理メニューの決定 (整理キーの長押しでも可)",
 };
 
 #endif // FF13_OVL_TEXT_H

@@ -17,6 +17,8 @@
  */
 
 #include "srp_internal.h"
+#include <shellapi.h>
+#include <objbase.h>
 #include "ff13_savepoints_data.h"
 #include "ff13_crypt.h"
 
@@ -526,39 +528,48 @@ static void do_savefix(int slot, const char* cp, unsigned char area, short regio
     ff13_decrypt(buf, n);
     char before[FF13_NAME_WIDTH+1]; memcpy(before, buf+FF13_NAME_OFF, FF13_NAME_WIDTH);
     before[FF13_NAME_WIDTH]=0;
-    // GUARD: only rewrite a REGULAR savepoint. An event restart point (rp_*), a chapter checkpoint
-    // (sp_chpt_*) or anything else is the story-consistent restart the game requires, and replacing
-    // it with the distance-nearest savepoint makes the save unloadable (proven on hardware). Leave
-    // those untouched; the sidecar teleport still repositions the party at load.
-    if (strncmp(before, "s_point_", 8) != 0) {
+    // GUARD: only a REGULAR savepoint's checkpoint may be rewritten. An event restart point (rp_*),
+    // a chapter checkpoint (sp_chpt_*) or anything else is the story-consistent restart the game
+    // requires, and the distance-nearest savepoint in its place makes the save unloadable
+    // (proven on hardware). Those keep their checkpoint AND area; the sidecar teleport still
+    // repositions the party at load. The thumbnail is display-only and is written either way.
+    int keepCp = strncmp(before, "s_point_", 8) != 0;
+    // thumbnail background (plaintext header 0x04, LE): set region, keep leader nibble.
+    // id = 0x48004000 | region<<4 | leader; leader OR'd only for field regions (<0x32).
+    uint32_t oldt = buf[4] | (buf[5]<<8) | (buf[6]<<16) | ((uint32_t)buf[7]<<24);
+    uint32_t nt = oldt;
+    if (region >= 0) {
+        nt = FF13_THUMB_BASE | ((uint32_t)region << 4);
+        if (region < 0x32) nt |= (oldt & 0xF);
+    }
+    if (keepCp && nt == oldt) {
         ff13log("[FF13-SRP] savefix: slot %d kept as-is -- game checkpoint '%s' is story-critical (not a savepoint)\n", slot, before);
         return;
     }
     size_t L = strlen(cp);
-    if (L >= FF13_NAME_WIDTH) { ff13loga("[FF13-SRP] savefix: name too long\n"); return; }
+    if (!keepCp && L >= FF13_NAME_WIDTH) { ff13loga("[FF13-SRP] savefix: name too long\n"); return; }
     // Safety net: back up the ORIGINAL save before editing (always loadable; restore the
     // .bak if anything is off -- the sidecar still teleports to the hotkey position).
     { char bp[MAX_PATH]; snprintf(bp, sizeof(bp), "%s.bak", path);
       if (CopyFileA(path, bp, FALSE)) { if (slot >= 0 && slot < 256) g_bakKnown[slot] = 1;
           ff13log("[FF13-SRP] savefix: backed up original -> ff13-%02d.dat.bak\n", slot); }
       else ff13loga("[FF13-SRP] savefix: WARNING backup failed (slot %d)\n", slot); }
-    memset(buf + FF13_NAME_OFF, 0, FF13_NAME_WIDTH);   // 16-byte name field only; preserve rank@0x3038
-    memcpy(buf + FF13_NAME_OFF, cp, L);
-    buf[FF13_AREA_OFF] = area;
-    // thumbnail background (plaintext header 0x04, LE): set region, keep leader nibble.
-    // id = 0x48004000 | region<<4 | leader; leader OR'd only for field regions (<0x32).
-    if (region >= 0) {
-        uint32_t oldt = buf[4] | (buf[5]<<8) | (buf[6]<<16) | ((uint32_t)buf[7]<<24);
-        uint32_t nt = FF13_THUMB_BASE | ((uint32_t)region << 4);
-        if (region < 0x32) nt |= (oldt & 0xF);
-        buf[4]=(uint8_t)nt; buf[5]=(uint8_t)(nt>>8); buf[6]=(uint8_t)(nt>>16); buf[7]=(uint8_t)(nt>>24);
+    if (!keepCp) {
+        memset(buf + FF13_NAME_OFF, 0, FF13_NAME_WIDTH);   // 16-byte name field only; preserve rank@0x3038
+        memcpy(buf + FF13_NAME_OFF, cp, L);
+        buf[FF13_AREA_OFF] = area;
     }
+    buf[4]=(uint8_t)nt; buf[5]=(uint8_t)(nt>>8); buf[6]=(uint8_t)(nt>>16); buf[7]=(uint8_t)(nt>>24);
     ff13_encrypt(buf, n);
     FILE* o = fopen(path, "wb");
     if (!o) { ff13loga("[FF13-SRP] savefix: write-open fail\n"); return; }
     fwrite(buf, 1, n, o); fclose(o);
-    ff13log("[FF13-SRP] savefix: slot %d  '%s' -> '%s'  area=0x%02X region=%d  written\n",
-            slot, before, cp, area, region);
+    if (keepCp)
+        ff13log("[FF13-SRP] savefix: slot %d checkpoint '%s' kept (story-critical) -- thumbnail region %d written\n",
+                slot, before, region);
+    else
+        ff13log("[FF13-SRP] savefix: slot %d  '%s' -> '%s'  area=0x%02X region=%d  written\n",
+                slot, before, cp, area, region);
 }
 
 // The browser bounds every slot index by 0x63 (0x838B34 / 0x838CCB; the load loop at 0x8387ED
@@ -814,8 +825,8 @@ static int edit_cap(void) { return g_editMode == EDIT_LABEL ? LABEL_MAX : CATNAM
 static void edit_insert(const wchar_t* w) {
     int cap = edit_cap();
     for (int i = 0; w[i]; i++) {
-        if (g_editLen >= cap - 1) { g_editBad = 1; return; }
-        if (!edit_ok_char(w[i])) { g_editBad = 1; continue; }
+        if (g_editLen >= cap - 1) { g_editBad = EDIT_BAD_INPUT; return; }
+        if (!edit_ok_char(w[i])) { g_editBad = EDIT_BAD_INPUT; continue; }
         g_editBuf[g_editLen++] = w[i];
     }
     g_editBuf[g_editLen] = 0;
@@ -828,12 +839,13 @@ static LRESULT CALLBACK srp_wndproc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if ((m == WM_KEYDOWN || m == WM_KEYUP) && wp != VK_ESCAPE) return 0;
         if (m == WM_CHAR) {
             wchar_t c = (wchar_t)wp;
-            // No Enter case on purpose: an Enter reaching the save list behind the editor would
-            // start loading a save.
-            if (c == 0x08) { if (g_editLen) g_editBuf[--g_editLen] = 0; }        // Backspace
+            // No Enter case HERE on purpose: as a character it is only '\r' (filtered below), and
+            // the commit lives on the hotkey thread (menu_ok), whose gate lift then waits out the
+            // key's release so it cannot land in the save list behind the editor.
+            if (c == 0x08) { g_editBad = 0; if (g_editLen) g_editBuf[--g_editLen] = 0; }  // Backspace
             else if (c == 0x16) {                            // Ctrl+V
                 wchar_t w[256];
-                if (clipboard_text(w, 256)) edit_insert(w); else g_editBad = 1;
+                if (clipboard_text(w, 256)) edit_insert(w); else g_editBad = EDIT_BAD_INPUT;
             }
             else if (c >= L' ') { g_editBad = 0; wchar_t one[2] = { c, 0 }; edit_insert(one); }
             return 0;
@@ -1094,11 +1106,74 @@ static int checkpoint_read(FILE* f, char out[FF13_NAME_WIDTH + 1]) {
 // prints that mtime as the save's date (all three measured), so sorting is only re-stamping mtimes.
 #define SS_OFF_K1 0x4560A     // u16 LE: coarse story step high, a finer step low
 #define SS_OFF_K2 0x306A      // u8: splits ties inside one K1 value
+// The 64 Cie'th stone missions, one 4-byte record each: u16 times cleared, u16 open flag. The same
+// array the game reads at [*0x282B230 + idx*4 + 0x1968] (getClearCountOfMission -> 0x00B69760,
+// getMissionOpenFlag -> 0x00B69640), so the whole block sits at file = runtime + 0x2348.
+#define SS_OFF_MISSION 0x3CB0
+#define SS_MISSIONS    64
 volatile int g_ssOpen = 0;
 volatile int g_ssSel  = 0;
 
-typedef struct { int slot; uint32_t key; ULONGLONG real; unsigned char leads; } ss_ent;
+// Where a checkpoint sits in the story, from the game's own savepoint.wdb columns carried in
+// ff13_savepoints_data.h: `region` walks the route (hang 0, hgin 1, hgcr 2, ... eden 19, lasd 20,
+// with the late halves of a split map appended above 20), `uid` walks it inside one region.
+// Regions 11..18 are exactly Gran Pulse (10 is the Fifth Ark, 19 is Eden) and are left unordered on
+// purpose: no fixed order fits a route the player picks, so those rows tie here and fall through to
+// the keys below.
+#define SS_REGION_GP_LO 11     // gpst Steppe (Haerii too), gpcg Vallis Media, gpyu Mah'habara,
+#define SS_REGION_GP_HI 18     // gpda north Steppe, gptk Sulyya, gptt Taejin, gpwo/gpoc Oerba
+// Whether the save is carrying a mission it has not finished: some record is open with a clear
+// count of zero. NOT the id at 0x3048 (`g + 0xCB0`, getActiveMissionId -> 0x00B698A0), which names
+// the last mission taken and SURVIVES clearing it (measured).
+static int save_accepted(const uint8_t* buf) {
+    for (int m = 0; m < SS_MISSIONS; m++) {
+        const uint8_t* r = buf + SS_OFF_MISSION + m * 4;
+        if ((r[2] || r[3]) && !(r[0] || r[1])) return 1;
+    }
+    return 0;
+}
+
+// The play time the list itself prints, parsed out of the plaintext header: the decrypted body
+// carries no counter that matches it (LE/BE, seconds/frames/ms, split fields and float were all
+// searched). The LAST h:m:s in the line and only on a non-digit boundary -- the save's own label
+// sits earlier in the same string and may hold anything. 0 = unreadable, which ties.
+static uint32_t header_playtime(const uint8_t* buf) {
+    wchar_t line[FF13_LIST_CAP];
+    memcpy(line, buf + FF13_LIST_OFF, sizeof line);
+    int len = 0;
+    while (len < FF13_LIST_CAP && line[len]) len++;
+    uint32_t best = 0;
+    for (int i = 0; i < len; i++) {
+        if (i && line[i - 1] >= L'0' && line[i - 1] <= L'9') continue;
+        unsigned v[3] = {0, 0, 0};
+        int j = i, part = 0, digits = 0;
+        while (j < len && part < 3) {
+            if (line[j] >= L'0' && line[j] <= L'9') { v[part] = v[part] * 10 + (unsigned)(line[j] - L'0'); digits++; j++; }
+            else if (line[j] == L':' && digits)     { part++; digits = 0; j++; }
+            else break;
+        }
+        if (part == 2 && digits) best = v[0] * 3600u + v[1] * 60u + v[2];
+    }
+    return best;
+}
+
+#define SS_RANK_NONE 0xFFFFFFFFu
+static uint32_t sp_story_rank(const char* cp) {
+    if (!cp || !cp[0]) return SS_RANK_NONE;
+    for (int z = 0; z < FF13_ZONES_N; z++)
+        for (int i = 0; i < FF13_ZONES[z].n; i++)
+            if (!strcmp(FF13_ZONES[z].sp[i].name, cp)) {
+                int r = FF13_ZONES[z].sp[i].region;
+                if (r >= SS_REGION_GP_LO && r <= SS_REGION_GP_HI) return SS_RANK_NONE;
+                return (uint32_t)r * 1000000u + (uint32_t)(unsigned short)FF13_ZONES[z].sp[i].uid;
+            }
+    return SS_RANK_NONE;   // an event restart point (rp_*): no row in the table, so it ranks last
+}
+
+typedef struct { int slot; uint32_t key; uint32_t rank; uint32_t play; ULONGLONG real;
+                 unsigned char leads, miss, acc; } ss_ent;
 static int g_ssDescend = 0;
+int g_sortMode = 0;                   // the sort last chosen: 0 story asc, 1 story desc, 2 by number
 static int ss_cmp(const void* A, const void* B) {
     const ss_ent* a = (const ss_ent*)A; const ss_ent* b = (const ss_ent*)B;
     if (a->key != b->key) {
@@ -1110,7 +1185,32 @@ static int ss_cmp(const void* A, const void* B) {
         int r = a->leads ? -1 : 1;
         return g_ssDescend ? -r : r;
     }
-    if (a->real != b->real) return (a->real > b->real) ? -1 : 1;
+    // Ahead of the place: on Gran Pulse the story key barely moves, so missions cleared is the
+    // only progress two saves of one step differ by.
+    if (a->miss != b->miss) {
+        int r = (a->miss < b->miss) ? -1 : 1;
+        return g_ssDescend ? -r : r;
+    }
+    // One further step at the same count: the stone has been taken and the mark is not down yet.
+    if (a->acc != b->acc) {
+        int r = a->acc ? 1 : -1;
+        return g_ssDescend ? -r : r;
+    }
+    if (a->rank != b->rank) {
+        int r = (a->rank < b->rank) ? -1 : 1;
+        return g_ssDescend ? -r : r;
+    }
+    // How far into the run the save is, which is what the list prints and what the eye compares.
+    if (a->play != b->play) {
+        int r = (a->play < b->play) ? -1 : 1;
+        return g_ssDescend ? -r : r;
+    }
+    // Turned with the direction like every key above it: left un-turned, the same save comes first
+    // both ways and the list then shows one save above another carrying the lower number.
+    if (a->real != b->real) {
+        int r = (a->real < b->real) ? -1 : 1;
+        return g_ssDescend ? -r : r;
+    }
     return a->slot - b->slot;
 }
 
@@ -1237,7 +1337,8 @@ static int ss_collect(ss_ent* e, int mode) {
             continue;
         }
         uint32_t key;
-        int leads = 0;
+        uint32_t rank = 0, play = 0;
+        int leads = 0, miss = 0, acc = 0;
         if (mode == 2) {
             key = (uint32_t)slot;
         } else {
@@ -1247,6 +1348,11 @@ static int ss_collect(ss_ent* e, int mode) {
             char cp[FF13_NAME_WIDTH + 1];
             memcpy(cp, buf + FF13_NAME_OFF, FF13_NAME_WIDTH); cp[FF13_NAME_WIDTH] = 0;
             leads = chapter_save_leads_to(cp);
+            rank  = sp_story_rank(cp);
+            for (int m = 0; m < SS_MISSIONS; m++)
+                if (buf[SS_OFF_MISSION + m * 4] || buf[SS_OFF_MISSION + m * 4 + 1]) miss++;
+            acc  = save_accepted(buf);
+            play = header_playtime(buf);
         }
         WIN32_FILE_ATTRIBUTE_DATA fa;
         ULONGLONG cur = 0;
@@ -1260,8 +1366,26 @@ static int ss_collect(ss_ent* e, int mode) {
         if (!real)
             ff13log("[FF13-SRP] save sort: slot %d wears a stamp this session cannot place -- its "
                     "real date is unknown and the list will show the sort's own\n", slot);
-        e[n].slot = slot; e[n].key = key; e[n].real = real;
-        e[n].leads = (unsigned char)leads; n++;
+        e[n].slot = slot; e[n].key = key; e[n].rank = rank; e[n].play = play; e[n].real = real;
+        e[n].leads = (unsigned char)leads; e[n].miss = (unsigned char)miss;
+        e[n].acc = (unsigned char)acc; n++;
+    }
+    if (mode != 2 && n) {
+        int lo = SS_MISSIONS, hi = 0;
+        for (int i = 0; i < n; i++) {
+            if (e[i].miss < lo) lo = e[i].miss;
+            if (e[i].miss > hi) hi = e[i].miss;
+        }
+        int acc = 0;
+        for (int i = 0; i < n; i++) if (e[i].acc) acc++;
+        if (hi || acc)
+            ff13log("[FF13-SRP] save sort: missions cleared runs %d..%d over %d saves, %d of them "
+                    "carrying one they have not finished -- both order two saves of one story step "
+                    "before their save points do\n", lo, hi, n, acc);
+        int noplay = 0;
+        for (int i = 0; i < n; i++) if (!e[i].play) noplay++;
+        if (noplay) ff13loga("[FF13-SRP] save sort: %d of %d save(s) show no play time in the "
+                             "header -- those fall back to their save dates\n", noplay, n);
     }
     return n;
 }
@@ -1307,11 +1431,15 @@ static int ss_stamp(ss_ent* e, int n, int descend) {
     return done;
 }
 
+static void range_clear(void);
+
 void save_sort_apply(void) {
     static ss_ent e[100];
+    range_clear();                        // every mtime is about to change under the mark
     int mode = g_ssSel - SS_STORY_ASC;    // menu row -> the sort mode: 0 asc, 1 desc, 2 by number
     int n = ss_collect(e, mode);
     if (!n) { ff13loga("[FF13-SRP] save sort: no saves found\n"); return; }
+    g_sortMode = mode; state_save();      // a renumber keeps this direction
     int done = ss_stamp(e, n, mode == 1);
     char msg[96];
     snprintf(msg, sizeof msg, ui_text(T_SS_DONE), done);
@@ -1408,6 +1536,7 @@ void filter_scan(int* counts, int n) {
 }
 
 void filter_apply(int chapter) {
+    range_clear();                       // visibility is part of what the mark selected
     g_filterChapter = chapter;
     if (chapter) filter_hook_install();
     ff13log("[FF13-SRP] filter: %s\n", chapter ? "chapter set" : "off (every save shown)");
@@ -1477,6 +1606,7 @@ static void renum_slot_swap(int a, int b) {
     { int t = g_slotHasLoc[a];      g_slotHasLoc[a] = g_slotHasLoc[b];   g_slotHasLoc[b] = t; }
     { uint8_t t = g_bakKnown[a];    g_bakKnown[a] = g_bakKnown[b];       g_bakKnown[b] = t; }
     { date_row t = g_dateRow[a];    g_dateRow[a] = g_dateRow[b];         g_dateRow[b] = t; }
+    { unsigned char t = g_slotChapter[a]; g_slotChapter[a] = g_slotChapter[b]; g_slotChapter[b] = t; }
 }
 
 // perm[i] = where slot i's data has to end up; perm is consumed in the process.
@@ -1494,7 +1624,7 @@ static void renum_permute(unsigned char* perm) {
         if (slot_has_file(s)) continue;
         memset(&g_sidecar[s], 0, sizeof g_sidecar[s]);
         g_slotMapN[s] = 0; g_slotHasA18[s] = 0; g_slotHasLoc[s] = 0;
-        g_bakKnown[s] = 0;
+        g_bakKnown[s] = 0; g_slotChapter[s] = 0;
         memset(&g_dateRow[s], 0, sizeof g_dateRow[s]);
     }
     sidecar_save_file(); mapsidecar_save(); datesidecar_save();
@@ -1552,6 +1682,9 @@ static int renum_pending(void) {
 }
 // Every slot-keyed table in one sweep; the caller decides what (if anything) reloads them.
 static void slot_tables_clear(void) {
+    // Zeroing the chapter map means "unknown", which the filter hook always SHOWS -- the safe
+    // direction: a half-renumbered list may draw too much, never hide a save that is there.
+    memset(g_slotChapter, 0, sizeof g_slotChapter);
     memset(g_sidecar, 0, sizeof g_sidecar);
     memset(g_slotMapN, 0, sizeof g_slotMapN);
     memset(g_slotMap, 0, sizeof g_slotMap);
@@ -1780,12 +1913,15 @@ void save_renumber_apply(void) {
         }
     }
     // e[] was collected before the renames, so each entry still carries that save's real date.
+    // The list keeps the direction the last sort chose; by-number is story order once the
+    // numbers follow the story, so only endgame-first is a different answer.
     for (int i = 0; i < n; i++) e[i].slot = i;
-    ss_stamp(e, n, 0);
+    ss_stamp(e, n, g_sortMode == 1);
     char msg[96];
     snprintf(msg, sizeof msg, ui_text(T_SS_RENUM_DONE), m);
     flash_say(msg);
-    ff13log("[FF13-SRP] renumber: %d of %d saves renumbered into story order\n", m, n);
+    ff13log("[FF13-SRP] renumber: %d of %d saves renumbered into story order (list %s)\n", m, n,
+            g_sortMode == 1 ? "endgame first" : "Chapter 1 first");
 }
 
 // The twin of the block below lives in srp_warp.c, on a different commit hook; kept separate on purpose.
@@ -2089,6 +2225,14 @@ static void cat_journal_drop(void) {
     char p[MAX_PATH]; if (cat_journal_path(p, sizeof p)) DeleteFileA(p);
 }
 
+// A cut-short renumber or category switch still names files it has to put back: its temps sit in
+// the save directory and its journal names folders mid-move. Anything that deletes a save or takes
+// one out of the directory has to stand down until recovery has run, so all of them ask here.
+static int recovery_owns_saves(void) {
+    char jp[MAX_PATH];
+    return renum_pending() || (cat_journal_path(jp, sizeof jp) && file_exists(jp));
+}
+
 // Everything keyed by slot has just been replaced on disk. Same table list as renum_slot_swap.
 static void cat_tables_reload(void) {
     slot_tables_clear();
@@ -2109,6 +2253,23 @@ static void cat_tables_reload(void) {
         // boot); this category can show it, so the hook has to be live now.
         filter_hook_install();
     }
+}
+
+// The glob also matches the parked sidecars, so only the exact ff13-NN.dat shape counts.
+static int cat_saves_in(const char* dir) {
+    char glob[MAX_PATH];
+    int n = 0;
+    snprintf(glob, sizeof glob, "%s\\ff13-*.dat", dir);
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(glob, &fd);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    do {
+        const char* f = fd.cFileName;
+        if (strlen(f) == 11 && f[5] >= '0' && f[5] <= '9' && f[6] >= '0' && f[6] <= '9'
+            && !_stricmp(f + 7, ".dat")) n++;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    return n;
 }
 
 static int cat_name_cmp(const void* A, const void* B) {
@@ -2143,23 +2304,8 @@ void cat_list_refresh(void) {
     qsort(g_catList, (size_t)g_catListN, CATNAME_BYTES, cat_name_cmp);
     for (int i = 0; i < g_catListN; i++) {
         catname_to_u8(g_catListU8[i], sizeof g_catListU8[i], g_catList[i]);
-        char dir[MAX_PATH], glob[MAX_PATH];
-        int saves = 0;
-        if (cat_dir_of(dir, sizeof dir, g_catList[i])) {
-            snprintf(glob, sizeof glob, "%s\\ff13-*.dat", dir);
-            WIN32_FIND_DATAA fd;
-            HANDLE h = FindFirstFileA(glob, &fd);
-            if (h != INVALID_HANDLE_VALUE) {
-                do {
-                    // The glob also matches the parked sidecars, so only the exact ff13-NN.dat
-                    // shape counts.
-                    const char* n = fd.cFileName;
-                    if (strlen(n) == 11 && n[5] >= '0' && n[5] <= '9' && n[6] >= '0' && n[6] <= '9'
-                        && !_stricmp(n + 7, ".dat")) saves++;
-                } while (FindNextFileA(h, &fd));
-                FindClose(h);
-            }
-        }
+        char dir[MAX_PATH];
+        int saves = cat_dir_of(dir, sizeof dir, g_catList[i]) ? cat_saves_in(dir) : 0;
         size_t l = strlen(g_catListU8[i]);
         snprintf(g_catListU8[i] + l, sizeof g_catListU8[i] - l, ui_text(T_CAT_COUNT), saves);
     }
@@ -2303,6 +2449,85 @@ static void cat_switch_recover(void) {
     cat_journal_drop();
 }
 
+// ---- deleting a parked category ----------------------------------------------------------------
+// To the Recycle Bin rather than unlinked: a category can hold a hundred real saves. A drive with
+// no bin (a network or removable one) makes the shell delete outright -- the README says so.
+#define CAT_DEL_ARM_MS 8000
+static volatile int   g_catDelArm = -1;      // the g_catSel this confirm belongs to; -1 = idle
+static volatile DWORD g_catDelUntil = 0;
+
+int cat_del_armed(void) { return g_catDelArm >= 0; }
+static void cat_del_disarm(void) { g_catDelArm = -1; }
+
+// `list` is SHFileOperation's own form: absolute paths, each NUL-terminated, the last one twice.
+// The shell wants a COM-initialised thread for the bin's namespace work (the hotkey thread has
+// none of its own).
+static int shell_recycle(const wchar_t* list, const char* what) {
+    SHFILEOPSTRUCTW op;
+    memset(&op, 0, sizeof op);
+    op.wFunc  = FO_DELETE;
+    op.pFrom  = list;
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    int r = SHFileOperationW(&op);
+    if (SUCCEEDED(hr)) CoUninitialize();     // S_FALSE counts as an init and has to be balanced
+    if (r || op.fAnyOperationsAborted) {
+        ff13loga("[FF13-SRP] '%s' would not go to the bin (rc %d, aborted %d)\n",
+                 what, r, (int)op.fAnyOperationsAborted);
+        return 0;
+    }
+    return 1;
+}
+
+static int cat_recycle(const char* dir) {
+    wchar_t w[MAX_PATH + 2];
+    int n = MultiByteToWideChar(CP_ACP, 0, dir, -1, w, MAX_PATH);
+    if (n <= 0) return 0;
+    w[n] = 0;
+    return shell_recycle(w, dir);
+}
+
+int cat_del_hold(void) {
+    int sel = g_catSel;
+    const char* pick = cat_pick();
+    if (!pick) { cat_del_disarm(); return 0; }
+    char dir[MAX_PATH];
+    if (recovery_owns_saves()) {
+        ff13loga("[FF13-SRP] category: delete refused -- an unfinished renumber or switch owns "
+                 "these files\n");
+        flash_say_c(ui_text(T_SS_CAT_DEL_FAIL), OVL_FLASH_OFF);
+        cat_del_disarm();
+        return 0;
+    }
+    if (!cat_dir_of(dir, sizeof dir, pick)) {
+        flash_say_c(ui_text(T_SS_CAT_DEL_FAIL), OVL_FLASH_OFF);
+        cat_del_disarm();
+        return 0;
+    }
+    int saves = cat_saves_in(dir);
+    if (saves > 0 && g_catDelArm != sel) {
+        g_catDelArm = sel;
+        g_catDelUntil = GetTickCount() + CAT_DEL_ARM_MS;
+        ff13log("[FF13-SRP] category: '%s' holds %d save(s) -- confirm again to delete\n", pick, saves);
+        return 0;
+    }
+    char name[CATNAME_BYTES], nameU8[CATNAME_BYTES * 3];
+    snprintf(name, sizeof name, "%s", pick);
+    snprintf(nameU8, sizeof nameU8, "%s", (sel >= 0 && sel < g_catListN) ? g_catListU8[sel] : name);
+    cat_del_disarm();
+    if (!cat_recycle(dir)) {
+        flash_say_c(ui_text(T_SS_CAT_DEL_FAIL), OVL_FLASH_OFF);
+        return 0;
+    }
+    ff13log("[FF13-SRP] category: deleted '%s' (%d save(s)) -- to the recycle bin\n", name, saves);
+    cat_list_refresh();                          // ...which also drops the pick this row was on
+    if (g_sendDest > g_catListN) g_sendDest = g_catListN;   // the list of destinations just shrank
+    char msg[224];
+    snprintf(msg, sizeof msg, ui_text(T_SS_CAT_DEL_DONE), nameU8);
+    flash_say(msg);
+    return 1;
+}
+
 // ---- naming a category -----------------------------------------------------------------------
 // The DOS device names: a directory called any of these cannot be reached by the paths built here.
 static int catname_reserved(const char* n) {
@@ -2358,8 +2583,25 @@ static int catname_edit_open(int mode) {
     g_labelEdit = 1;
     return 1;
 }
-int cat_edit_open(int rename) {
-    return catname_edit_open(rename ? EDIT_CAT_RENAME : EDIT_CAT_NEW);
+int cat_edit_open(int mode) { return catname_edit_open(mode); }
+
+// The full-copy seed: exactly the file set a switch moves, duplicated rather than moved, so the new
+// category comes out a twin -- same save numbers, .bak files and sidecars. Going save by save
+// through send_apply_from would renumber every one of them into the destination's free slots
+// instead. -1 = a file would not copy.
+static int cat_copy_all(const char* dir) {
+    int n = 0;
+    for (int i = 0; i < CAT_FILES; i++) {
+        char a[MAX_PATH], b[MAX_PATH];
+        if (!cat_file_pair(i, dir, a, sizeof a, b, sizeof b) || !file_exists(a)) continue;
+        if (CopyFileA(a, b, TRUE)) n++;
+        else {
+            ff13loga("[FF13-SRP] category: copy %s -> %s failed (err %lu)\n",
+                     a, b, GetLastError());
+            return -1;
+        }
+    }
+    return n;
 }
 
 // ---- send the save under the cursor to another category ---------------------------------------
@@ -2382,10 +2624,233 @@ int send_cycle(int dir) {
     return g_sendDest;
 }
 
+// ---- range mark: send every save between two rows of the list on screen -----------------------
+// Membership is by mtime: the game's list sorts on raw file mtime, newest first, and the chapter
+// filter's hook drops rows by this same g_slotChapter array, so the set is exactly the rows drawn
+// between the ends. Session-local; anything that rewrites mtimes, slots or visibility clears it.
+static int send_apply_from(int src, const char* dstName, int move, int quiet);
+static void range_del_disarm(void);
+static volatile int g_rangeAnchor = -1;
+static volatile int g_rangeShownN = 0;
+int range_anchor(void)      { return g_rangeAnchor; }
+int range_shown_count(void) { return g_rangeShownN; }
+// The delete confirm belongs to a mark, so it goes when the mark does -- here rather than at each
+// caller, none of which can then forget it.
+static void range_clear(void) { g_rangeAnchor = -1; g_rangeShownN = 0; range_del_disarm(); }
+
+// Everything the tables hold about a slot whose file has just left this category, for a move and for
+// a delete alike. The same set renum_slot_swap carries: one added there is cleared here too. The
+// caller writes the three sidecars out -- a range does it once at the end, not per save.
+static void slot_forget(int slot) {
+    memset(&g_sidecar[slot], 0, sizeof g_sidecar[slot]);
+    g_slotMapN[slot] = 0;
+    memset(g_slotMap[slot], 0, sizeof g_slotMap[slot]);
+    memset(g_slotA18[slot], 0, sizeof g_slotA18[slot]);
+    g_slotHasA18[slot] = 0;
+    g_slotLoc[slot] = 0; g_slotHasLoc[slot] = 0;
+    g_bakKnown[slot] = 0;
+    g_slotChapter[slot] = 0;
+    memset(&g_dateRow[slot], 0, sizeof g_dateRow[slot]);
+}
+
+static ULONGLONG slot_mtime(int slot) {
+    char p[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (slot < 0 || slot >= SS_SLOTS || !save_path_for(slot, p, sizeof p)
+        || !GetFileAttributesExA(p, GetFileExInfoStandard, &fa)) return 0;
+    return ft_u64(fa.ftLastWriteTime);
+}
+
+static int range_members(int* out, int cap) {
+    ULONGLONG ta = slot_mtime(g_rangeAnchor), tb = slot_mtime(g_lselSlot);
+    if (!ta || !tb) return -1;
+    ULONGLONG lo = ta < tb ? ta : tb, hi = ta < tb ? tb : ta;
+    int want = g_filterHooked ? g_filterChapter : 0, n = 0;
+    for (int slot = 0; slot < SS_SLOTS && n < cap; slot++) {
+        if (want && g_slotChapter[slot] && g_slotChapter[slot] != (unsigned char)want) continue;
+        ULONGLONG t = slot_mtime(slot);
+        if (t && t >= lo && t <= hi) out[n++] = slot;
+    }
+    return n;
+}
+
+// Capacity is checked up front so a move never strands half the range in each place. A short
+// destination keeps the mark (repick and go again); any other exit drops it -- after a part-done
+// send the files have moved on and a re-run would double up the copies.
+static int send_range_apply(const char* dstName, int move) {
+    char dir[MAX_PATH], u8[CATNAME_BYTES * 3], msg[256];
+    int m[SS_SLOTS];
+    int n = range_members(m, SS_SLOTS);
+    if (n <= 0) {
+        range_clear();
+        flash_say_c(ui_text(T_RANGE_GONE), OVL_FLASH_OFF);
+        return 0;
+    }
+    catname_to_u8(u8, sizeof u8, dstName);
+    int freeN = 0;
+    if (cat_dir_of(dir, sizeof dir, dstName))
+        for (int s = 0; s < SS_SLOTS; s++) {
+            char p[MAX_PATH];
+            snprintf(p, sizeof p, "%s\\ff13-%02d.dat", dir, s);
+            if (!file_exists(p)) freeN++;
+        }
+    if (freeN < n) {
+        snprintf(msg, sizeof msg, ui_text(T_SEND_N_FULL), u8, freeN, n);
+        flash_say_c(msg, OVL_FLASH_OFF);
+        return 0;
+    }
+    range_clear();
+    int done = 0;
+    for (int i = 0; i < n; i++) {
+        if (!send_apply_from(m[i], dstName, move, 1)) break;
+        done++;
+    }
+    if (done < n) {
+        snprintf(msg, sizeof msg, ui_text(T_SEND_N_PART), done, n);
+        flash_say_c(msg, OVL_FLASH_OFF);
+        return 0;
+    }
+    ff13log("[FF13-SRP] send: %d save(s) -> '%s' (%s)\n", n, dstName, move ? "move" : "copy");
+    snprintf(msg, sizeof msg, ui_text(move ? T_SEND_N_MOVED : T_SEND_N_COPIED), n, u8);
+    flash_say(msg);
+    return 1;
+}
+
+// The one funnel: lsel_go and the send editor's commit both land here, so single and range cannot
+// be decided twice and one guard covers both. A copy is refused with the move -- its destination
+// can be a folder the switch journal is still moving. The mark survives a refusal.
+static int send_go(const char* dstName, int move) {
+    if (recovery_owns_saves()) {
+        ff13loga("[FF13-SRP] send: refused -- an unfinished renumber or switch owns these files\n");
+        flash_say_c(ui_text(T_SEND_FAIL), OVL_FLASH_OFF);
+        return 0;
+    }
+    // The predicate the rows are DRAWN with: on a ghost row the menu shows the single-save form,
+    // so the action must be that one. An anchor that is gone can never resolve again, so its mark
+    // is dropped here; a ghost under the CURSOR resolves once the cursor moves off, so it stands.
+    if (g_rangeAnchor >= 0) {
+        if (g_rangeShownN > 0) return send_range_apply(dstName, move);
+        if (!slot_mtime(g_rangeAnchor)) {
+            range_clear();
+            flash_say_c(ui_text(T_RANGE_GONE), OVL_FLASH_OFF);
+            return 0;
+        }
+    }
+    return send_apply_from(g_lselSlot, dstName, move, 0);
+}
+
+
+// ---- deleting the marked range ----------------------------------------------------------------
+// To the Recycle Bin behind two confirms, as a category goes (CODE_NOTES).
+#define RANGE_DEL_ARM_MS 8000
+static volatile int   g_delArm = 0;
+static volatile int   g_delArmN = 0;
+static volatile int   g_delArmAnchor = -1;   // the mark and the cursor it armed on: a re-pick disarms
+static volatile int   g_delArmSlot = -1;
+static volatile DWORD g_delArmUntil = 0;
+
+int range_del_armed(void) { return g_delArm; }
+int range_del_count(void) { return g_delArmN; }
+static void range_del_disarm(void) {
+    g_delArm = 0; g_delArmN = 0; g_delArmAnchor = -1; g_delArmSlot = -1;
+}
+
+static int slot_recycle(int slot) {
+    char sp[MAX_PATH], sb[MAX_PATH];
+    wchar_t w[MAX_PATH * 2 + 2];
+    if (!save_path_for(slot, sp, sizeof sp)) return 0;
+    int n = MultiByteToWideChar(CP_ACP, 0, sp, -1, w, MAX_PATH);
+    if (n <= 0) return 0;
+    if (bak_path_for(slot, sb, sizeof sb) && file_exists(sb)) {
+        int m = MultiByteToWideChar(CP_ACP, 0, sb, -1, w + n, MAX_PATH);
+        if (m > 0) n += m;
+    }
+    w[n] = 0;
+    return shell_recycle(w, sp);
+}
+
+static int range_del_apply(void) {
+    char msg[224];
+    int m[SS_SLOTS];
+    int n = range_members(m, SS_SLOTS);
+    if (n <= 0) {
+        range_clear();
+        flash_say_c(ui_text(T_RANGE_GONE), OVL_FLASH_OFF);
+        return 0;
+    }
+    if (recovery_owns_saves()) {
+        ff13loga("[FF13-SRP] delete: refused -- an unfinished renumber or switch owns these files\n");
+        flash_say_c(ui_text(T_DEL_FAIL), OVL_FLASH_OFF);
+        return 0;
+    }
+    int done = 0;
+    for (int i = 0; i < n; i++) {
+        if (!slot_recycle(m[i])) break;
+        slot_forget(m[i]);
+        done++;
+    }
+    if (done) {
+        sidecar_save_file(); mapsidecar_save(); datesidecar_save();
+        filter_menu_refresh();
+        // The last save of the filtered chapter may just have gone (the same guard a send keeps).
+        if (g_filterChapter && filter_count_of(g_filterChapter) <= 0) {
+            ff13log("[FF13-SRP] delete: chapter %d has no save left -- the whole list is shown\n",
+                    g_filterChapter);
+            filter_apply(0);
+            state_save();
+        }
+    }
+    range_clear();
+    ff13log("[FF13-SRP] delete: %d of %d save(s) to the recycle bin\n", done, n);
+    if (done < n) {
+        flash_say_c(ui_text(T_DEL_FAIL), OVL_FLASH_OFF);
+        return 0;
+    }
+    snprintf(msg, sizeof msg, ui_text(T_DEL_N_DONE), done);
+    flash_say(msg);
+    return 1;
+}
+
+// The first confirm arms, the second runs. It stands itself down (save_poll_tick), so callers only
+// ever press it.
+static int range_del_row(void) {
+    // Returning 1 keeps the menu open: 0 makes the caller close it, and the row the advice names
+    // goes with it. Tested with the predicate the row is DRAWN with, so a row drawn dim can never
+    // answer a confirm by deleting.
+    if (!range_del_ready()) {
+        range_del_disarm();
+        if (g_rangeAnchor < 0) {
+            flash_say_c(ui_text(T_DEL_NEED_RANGE), OVL_FLASH_OFF);
+        } else if (slot_mtime(g_rangeAnchor)) {
+            // the cursor end is the ghost: the mark stands (same split as send_go)
+            flash_say_c(ui_text(T_RANGE_ROW_GONE), OVL_FLASH_OFF);
+        } else {
+            range_clear();
+            flash_say_c(ui_text(T_RANGE_GONE), OVL_FLASH_OFF);
+        }
+        return 1;
+    }
+    if (!g_delArm || g_delArmAnchor != g_rangeAnchor || g_delArmSlot != g_lselSlot) {
+        char msg[224];
+        int n = g_rangeShownN;
+        g_delArm = 1; g_delArmN = n;
+        g_delArmAnchor = g_rangeAnchor; g_delArmSlot = g_lselSlot;
+        g_delArmUntil = GetTickCount() + RANGE_DEL_ARM_MS;
+        ff13log("[FF13-SRP] delete: %d save(s) picked -- confirm again to run\n", n);
+        { char ok[40]; tidy_ok_phrase(ok, sizeof ok);
+          snprintf(msg, sizeof msg, ui_text(T_LSEL_DEL_ARM), n, ok); }
+        flash_say_c(msg, OVL_FLASH_OFF);
+        return 1;                     // the menu stays open, that row now reading as the confirm
+    }
+    range_del_disarm();
+    int ok = range_del_apply();
+    g_lselOpen = 0;                   // the save it was opened on may not be there any more
+    return ok;
+}
 
 // ---- the save list's little menu: what can be done with the save under the cursor -------------
-// The slot is latched at open: the DirectInput gate keeps the game's cursor still while this is
-// up, so the row cannot change underneath it.
+// The slot is taken at open and then FOLLOWED (save_poll_tick): the input gate does not reach a
+// pad, so the game's cursor can move while this is up.
 static int send_apply_from(int src, const char* dstName, int move, int quiet);
 
 volatile int g_lselOpen = 0;
@@ -2398,13 +2863,26 @@ int lsel_open(void) {
     if (!label_edit_ready() || g_shownState != MAIN_STATE_LOAD) return 0;
     cat_list_refresh();
     g_lselSlot = g_shownSlot;
-    g_lselSel = LSEL_NOTE;
+    if (g_rangeAnchor >= 0 && !slot_mtime(g_rangeAnchor)) {
+        range_clear();
+        flash_say_c(ui_text(T_RANGE_GONE), OVL_FLASH_OFF);
+    }
+    // For the row text; save_poll_tick recounts on a cursor move, and each row that runs recounts.
+    g_rangeShownN = 0;
+    if (g_rangeAnchor >= 0) {
+        int m[SS_SLOTS], n = range_members(m, SS_SLOTS);
+        if (n > 0) g_rangeShownN = n;
+    }
+    g_lselSel = (g_rangeAnchor >= 0) ? LSEL_COPY : LSEL_NOTE;
     g_sendDest = 0;
     g_lselOpen = 1;
     ff13log("[FF13-SRP] save list: menu opened on save %d\n", g_lselSlot + 1);
     return 1;
 }
 void lsel_close(void) { g_lselOpen = 0; }
+// 1 = the delete row can run: it is the one row acting on more than the save under the cursor, and
+// what it would delete is what the send rows offer to send.
+int range_del_ready(void) { return g_rangeAnchor >= 0 && g_rangeShownN > 0; }
 
 // Title screen only: every row here re-stamps, renames or moves save files, and a running game
 // holds the ones it loaded from. STATE_LOAD is the title's own load list (MAINLOOP_HOOK.md); a
@@ -2429,6 +2907,7 @@ void menu_screen_tick(void) {
     static int at = -2;
     int st = main_state();
     if (st < 0 || st == at) return;
+    range_clear();                    // the list the mark pointed into left the screen with it
     int had = (g_ssOpen || g_lselOpen || g_labelEdit);
     if (at != -2)
         ff13logv("[FF13-SRP] main state %d -> %d%s\n", at, st,
@@ -2438,7 +2917,9 @@ void menu_screen_tick(void) {
     if (g_labelEdit) label_edit_finish(0);
     g_ssOpen = 0;
     lsel_close();
-    di_gate_lift();
+    // Not di_gate_lift: a key still down would reach the new screen as a fresh press (see
+    // menu_gate_release).
+    menu_gate_release();
 }
 // 1 = the row did something. An editor it opens draws above this menu, which stays open behind it.
 int lsel_go(void) {
@@ -2448,10 +2929,33 @@ int lsel_go(void) {
         flash_say_c(ui_text(T_LABEL_NO_WINDOW), OVL_FLASH_OFF);
         return 0;
     }
+    if (g_lselSel == LSEL_MARK) {
+        if (g_rangeAnchor >= 0) {
+            range_clear();       // the menu stays open; the send rows shrink back to one save
+            flash_say_c(ui_text(T_RANGE_CLEARED), OVL_FLASH_OFF);
+            return 1;
+        }
+        if (!slot_mtime(g_lselSlot)) {      // a ghost row: its save has already moved away
+            flash_say_c(ui_text(T_RANGE_GONE), OVL_FLASH_OFF);
+            return 0;
+        }
+        g_rangeAnchor = g_lselSlot;
+        // The menu stays up (the rows show the range grow as the game's cursor moves under it)
+        // and the cursor STAYS on this row, which now reads "clear the range": a second press is
+        // the undo, never a send -- on the copy row a double-press would ship the range.
+        int m0[SS_SLOTS], n0 = range_members(m0, SS_SLOTS);
+        g_rangeShownN = (n0 > 0) ? n0 : 0;
+        char msg[192];
+        snprintf(msg, sizeof msg, ui_text(T_RANGE_MARKED), g_lselSlot + 1);
+        flash_say(msg);
+        ff13log("[FF13-SRP] save list: range marked from save %d\n", g_lselSlot + 1);
+        return 1;
+    }
+    if (g_lselSel == LSEL_DEL) return range_del_row();
     int move = (g_lselSel == LSEL_MOVE);
     const char* pick = send_dest_pick();
     if (pick) {
-        int ok = send_apply_from(g_lselSlot, pick, move, 0);
+        int ok = send_go(pick, move);
         if (ok) g_lselOpen = 0;
         return ok;
     }
@@ -2587,15 +3091,7 @@ static int send_apply_from(int src, const char* dstName, int move, int quiet) {
         char sb[MAX_PATH];
         DeleteFileA(sp);
         if (bak_path_for(src, sb, sizeof sb)) DeleteFileA(sb);
-        // The same tables renum_slot_swap carries: one added there is cleared here too.
-        memset(&g_sidecar[src], 0, sizeof g_sidecar[src]);
-        g_slotMapN[src] = 0;
-        memset(g_slotMap[src], 0, sizeof g_slotMap[src]);
-        memset(g_slotA18[src], 0, sizeof g_slotA18[src]);
-        g_slotHasA18[src] = 0;
-        g_slotLoc[src] = 0; g_slotHasLoc[src] = 0;
-        g_bakKnown[src] = 0;
-        memset(&g_dateRow[src], 0, sizeof g_dateRow[src]);
+        slot_forget(src);
         sidecar_save_file(); mapsidecar_save(); datesidecar_save();
         filter_menu_refresh();
         // The last save of the filtered chapter may just have left (same guard as a switch).
@@ -2648,15 +3144,18 @@ static void seed_remove(const char* dir) {
 void cat_edit_tick(void) {
     if (!g_labelEdit || g_editMode == EDIT_LABEL || !g_editDone) return;
     int commit = g_editDone, rename = (g_editMode == EDIT_CAT_RENAME),
-        send = (g_editMode == EDIT_CAT_SEND);
-    g_labelEdit = 0; g_editDone = 0; g_editMode = EDIT_LABEL;
-    if (commit < 0) return;
+        send = (g_editMode == EDIT_CAT_SEND), all = (g_editMode == EDIT_CAT_NEW_ALL);
+    g_editDone = 0;
+    if (commit < 0) { g_labelEdit = 0; g_editMode = EDIT_LABEL; return; }
     char name[CATNAME_BYTES];
     int bad = catname_commit_check(name, sizeof name, rename);
     if (bad) {
-        flash_say_c(ui_text(bad == 2 ? T_SS_CAT_EXISTS : T_SS_CAT_BADNAME), OVL_FLASH_OFF);
+        // The editor stays up with the reason drawn in it: closing here would throw the typed name
+        // away and put the message far from where the editor was.
+        g_editBad = (bad == 2) ? EDIT_BAD_EXISTS : EDIT_BAD_NAME;
         return;
     }
+    g_labelEdit = 0; g_editMode = EDIT_LABEL;
     if (send) {
         char sendCats[MAX_PATH], sendDir[MAX_PATH];
         if (!cats_root(sendCats, sizeof sendCats) || !cat_dir_of(sendDir, sizeof sendDir, name)) {
@@ -2669,7 +3168,9 @@ void cat_edit_tick(void) {
             flash_say_c(ui_text(T_SEND_FAIL), OVL_FLASH_OFF);
             return;
         }
-        if (send_apply_from(g_lselSlot, name, g_sendPendMove, 0)) { g_lselOpen = 0; cat_list_refresh(); }
+        // A failed range send may leave part-copies behind: RemoveDirectoryA refuses a non-empty
+        // dir, so those survive for the log to point at rather than vanishing with the category.
+        if (send_go(name, g_sendPendMove)) { g_lselOpen = 0; cat_list_refresh(); }
         else RemoveDirectoryA(sendDir);
         return;
     }
@@ -2696,10 +3197,23 @@ void cat_edit_tick(void) {
     }
     // Seeded BEFORE the switch, so the switch carries it in like any parked file: at zero saves the
     // title drops its LOAD GAME entry and only re-grows it when the title is re-entered (measured).
-    int seed = newest_active_slot();
-    if (seed >= 0) send_apply_from(seed, name, 0, 1);
-    if (cat_switch(name)) g_ssOpen = 0;
-    else { seed_remove(dir); RemoveDirectoryA(dir); }
+    if (all) {
+        // The tables have to be on disk before they are copied: cat_switch flushes them too, but
+        // that is after this, and the copies would carry whatever the last write left behind.
+        sidecar_save_file(); mapsidecar_save(); datesidecar_save();
+        int c = cat_copy_all(dir);
+        if (c < 0) {
+            seed_remove(dir); RemoveDirectoryA(dir);
+            flash_say_c(ui_text(T_SS_CAT_FAIL), OVL_FLASH_OFF);
+            return;
+        }
+        ff13log("[FF13-SRP] category: '%s' seeded with %d file(s) copied from '%s'\n",
+                name, c, g_catCur);
+    } else {
+        int seed = newest_active_slot();
+        if (seed >= 0) send_apply_from(seed, name, 0, 1);
+    }
+    if (!cat_switch(name)) { seed_remove(dir); RemoveDirectoryA(dir); }
 }
 
 // ---- the three entry points the merged worker calls ----
@@ -2759,12 +3273,49 @@ void save_install_hooks(void) {
 #define SAVE_FIX_DELAY_TICKS        (2000 / HK_POLL_MS)    // let the game flush the .dat first
 #define SAVE_BAK_SWEEP_TICKS        (2000 / HK_POLL_MS)    // how often the deleted-save watch looks
 
+// The save loop's own two edge states. At file scope because the editor branch in the worker
+// `continue`s past save_poll_tick: left frozen, a key held across an editor session fires as fresh
+// the tick it closes -- and a save hotkey firing by itself opens the game's save screen.
+static int g_saveKeyWas = 0, g_camKeyWas = 0;
+void save_keys_step(void) {
+    hk_edge(g_saveVk, &g_saveKeyWas);
+    if (g_camUnstickVk) hk_edge(g_camUnstickVk, &g_camKeyWas);
+}
+
+// The cursor CAN move under the list menu: the gate only reaches devices made through our
+// DirectInput proxy, and a pad is not one of them (measured). So the menu follows the row the game
+// says it is drawing; every row acts on g_lselSlot, and acting on a save that left the screen
+// would be silent and wrong. The recount stays HERE and not in the draw: range_members stats
+// every slot, ~100 file stats a call.
+void lsel_follow_now(void) {
+    if (g_lselOpen && g_shownState == MAIN_STATE_LOAD
+        && g_shownSlot >= 0 && g_shownSlot != g_lselSlot) {
+        ff13logv("[FF13-SRP] save list: the cursor moved to save %d under the menu\n",
+                 g_shownSlot + 1);
+        g_lselSlot = g_shownSlot;
+        g_rangeShownN = 0;
+        if (g_rangeAnchor >= 0) {
+            int m[SS_SLOTS], n = range_members(m, SS_SLOTS);
+            if (n > 0) g_rangeShownN = n;
+        }
+    }
+}
+
 // One tick of the save-anywhere loop, called from the hotkey thread's poll. Edge detection is on the
 // MSB (currently-down) via hk_edge; GetAsyncKeyState's LSB "recently pressed" bit was not latching.
 void save_poll_tick(DWORD now) {
-    (void)now;
+    lsel_follow_now();
+    // The delete confirm stands down on its own -- the row moved, the pick changed, the menu
+    // closed, or the window lapsed. Here rather than at each of those callers, so none can miss it.
+    if (g_catDelArm >= 0 && (!g_ssOpen || g_ssSel != SS_CAT_DEL || g_catDelArm != g_catSel
+                             || (int)(g_catDelUntil - now) <= 0))
+        cat_del_disarm();
+    // ...and the range one likewise, on its own row and its own mark. A cleared mark takes it
+    // through range_clear, so what is left here is the row moving, the menu going, and the lapse.
+    if (g_delArm && (!g_lselOpen || g_lselSel != LSEL_DEL || g_delArmAnchor != g_rangeAnchor
+                     || g_delArmSlot != g_lselSlot || (int)(g_delArmUntil - now) <= 0))
+        range_del_disarm();
     static uint32_t lSave = 0, lLoad = 0, lRestore = 0, lCpb = 0;
-    static int f8_was = 0;
     // restore state machine: wait for the field to settle after a load, then
     // cluster_restore to the saved position.
     static int restorePending = 0, restoreTicks = 0, stableCnt = 0;
@@ -2891,15 +3442,15 @@ void save_poll_tick(DWORD now) {
     // ---- save hotkey = open the "save anywhere" screen: capture the leader position + zone, then
     //      set openSaveFlag so the 0x40FA50 cave calls the interactive save entry on the next yield.
     // ---- camera un-stick hotkey (manual): arm the FSM state 4->2 force (consumed on the game thread) ----
-    if (g_camUnstickVk) { static int cu_was = 0;
-      if (hk_edge(g_camUnstickVk, &cu_was)) {
+    if (g_camUnstickVk) {
+      if (hk_edge(g_camUnstickVk, &g_camKeyWas)) {
 #ifdef FF13_DIAG
           camera_state_dump("unstick");
 #endif
           g_camUnstickN = 3;   // force free-follow for ~3 frames (on_postcam / game thread)
       }
     }
-    if (hk_edge(g_saveVk, &f8_was)) {
+    if (hk_edge(g_saveVk, &g_saveKeyWas)) {
       int zs = field_zone_state();
       if (zs != 3) {   // not FIELD_IDLE: event/battle/transition -> unresumable save
         flash_say(ui_text(T_SAVE_FIELD_ONLY));

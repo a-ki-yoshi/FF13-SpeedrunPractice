@@ -80,9 +80,17 @@ int hk_edge(UINT b, int* was);
 #define OFF_MAXHP     0x6C8   // max HP       (int32, direct dword; no indirection)
 #define OFF_GUARD324  0x324   // enemy guard  (int32) -- the cave's enemy gate (party=0 / enemy!=0)
 #define OFF_DEFEATED  0x259   // byte; bit 0x02 = defeated
-#define OFF_TEAM      0x24E   // byte; bit 0x04 = this actor is on the enemy side
+#define OFF_TEAM      0x24E   // byte of the actor flags; bit 0x04 is NOT a side test (measured set on
+                              // party actors too). Use OFF_GUARD324 for enemy-or-not.
 #define OFF_LIFECYCLE 0x270   // dword of eight nibbles; bits 12-15 = lifecycle (1 alive / 3 dead)
 #define OFF_ACTOR_NAME 0x1A40 // charaspec name, 16 bytes NUL-padded (read off the placement join)
+// The actor's numeric statuses: five layers of 64 ints embedded here, read as
+// *(int*)(actor + 0x2C4 + layer*0x100 + idx*4) (0x4B5150). Chara::getStatus (0x472430) reads
+// layer 4 and applies the buffs on top of what it finds, so this slot is the UNBUFFED value and a
+// buff still scales what is written here. Indexes are fake/Party.java's ST_* constants.
+#define OFF_ACTOR_STATS  0x2C4
+#define ACTOR_STAT_LAYER 4
+#define ST_ATK_PHY       5    // Chara::getAtkPhy (0x472310) is getStatus(5): damage AND the UI
 // Read span bounds-checked before touching an actor.
 #define ACTOR_SPAN    (OFF_MAXHP + 4)
 // ---- BattleMain state: read only by the overlay, to hide field-only lines during a battle ----
@@ -195,7 +203,7 @@ int hk_edge(UINT b, int* was);
 #define RVA_CAM_RECENTER 0x236A20     // VA 0x636A20  __thiscall recenter(this)
 #define RVA_WIDESHOT 0x1A5807     // VA 0x5A5807
 #define RVA_GETCAM 0x2C0880       // VA 0x6C0880  void __cdecl getCurrentCamera(float out[16])
-#define OVL_FLASH_OFF  0xFFA3A8A8   // status flash   : something switched off
+#define OVL_FLASH_OFF  0xFFC4CFCF   // status flash   : something switched off
 
 // ---- shared types ----
 typedef struct { const char* name; float x, y, z; } ff13_enemy;
@@ -301,6 +309,9 @@ extern UINT g_boVk;
 extern UINT g_saveVk;
 extern UINT g_camUnstickVk;
 extern UINT g_ssVk;
+extern UINT g_menuOkVk;
+extern UINT g_listPrevVk;
+extern UINT g_listNextVk;
 extern volatile int g_hkFocusOnly;
 extern volatile int g_killMode;
 extern volatile unsigned char g_battleOverlay;
@@ -432,6 +443,7 @@ void __cdecl on_layout_on (uint32_t c);
 void __cdecl on_layout_off(uint32_t c);
 void __cdecl on_screen_env(uint32_t vmctx);
 int vm_get_work(int idx);
+int vm_capacity_level(void);        // Party.getCapacityLevel(): the Crystarium stage, -1 = unknown
 void vm_set_work(int idx, int val);
 void vm_set_event_flag(const char* name, int on);
 int vm_get_event_flag(const char* name);
@@ -446,6 +458,17 @@ int  vm_top_menu_get(void);
 const char* zone_state_name(int st);
 int scene_win_at_checkpoint(uint32_t btsc);
 const signed char (*scene_decks(uint32_t btsc, int* n))[3];
+// A stat the story hands a fight that a pick cannot bring with it; NULL for most fights. It goes to
+// the fight's ONLY party member, so a fight with more than one is refused rather than guessed at.
+// The row must NOT fire on top of the story's own step: `setup` is the initSetupParty stage left in
+// globalWork[210] and `capLv` is the Crystarium stage that same step sets -- either one standing is
+// enough, the first catching it inside a session, the second across a reload.
+typedef struct {
+    uint16_t btsc; unsigned char stat; short add; int setup; int capLv;
+} ff13_scene_stat;
+#define SETUP_PROGRESS_WORK 210     // initSetupParty's own "applied up to here" (BattleMemberDebug)
+const ff13_scene_stat* scene_stat(uint32_t btsc);
+int battle_resolved(void);          // nonzero once the fight has resolved (before the state ends)
 extern const uint8_t P_OPTREG[6];
 extern const uint8_t P_OPTSET[6];
 extern const uint8_t P_OPTCLR[6];
@@ -488,6 +511,12 @@ void ctl_hold(void);
 void di_gate_arm(void);
 int  di_gate_left_ms(void);
 void di_gate_lift(void);
+// Hand the game one keystroke THROUGH a live gate: the gate hands it a zeroed keyboard every read,
+// so a byte set in that buffer is a key the game believes is down. DirectInput indexes the keyboard
+// by scan code, not VK.
+#define DIK_LEFT   0xCB
+#define DIK_RIGHT  0xCD
+void di_fake_dik(int dik, DWORD ms);
 int  ctl_force_on(void);
 void ctl_unlock(void);
 void vm_start_battle(const char* arena, uint32_t flags, uint32_t btsc);
@@ -689,8 +718,20 @@ extern const uint8_t P_AITARGET[11];
 void __cdecl on_ai_target(uint32_t esp);
 // The status-effect roll, one fork before it draws (common/docs/STATUS_ROLL_RE.md).
 #define RVA_STATROLL  0xA5597        // VA 0x4A5597
+#define RVA_STATLAND  0xA55D1        // VA 0x4A55D1: the store the roll's compare falls through to,
+                                     // and the only "it landed" the dice can reach
 extern const uint8_t P_STATROLL[7];
 void __cdecl on_status_roll(uint32_t esp);
+extern const uint8_t P_STATLAND[7];
+void __cdecl on_status_land(uint32_t esp);
+// The hit-reaction resist roll, the same shape one layer out (common/docs/LAUNCH_ROLL_RE.md).
+#define RVA_LAUNCH    0xA7E79        // VA 0x4A7E79
+#define RVA_LAUNCHRES 0xA7ECD        // VA 0x4A7ECD: the store that downgrades the reaction, and the
+                                     // only "it did not go up" the dice can reach
+extern const uint8_t P_LAUNCH[8];
+void __cdecl on_launch_roll(uint32_t esp);
+extern const uint8_t P_LAUNCHRES[11];
+void __cdecl on_launch_resist(uint32_t esp);
 void __cdecl on_ai_afterexec(uint32_t ctx);
 void __cdecl on_spec_replace(uint32_t ecx, uint32_t name);
 extern volatile int      g_homeHave;
@@ -798,16 +839,19 @@ void save_install_hooks(void);
 void save_poll_tick(DWORD now);
 // save-list sort menu: srp_save.c owns the state and the work, dllmain.c polls the keys and
 // holds the DirectInput gate while it is open, srp_overlay.c draws it.
-#define SS_MODES 8
+#define SS_MODES 10
+extern int g_sortMode;           // the sort last chosen (0 asc / 1 desc / 2 number); state.dat "sort"
 // Menu order, and g_ssSel indexes it. save_sort_apply subtracts SS_STORY_ASC to get back to the
 // sort mode ss_collect/ss_stamp know (0 asc, 1 desc, 2 by number), so the three sort rows have to
 // stay adjacent and in that order.
 #define SS_FILTER 0
 #define SS_CAT_PICK 1
 #define SS_CAT_NEW 2
-#define SS_CAT_RENAME 3
-#define SS_STORY_ASC 4           // 4..6 are the three sort rows
-#define SS_RENUM 7
+#define SS_CAT_NEW_ALL 3
+#define SS_CAT_RENAME 4
+#define SS_CAT_DEL 5
+#define SS_STORY_ASC 6           // 6..8 are the three sort rows
+#define SS_RENUM 9
 extern volatile int g_ssOpen;
 extern volatile int g_ssSel;
 extern volatile int g_filterChapter;     // 0 = every chapter
@@ -831,6 +875,12 @@ int steam_cloud_on(void);
 extern volatile int g_labelEdit;
 extern volatile int g_labelEditSlot;
 const wchar_t* label_edit_text(void);
+// What is wrong with the editor's text right now (0 = nothing). INPUT comes from typing and the
+// next keystroke clears it; the other two come from a refused commit and stand until the name
+// changes -- the editor stays open on them.
+#define EDIT_BAD_INPUT  1
+#define EDIT_BAD_EXISTS 2
+#define EDIT_BAD_NAME   3
 int  label_edit_bad(void);
 int  label_edit_ready(void);      // is the save list showing a row right now?
 int  label_edit_open(void);
@@ -842,6 +892,7 @@ int  label_edit_tick(char* what, size_t n);
 #define EDIT_CAT_NEW    1
 #define EDIT_CAT_RENAME 2
 #define EDIT_CAT_SEND   3         // naming the category a save is being sent to
+#define EDIT_CAT_NEW_ALL 4        // ...a new category seeded with EVERY save, not just the newest
 int  edit_mode(void);
 // ---- save categories: the whole save directory, parked in and out of
 // <save dir>\categories\<name>\.
@@ -854,7 +905,11 @@ const char* cat_name_cur(void);   // the category in use, UTF-8
 const char* cat_name_sel(void);   // ...the switch target likewise, or NULL when none is picked
 const char* cat_pick(void);       // that target as the filesystem spells it (what cat_switch takes)
 int  cat_switch(const char* target);
-int  cat_edit_open(int rename);
+// The delete row's hold: the first one arms the confirm, the next one deletes. It stands itself
+// down (save_poll_tick), so callers only ever press it.
+int  cat_del_hold(void);
+int  cat_del_armed(void);         // 1 = that row is waiting for the second hold
+int  cat_edit_open(int mode);     // EDIT_CAT_NEW / EDIT_CAT_NEW_ALL / EDIT_CAT_RENAME
 void cat_edit_tick(void);
 
 // ---- the save list's chooser ------------------------------------------------------------------
@@ -862,14 +917,24 @@ void cat_edit_tick(void);
 #define LSEL_NOTE 0
 #define LSEL_COPY 1
 #define LSEL_MOVE 2
-#define LSEL_ROWS 3
+#define LSEL_MARK 3
+#define LSEL_DEL  4
+#define LSEL_ROWS 5
 extern volatile int g_lselOpen;
 extern volatile int g_lselSel;
 extern volatile int g_lselSlot;
+int  range_anchor(void);        // -1 = no range mark, else the slot it starts from
+int  range_shown_count(void);   // members as of the last cursor move, for the row text
+int  range_del_ready(void);     // 0 = drawn but cannot run: no mark, or one that will not resolve
+int  range_del_armed(void);     // 1 = it is waiting for the second hold
+int  range_del_count(void);     // ...over this many saves, counted when it armed
 int  lsel_open(void);
 void lsel_close(void);
+void lsel_follow_now(void);       // sync the menu to the row the game shows; call before acting
 void menu_screen_tick(void);      // closes our menus when the game changes screen under them
 int  lsel_go(void);
+void menu_gate_release(void);     // dllmain.c: lift the gate once no gated key is still down
+void save_keys_step(void);        // advance the save loop's edge states without acting on them
 
 // ---- send the save under the list's cursor to another category --------------------------------
 extern volatile int g_sendDest;   // 0..cat_count()-1 = a parked category, cat_count() = a new one
@@ -881,6 +946,7 @@ extern volatile unsigned char g_helpOpen;
 void flash_say_c(const char* s, DWORD col);
 void flash_say(const char* s);
 void vk_label(UINT b, char* out, size_t n);
+void tidy_ok_phrase(char* out, size_t n);
 int overlay_in_battle(void);
 int read_via_ptr(unsigned ptrRva, int off);
 void overlay_init(void);

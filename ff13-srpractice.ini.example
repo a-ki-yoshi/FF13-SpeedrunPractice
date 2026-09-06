@@ -2,10 +2,14 @@
 ; Rename to ff13-srpractice.ini, place next to ffXiiiimg.exe. All keys optional (defaults below). Details in the README.
 
 [hotkeys]
-; キーは F1..F24 / 英字 / 数字 / 生の0xNNコード(Enter=0x0D、Backspace=0x08、Space=0x20)。
-; Ctrl+ / Shift+ / Alt+ を前に付けられる(例: Ctrl+Shift+T)。EscとFnは使えない。offで無効化。
-; A key is F1..F24, a letter, a digit, or a raw 0xNN code (Enter = 0x0D, Backspace = 0x08, Space = 0x20),
-; alone or behind Ctrl+ / Shift+ / Alt+ (e.g. Ctrl+Shift+T). Esc and Fn cannot be used; off = disabled.
+; キーはF1..F24 / 英字 / 数字 / キー名(Enter, Space, Tab, Backspace, Up, Down, Left, Right,
+; Home, End, PageUp, PageDown, Insert, Delete) / 生の0xNNコード。
+; Ctrl+ / Shift+ / Alt+ を前に付けられる(例: Ctrl+Shift+T)。EscとFnは使えない。
+; 無効にするには値を空にする(例: warp =)。
+; A key is F1..F24, a letter, a digit, a key name (Enter, Space, Tab, Backspace, Up, Down, Left,
+; Right, Home, End, PageUp, PageDown, Insert, Delete), or a raw 0xNN code,
+; alone or behind Ctrl+ / Shift+ / Alt+ (e.g. Ctrl+Shift+T). Esc and Fn cannot be used.
+; To unbind a key, leave its value empty (e.g. warp =).
 
 ; require_focus: 1=FF13のウィンドウがアクティブなときだけ有効。0=無条件で有効。
 ; require_focus: 1 = only while the FF13 window is active. 0 = always, even in the background.
@@ -29,6 +33,14 @@ picker_left    = 0x25
 picker_right   = 0x27
 cancel         = 0x08
 
+; セーブ整理メニュー用。menu_ok=決定(メニュー表示中はゲームがキーを受け取らないので重なっても安全)、
+; list_prev/list_next=操作対象のセーブを選ぶ。メニュー自体の移動は上のpicker_up/downのまま。
+; For the save/tidy menus. menu_ok confirms (sharing the game's key is safe -- a menu up means the game sees no keyboard);
+; list_prev/list_next pick which save the menu acts on. The menus themselves still move on picker_up/down above.
+menu_ok        = Enter
+list_prev      = A
+list_next      = D
+
 [overlay]
 ; Modが表示する文字の言語: auto | jp | en。
 ; What the mod draws is in: auto (follow the game) | jp | en.
@@ -40,20 +52,14 @@ language = auto
 multiplier = 3.0
 
 [battle_picker]
-; 任意戦闘呼び出し。ここは何も設定しなくても動く。
-; The battle picker. Nothing here needs setting for it to work.
-
 ; 戦闘の曲が入るまでの無音の長さ。0〜8000ms。
 ; Silence before a picked fight's own track comes in, 0..8000 ms.
 bgm_delay_ms = 1200
 
 [save]
-; どこでもセーブ。ここは何も設定しなくても動く。
-; Save anywhere. Nothing here needs setting for it to work.
-
-; ゲームのセーブ一覧で、ホットキー保存の番号の右に付ける印(「セーブデータ 01*」)。最大8文字。offと書く(または空にする)と付けない。
+; ゲームのセーブ一覧で、どこでもセーブで作成したデータの番号の右に付ける印(「セーブデータ 01*」)。最大8文字。値を空にすると付けない。
 ; 全角文字も使用可能。数字は不可。
-; Mark a hotkey save after its number in the game's save list ("Save Data 01*"). Max 8 chars; write off (or leave it empty) for no mark.
+; Mark a save made with save-anywhere after its number in the game's save list ("Save Data 01*"). Max 8 chars; leave it empty for no mark.
 ; Full-width characters are fine; digits are not.
 list_mark = *
 ; ff13-NN.datがあるディレクトリ。空 = 自動検出。

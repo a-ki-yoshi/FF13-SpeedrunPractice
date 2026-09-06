@@ -46,6 +46,21 @@ int di_gate_left_ms(void) {
 }
 void di_gate_lift(void) { g_diGate = 0; }
 
+// One key the game is allowed to see while the gate is up (srp_internal.h). Written by the hotkey
+// thread, read by the game's -- both plain volatile ints, and a torn read costs at worst one
+// keystroke. It rides the gate's own zeroing pass, so it exists only while the gate does.
+static volatile int   g_diFakeDik   = 0;
+static volatile DWORD g_diFakeUntil = 0;
+void di_fake_dik(int dik, DWORD ms) {
+    g_diFakeUntil = GetTickCount() + ms;
+    g_diFakeDik   = dik;
+}
+static int di_fake_live(void) {
+    if (!g_diFakeDik) return 0;
+    if ((int)(GetTickCount() - g_diFakeUntil) >= 0) { g_diFakeDik = 0; return 0; }
+    return 1;
+}
+
 static int di_gated(void) {
     if (!g_diGate) return 0;
     if ((int)(GetTickCount() - g_diGateUntil) >= 0) { g_diGate = 0; return 0; }
@@ -120,8 +135,12 @@ static HRESULT __stdcall di_hook_state(void* dev, DWORD cb, void* buf) {
     }
     switch (g_diDev[di].kind) {
     case DI_KIND_KBD:
+        memset(buf, 0, cb);                            // every key up...
+        if (di_fake_live() && (DWORD)g_diFakeDik < cb) // ...except the one we are handing over
+            ((uint8_t*)buf)[g_diFakeDik] = 0x80;
+        break;
     case DI_KIND_MOUSE:
-        memset(buf, 0, cb);                            // keys up; relative axes still
+        memset(buf, 0, cb);                            // buttons up; relative axes still
         break;
     case DI_KIND_PAD:
         // DIJOYSTATE/DIJOYSTATE2 both lay out 8 axis LONGs at 0, 4 POV DWORDs at 32 (centred is
