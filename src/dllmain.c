@@ -711,6 +711,12 @@ static DWORD WINAPI worker(LPVOID unused) {
     (g_tpOk ? ff13logv : ff13loga)("[FF13-SRP] TP get/set @0x%08X/0x%08X: %s\n", (unsigned)(g_base + RVA_TPGET),
              (unsigned)(g_base + RVA_TPSET),
              g_tpOk ? "OK" : "never matched -> TP a picked fight spends stays spent");
+    // The battle result store's own clear, called once per pick (see btres_clear_for_pick).
+    g_btresOk = wait_for_bytes(g_base + RVA_BTRES_CLEAR, P_BTRES_CLEAR, (int)sizeof(P_BTRES_CLEAR), 15000) >= 0;
+    (g_btresOk ? ff13logv : ff13loga)("[FF13-SRP] battle result store clear @0x%08X: %s\n",
+             (unsigned)(g_base + RVA_BTRES_CLEAR),
+             g_btresOk ? "OK (emptied before every pick)"
+                       : "never matched -> a fifth pick of a chain's second half can crash the game");
     // Libra is neither called nor hooked: the arrays are read and written directly and the only
     // code borrowed is the lock the Datalog's own accessors take, so it is that pair that gets
     // checked. The Datalog pointer itself is read fresh every time (see libra_datalog).

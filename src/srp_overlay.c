@@ -541,7 +541,8 @@ int overlay_in_battle(void) {
 // QueryPerformanceCounter, so game-speed (which warps the game clock) does not distort it.
 #define OFF_BM_GAMETIME 0x60     // [BM+0x60] = in-game battle timer (ms)
 // Fight-boundary signals (same source; module-relative RVAs, deref then offset).
-#define RVA_TARGET_PTR  0x242B060 // [g_base+..] -> ptr; +0x3C = target (nonzero once a fight resolves)
+#define RVA_TARGET_PTR  RVA_BTRESDB_PTR // db_bt_result: +0x3C = sheet 0's target, nonzero once a fight
+                                        // resolves. Every pick zeroes it (btres_clear_for_pick).
 #define OFF_TARGET      0x3C
 #define RVA_ENEMYPT_PTR 0x23FD20C // [g_base+..] -> ptr; +0x12C = enemy_point (clears when fight ends)
 #define OFF_ENEMYPT     0x12C

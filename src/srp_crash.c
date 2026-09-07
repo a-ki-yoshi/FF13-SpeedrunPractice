@@ -45,7 +45,7 @@ static void crash_write(const char* s) {
 
 // A module name + RVA if the address is in one, otherwise what the memory itself is. A hook cave
 // is VirtualAlloc'd, so it belongs to no module and this is the only thing that names it.
-static void addr_where(uintptr_t a, char* out, size_t n) {
+void addr_where(uintptr_t a, char* out, size_t n) {
     HMODULE m = NULL;
     if (a && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
                                 | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,

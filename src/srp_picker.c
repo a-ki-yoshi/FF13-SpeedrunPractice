@@ -17,6 +17,10 @@
  */
 
 #include "srp_internal.h"
+#ifdef FF13_DIAG
+static void trk_audit(const char* when);
+#endif
+static void btres_clear_for_pick(uint32_t btsc);
 
 // ============================ BATTLE PICKER (call up any fight in this zone) ==================
 // Threading: everything that touches game state runs from bs_pump() on the GAME thread (called from
@@ -888,8 +892,8 @@ static int librakeep_count(uint32_t btsc) {
 }
 
 // The kept rows that also keep the paradigm the fight ENDS on in hand: the first half of a
-// back-to-back pair whose second half opens on it in the story. User-specified; btsc09041 was not
-// asked for, and btsc07037's next fight changes the party.
+// back-to-back pair whose second half opens on it in the story. User-specified; btsc09041's second
+// half resets the paradigm in the story, and btsc07037's next fight changes the party.
 static const uint16_t kSelKeepMode[] = { 3032, 4026 };
 #define SEL_KEEPMODE_N ((int)(sizeof(kSelKeepMode)/sizeof(kSelKeepMode[0])))
 
@@ -2450,6 +2454,10 @@ static void bs_start_selected(void) {
         return;
     }
     uint32_t want = g_bsList[g_bsSel];
+#ifdef FF13_DIAG
+    trk_audit("pick");
+#endif
+    btres_clear_for_pick(want);
     // Everything the staging asks for is a call the game itself would only make on a settled field,
     // so how long the field has been up belongs in a report.
     ff13logv("[FF13-SRP] battle picker: the loading indicator went down %lums ago\n",
@@ -3597,6 +3605,39 @@ const uint8_t P_TPSET[12] = {0x55,0x8B,0xEC,0x8B,0x45,0x08,0x50,0xE8,0x44,0xEA,0
 typedef int  (__cdecl *tpGet_t)(void);
 typedef void (__cdecl *tpSet_t)(int tp);
 
+// The store is FOUR sheets deep and battle init (0x4D49E0) leaves it alone when the scene's bit 34
+// (scene+0x252 & 4, a chain's second half) is set -- so every pick empties it, or the fifth such
+// pick runs off its end (crash report, reproduced; CODE_NOTES).
+const uint8_t P_BTRES_CLEAR[14] = {0x55,0x8B,0xEC,0x83,0xEC,0x08,0x6A,0x00,0x8B,0x0D,0x60,0xB0,0x82,0x02};
+typedef void (__cdecl *btresClear_t)(void);
+volatile int g_btresOk = 0;
+static int btres_level(void) {
+    uintptr_t p = g_base + RVA_BTRESDB_PTR;
+    if (!g_base || IsBadReadPtr((void*)p, 4)) return -1;
+    uint32_t db = *(uint32_t*)p;
+    if (!db || IsBadReadPtr((void*)(uintptr_t)(db + OFF_BTRES_LEVEL), 4)) return -1;
+    return *(int*)(uintptr_t)(db + OFF_BTRES_LEVEL);
+}
+// Game thread, on the field, before the fight is staged: the store's lock asserts it is not held.
+static void btres_clear_for_pick(uint32_t btsc) {
+    static int saidUnreadable = 0;
+    if (!g_btresOk) return;
+    int lvl = btres_level();
+    if (lvl < 0) {
+        if (!saidUnreadable) {
+            saidUnreadable = 1;
+            ff13loga("[FF13-SRP] battle picker: the battle result store cannot be read -- not emptied, "
+                     "so a fifth pick of a chain's second half can still crash the game\n");
+        }
+        return;
+    }
+    ((btresClear_t)(uintptr_t)(g_base + RVA_BTRES_CLEAR))();
+    if (lvl > 0)
+        ff13log("[FF13-SRP] battle picker: the battle result store held %d fight(s) -- emptied for "
+                "btsc%05u, as battle init does for any fight that is not a chain's second half\n",
+                lvl, btsc);
+}
+
 // Libra -- what a fight teaches about the enemies in it -- is the third thing a picked fight leaves
 // behind, and the only one that has to be put back DOWNWARDS: nothing spends it, so there is no
 // "give back what was taken" to do; the fight simply knows more afterwards.
@@ -4509,6 +4550,108 @@ static void enc_slots_watch(void) {
              "%d, t=%lu)\n", a, b, c, bits, ltype, field_zone_state(), (unsigned long)GetTickCount());
     lastA = a; lastB = b; lastC = c; lastBits = bits; lastL = ltype;
 }
+
+// ---- the game's leak tracker, walked the way free() (0x83FD30 -> 0xBB8550) walks it ----------
+// One hash set of every tracked block's 16-byte header {vtbl, next, prev, flags}: 0x80 buckets x
+// 12 bytes, chained on next. The walk is under the game's own mutex; the layout is in CODE_NOTES.
+#define RVA_TRK_MUTEXP  0x241E250
+#define RVA_TRK_MUTEX   0x241E238     // the object 0x83FAE0 stores at RVA_TRK_MUTEXP
+#define RVA_TRK_ENABLED 0x241E254
+#define RVA_TRK_TOTAL   0x241E258
+#define RVA_TRK_TABLE   0x241E260
+#define RVA_TRK_VTBL    0xCD5894      // VA 0x10D5894: what 0x83FC00 writes into every header
+#define RVA_TRK_FIND    0x7B8550      // VA 0xBB8550: the walk this one copies
+#define RVA_MTX_LOCK    0x409D30      // __thiscall(mutex, int tag)  ret 4
+#define RVA_MTX_UNLOCK  0x409D80      // __thiscall(mutex)
+#define TRK_BUCKETS     0x80
+#define TRK_STEP_CAP    4000000
+typedef void (__thiscall *mtxLock_t)(void* m, int tag);
+typedef void (__thiscall *mtxUnlock_t)(void* m);
+static const uint8_t P_MTX_LOCK[9]   = {0x55,0x8B,0xEC,0x83,0xEC,0x08,0x89,0x4D,0xF8};
+static const uint8_t P_MTX_UNLOCK[7] = {0x55,0x8B,0xEC,0x51,0x89,0x4D,0xFC};
+static const uint8_t P_TRK_FIND[9]   = {0x55,0x8B,0xEC,0x83,0xEC,0x10,0x89,0x4D,0xF0};
+
+static int trk_verify(void) {
+    static int state = 0;
+    if (state) return state > 0;
+    if (!g_base) return 0;
+    int ok = !IsBadReadPtr((void*)(g_base + RVA_MTX_LOCK), sizeof P_MTX_LOCK)
+          && !memcmp((void*)(g_base + RVA_MTX_LOCK), P_MTX_LOCK, sizeof P_MTX_LOCK)
+          && !IsBadReadPtr((void*)(g_base + RVA_MTX_UNLOCK), sizeof P_MTX_UNLOCK)
+          && !memcmp((void*)(g_base + RVA_MTX_UNLOCK), P_MTX_UNLOCK, sizeof P_MTX_UNLOCK)
+          && !IsBadReadPtr((void*)(g_base + RVA_TRK_FIND), sizeof P_TRK_FIND)
+          && !memcmp((void*)(g_base + RVA_TRK_FIND), P_TRK_FIND, sizeof P_TRK_FIND)
+          && !IsBadReadPtr((void*)(g_base + RVA_TRK_MUTEXP), 4)
+          && *(uintptr_t*)(g_base + RVA_TRK_MUTEXP) == g_base + RVA_TRK_MUTEX
+          && !IsBadReadPtr((void*)(g_base + RVA_TRK_TABLE), TRK_BUCKETS * 12);
+    state = ok ? 1 : -1;
+    if (!ok)
+        ff13loga("[FF13-SRP] DIAG tracker: the leak tracker is not where this build expects it -- "
+                 "not walked\n");
+    return ok;
+}
+
+static void trk_audit(const char* when) {
+    static int saidOff = 0;
+    if (!trk_verify()) return;
+    if (!*(volatile uint32_t*)(g_base + RVA_TRK_ENABLED)) {
+        if (!saidOff) {
+            saidOff = 1;
+            ff13loga("[FF13-SRP] DIAG tracker(%s): the game's leak tracker is OFF\n", when);
+        }
+        return;
+    }
+    void* mtx = *(void**)(g_base + RVA_TRK_MUTEXP);
+    uint32_t goodVt = (uint32_t)(g_base + RVA_TRK_VTBL);
+    ((mtxLock_t)(g_base + RVA_MTX_LOCK))(mtx, 0);
+    uintptr_t table = g_base + RVA_TRK_TABLE;
+    int nodes = 0, longest = 0, zombies = 0, steps = 0, zn = 0;
+    char zl[3][300];
+    for (int b = 0; b < TRK_BUCKETS; b++) {
+        uint32_t node = *(uint32_t*)(table + b * 12);
+        int len = 0;
+        while (node && steps++ < TRK_STEP_CAP) {
+            if (IsBadReadPtr((void*)(uintptr_t)node, 16)) {
+                zombies++;
+                if (zn < 3) snprintf(zl[zn++], sizeof zl[0],
+                                     " -- zombie: node %08X in bucket %d is unmapped", node, b);
+                break;
+            }
+            uint32_t vt = *(uint32_t*)(uintptr_t)node;
+            if (vt != goodVt) {
+                zombies++;
+                if (zn < 3) {
+                    char w[100], f[100];
+                    uint32_t fn = IsBadReadPtr((void*)(uintptr_t)vt, 4) ? 0 : *(uint32_t*)(uintptr_t)vt;
+                    addr_where(vt, w, sizeof w);
+                    addr_where(fn, f, sizeof f);
+                    snprintf(zl[zn++], sizeof zl[0],
+                             " -- zombie: node %08X in bucket %d: vtbl=%08X (%s), slot0=%08X (%s), "
+                             "next=%08X flags=%08X", node, b, vt, w, fn, f,
+                             *(uint32_t*)(uintptr_t)(node + 4), *(uint32_t*)(uintptr_t)(node + 12));
+                }
+                break;                           // its next is not to be trusted
+            }
+            nodes++; len++;
+            node = *(uint32_t*)(uintptr_t)(node + 4);
+        }
+        if (len > longest) longest = len;
+    }
+    uint32_t total = *(uint32_t*)(g_base + RVA_TRK_TOTAL);
+    ((mtxUnlock_t)(g_base + RVA_MTX_UNLOCK))(mtx);
+    // db_bt_result's sheet in use: 0 or 1 after a pick (btres_clear_for_pick), up to 3 in a story chain.
+    int dbLevel = btres_level();
+    ff13loga("[FF13-SRP] DIAG tracker(%s): %d nodes, longest bucket %d, %u bytes tracked, "
+             "%d zombie(s), db_bt_result level %d%s%s%s%s\n", when, nodes, longest, total, zombies,
+             dbLevel, steps >= TRK_STEP_CAP ? " (walk capped -- a cycle?)" : "",
+             zn > 0 ? zl[0] : "", zn > 1 ? zl[1] : "", zn > 2 ? zl[2] : "");
+}
+static void trk_watch(DWORD now) {
+    static DWORD nextAt = 0;
+    if (nextAt && (int)(now - nextAt) < 0) return;
+    nextAt = now + 20000;
+    trk_audit("tick");
+}
 #endif
 
 // ---- a pause menu that will not close --------------------------------------------------------
@@ -4586,6 +4729,9 @@ static void refund_watch(void) {
     if (g_restartUntil) return;                  // the restart above has not even been asked for yet
     if (field_zone_state() == 3) {                  // FIELD_IDLE: whatever the way back was, it is over
         g_refundUntil = 0;
+#ifdef FF13_DIAG
+        trk_audit("back on the field");
+#endif
         items_give_back();
         tp_give_back();
 #ifdef FF13_DIAG
@@ -5559,7 +5705,12 @@ static void pump_battle_live(DWORD now) {
         bm_timeline(now);
         cam_pump(g_bsStarted, now);
         if (inb) {
-            if (!g_bsInFight) ctl_unlock();    // the battle owns input now; the field gets its back
+            if (!g_bsInFight) {
+                ctl_unlock();                  // the battle owns input now; the field gets its back
+#ifdef FF13_DIAG
+                trk_audit("battle up");
+#endif
+            }
             g_bsInFight = 1;
             // Read while the fight is up, not at fight-over: the game's own put-back lands at
             // fight-over, and whether that is before or after the battle state clears is not
@@ -5572,6 +5723,9 @@ static void pump_battle_live(DWORD now) {
         }
         else if (g_bsInFight) {
             uint32_t fought = g_bsStarted;
+#ifdef FF13_DIAG
+            trk_audit("fight over");
+#endif
             // Only when the game itself said nothing -- its own count is better than this guess.
             // Same reason as mark_field_result above: a fight we emptied ourselves is not evidence
             // about what this zone can field.
@@ -5884,6 +6038,7 @@ void bs_pump(void) {
 #ifdef FF13_DIAG
     form_watch();                      // ahead of the early return: a fight outlives the load
     enc_slots_watch();
+    trk_watch(now);
     deck_sel_watch();
 #endif
     if (pump_touch_due(now)) return;   // still loading the pick -- the steps below would read half of it

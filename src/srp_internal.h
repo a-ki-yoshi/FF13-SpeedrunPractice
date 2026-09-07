@@ -190,6 +190,9 @@ int hk_edge(UINT b, int* was);
 #define RVA_ITEMCOUNT 0x7268E0      // VA 0xB268E0  __cdecl getItemCount(const char id[16]) -> int
 #define RVA_ITEMGIVE  0x7268C0      // VA 0xB268C0  __cdecl addItem(const char id[16], int n, int f)
 #define RVA_TPGET     0x7272E0      // VA 0xB272E0  __cdecl getTp(void) -> int
+#define RVA_BTRES_CLEAR 0x0FB880    // VA 0x4FB880  __cdecl void(void): empties db_bt_result under its lock
+#define RVA_BTRESDB_PTR 0x242B060   // VA 0x282B060 -> db_bt_result (the battle result store; the overlay reads sheet 0 through it too)
+#define OFF_BTRES_LEVEL 0x2C        // sheets in use, 0..3; the 4 sheets are 0x208 each from +0x30
 #define RVA_TPSET     0x7272F0      // VA 0xB272F0  __cdecl setTp(int)
 #define RVA_LOCK_ENTER  0x11B50     // VA 0x00411B50  __thiscall(lock, int tag)  ret 4
 #define RVA_LOCK_LEAVE  0x11BD0     // VA 0x00411BD0  __thiscall(lock)
@@ -317,6 +320,7 @@ extern volatile int g_killMode;
 extern volatile unsigned char g_battleOverlay;
 extern int  g_logLevel;
 void crash_report_install(void);
+void addr_where(uintptr_t a, char* out, size_t n);
 void crash_report_rearm(void);
 extern int    g_gsStepN;
 extern volatile int g_gsStep;
@@ -766,11 +770,13 @@ extern const uint8_t P_ITEMTAKE [6];
 extern const uint8_t P_ITEMCOUNT[7];
 extern const uint8_t P_ITEMGIVE [7];
 extern const uint8_t P_TPGET[8];
+extern const uint8_t P_BTRES_CLEAR[14];
 extern const uint8_t P_TPSET[12];
 extern const uint8_t P_LOCKENTER[9];
 extern const uint8_t P_LOCKLEAVE[7];
 extern volatile int   g_itemOk;
 extern volatile int   g_tpOk;
+extern volatile int   g_btresOk;
 void __cdecl on_item_take(uint32_t esp);
 extern volatile int g_libraOk;
 extern const uint8_t P_LOADSHOW[6];
