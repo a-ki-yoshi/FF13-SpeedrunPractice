@@ -12,7 +12,7 @@
 # setter hook, activate-variant probes, verbose applyHPDelta logger):
 #     FF13_DIAG=1 ./build.sh
 set -euo pipefail
-here="$(cd "$(dirname "$0")" && pwd)"            # <repo>/sr_practice/src or <repo>/src
+here="$(cd "$(dirname "$0")" && pwd)"            # <monorepo>/<mod>/src or <repo>/src
 if [ -d "$here/../../common/lib" ]; then
     lib="$(cd "$here/../../common/lib" && pwd)"
     libspec="../../common"                       # what the dirty-tree check watches
@@ -40,8 +40,9 @@ EXTRA="$EXTRA -DFF13_BUILD_ID=\"$rev\""
     -o "$out/dinput8.dll" \
     "$here/dllmain.c" "$here/srp_proxy.c" "$here/srp_core.c" "$here/srp_speed.c" \
     "$here/srp_battle.c" "$here/srp_picker.c" "$here/srp_warp.c" "$here/srp_overlay.c" \
-    "$here/srp_save.c" "$here/srp_crash.c" \
-    "$lib/ff13_hook.c" "$lib/ff13_crypt.c" "$here/dinput8.def" \
+    "$here/srp_save.c" "$here/srp_crash.c" "$here/srp_setup.c" \
+    "$lib/ff13_hook.c" "$lib/ff13_crypt.c" "$lib/ff13_ini.c" "$lib/ff13_keys.c" "$lib/ff13_steamcloud.c" \
+    "$here/dinput8.def" \
     "$out/version.res" \
     -lkernel32 -luser32 -lgdi32 -ladvapi32 -lshell32 -lole32
 echo "built: $out/dinput8.dll${EXTRA:+ (with $EXTRA)}"

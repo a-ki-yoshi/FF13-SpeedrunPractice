@@ -87,7 +87,7 @@ static volatile int g_emptyN = 0;
 // hook on load completion, on the game's own thread.
 #define BS_PRELOAD_CAP_MS 8000
 // A cap that expires while the probe still says "not resident" starts a fight whose models are
-// missing; the extension is bounded so BS_GIVEUP_MS stays the outer wall. Measured: CODE_NOTES.
+// missing; the extension is bounded so BS_GIVEUP_MS stays the outer wall. Measured.
 #define BS_PRELOAD_STEP_MS      1000
 // Long enough that a load which is only just starting reads as "not read" on the next poll.
 #define BS_PROBE_SETTLE_MS 400
@@ -117,8 +117,8 @@ static volatile int   g_selWant = -1;            // ...and the one the field is 
 static volatile int   g_selRestoreDue = 0;       // ...and whether the field still owes it back
 static volatile DWORD g_selRestoreFrom = 0;
 // One pass over a fight's drop rows, run at pick time and again at the touch hand-off. The
-// second pass is insurance, not a cure: the 2026-08-27 residual objects were the STAGE17 append,
-// not a failed deactivate (CODE_NOTES, the 12091 addenda).
+// second pass is insurance, not a cure: objects left on a picked fight's field came from the
+// save-anywhere cell append, not a failed deactivate.
 static int field_drops_apply(uint32_t btsc) {
     int dn = 0;
     const ff13_fielddrop* fd = field_drops(btsc, &dn);
@@ -267,10 +267,10 @@ const ff13_btsc_info* btsc_info(uint32_t btsc) {
     return NULL;
 }
 
-// Everything btsc_picker.tsv says about one fight. Any output may be NULL if you do not want it;
-// each comes back empty (name NULL, sort UNSET, tag "") when the TSV is silent about this fight.
+// Everything the picker table says about one fight. Any output may be NULL if you do not want it;
+// each comes back empty (name NULL, sort UNSET, tag "") when the picker table is silent about this fight.
 // `mode` is which row of a fight that has more than one: 0 for the fight itself, 1..n for a fight
-// the picker offers once per form (see kAiForms). The TSV carries a row per form and the header is
+// the picker offers once per form (see kAiForms). The picker table carries a row per form and the header is
 // sorted on the pair, so one search key covers both.
 void btsc_hand(uint32_t btsc, int mode, const unsigned short** jp, const char** en,
                       unsigned* order, const unsigned short** tag, int* kind) {
@@ -560,9 +560,9 @@ void zb_remember_sel(uint32_t zone, uint32_t btsc, int mode) {
     zb_save();
 }
 
-// One row's place in the list. `order` is where the row sits in btsc_picker.tsv, and that file's row
+// One row's place in the list. `order` is where the row sits in the picker table, and that file's row
 // order IS the list's order -- there is no sort key to keep in step with it. `rank` only decides
-// between fights the TSV does not mention at all.
+// between fights the picker table does not mention at all.
 typedef struct { uint16_t order; uint8_t rank; uint16_t btsc; } bs_key;
 static int bs_key_cmp(const void* a, const void* b) {
     const bs_key* x = (const bs_key*)a;
@@ -581,7 +581,7 @@ static void bs_scan(void) {
     uint32_t b = zb_lookup(zone);
     uint32_t band = (b != 0xFFFFFFFFu) ? b * 1000
                   : (g_lastBtscId ? (g_lastBtscId / 1000) * 1000 : 0);
-    // Ordered by hand first (btsc_picker.tsv's sort column), then by kind, then by number.
+    // Ordered by hand first (the picker table's sort column), then by kind, then by number.
     // A band is not a zone: Gran Pulse's nine zones share btsc11xxx, so a fight is kept only when a
     // character set of THIS zone holds its models (scene_belongs_here). Skipped when the zone is
     // unknown or has no sets in the table, since then the answer would be "none of them".
@@ -598,7 +598,7 @@ static void bs_scan(void) {
         unsigned order = FF13_BTSC_ORDER_LAST;
         btsc_hand(id, 0, NULL, NULL, &order, NULL, NULL);
 #ifdef FF13_HAVE_BTSC_NAMES
-        // The TSV IS the list: a fight it does not mention is not shown, which is how the test
+        // The picker table IS the list: a fight it does not mention is not shown, which is how the test
         // battles and dev-only bands are kept out. Without the header there is no file to consult,
         // so everything the zone can field is listed.
         if (order == FF13_BTSC_ORDER_LAST) continue;
@@ -620,7 +620,7 @@ static void bs_scan(void) {
         int want = 1 + aimode_count(keys[i].btsc);
         if (want > 1 + FORMS_MAX) want = 1 + FORMS_MAX;
         if (rows + want > BS_MENU_MAX) { over += want; continue; }
-        // Inside the set, the TSV's row order decides too: mode N indexes kAiForms, and every form
+        // Inside the set, the picker table's row order decides too: mode N indexes kAiForms, and every form
         // row carries its own `order`. A form the file never names sorts last, keeping its mode
         // order among the other unnamed ones.
         uint8_t var[1 + FORMS_MAX];
@@ -653,8 +653,8 @@ static void bs_scan(void) {
             if (!en) missing++;
         }
         if (missing)
-            ff13logv("[FF13-SRP] battle picker: %d of %d fights here have no English name in "
-                     "sr_practice/data/btsc_picker.tsv -- those rows show the Japanese one\n",
+            ff13logv("[FF13-SRP] battle picker: %d of %d fights here have no English name -- "
+                     "those rows show the Japanese one\n",
                      missing, n);
     }
     int wantMode = 0;
@@ -701,7 +701,7 @@ const uint8_t P_SPECREPL[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x20,0x02,0x00,0x00};
 // The last charaspec put on each SCENE OBJECT (the id at actor+8). The object outlives the fight
 // and the next one binds a fresh actor to it, so the shape it was left in is what carries over --
 // neither the actor (recycled) nor the scene (two objects of one enemy end in different forms) is
-// the key (measured; CODE_NOTES).
+// the key (measured).
 #define OBJFORM_N 16
 static struct { uint32_t obj; char nm[SPEC_NAME_LEN + 1]; DWORD at; } g_objForm[OBJFORM_N];
 #define OFF_ACTOR_OBJ 0x08           // the actor's scene object id; -1 = none
@@ -733,7 +733,7 @@ static const char* obj_form_left(uint32_t actor) {
 }
 
 // The fights that offer a form, and the charaspec each form is. Picker mode 1..n indexes `forms`;
-// the label in btsc_picker.tsv and the charaspec installed here come from the same row.
+// the label in the picker table and the charaspec installed here come from the same row.
 // `acts` is the same forms one step upstream: the ability the AI runs to change form. Redirect the
 // ABILITY, not just the charaspec -- a charaspec redirected on its own leaves the element the player
 // sees unchanged, because that comes from the ability's own effects.
@@ -744,7 +744,7 @@ static const char* obj_form_left(uint32_t actor) {
 static const struct { uint16_t btsc; const char* base;
                       const char* forms[FORMS_MAX]; const char* acts[FORMS_MAX];
                       const char* aim[FORMS_MAX]; const uint8_t flag[FORMS_MAX]; } kAiForms[] = {
-    // Mode N means "the Nth entry here", and that binding is the only thing btsc_picker.tsv has to
+    // Mode N means "the Nth entry here", and that binding is the only thing the picker table has to
     // keep. Row order in the file decides where a row is shown, so these can stay in any order.
     { 6046, "m097", { "m097_i",     "m097_f",     "m097_t",     "m097_w"     },   // ice / fire /
                     { "m097_ac510", "m097_ac500", "m097_ac520", "m097_ac530" },   // lightning / water
@@ -759,7 +759,7 @@ static const struct { uint16_t btsc; const char* base;
     // a roll, so WHICH part is hit is a separate question from which buff lands.
     // The parts are per-party: m301 is the one on Lightning's side, m303 the one on Snow's. Nothing
     // in the data names a side. The other two parts are reachable the same way and simply not
-    // listed; add a row here and in btsc_picker.tsv if they are ever wanted.
+    // listed; add a row here and in the picker table if they are ever wanted.
     { 9055, "m300", { NULL },
                     { "m300_mg000", "m300_mg000", "m300_mg010", NULL, NULL, NULL },
                     { "m301",       "m303",       NULL,         NULL, NULL, NULL },
@@ -770,7 +770,7 @@ static const struct { uint16_t btsc; const char* base;
 // ---- miss pin: the debuff that will not land -------------------------------------------------
 // Shares the form pin's mode numbering: a fight is in one mode table, never two. The roll itself is
 // left alone and the CHANCE it is about to be compared against is written instead -- see
-// on_status_roll and common/docs/STATUS_ROLL_RE.md.
+// on_status_roll.
 #define DBF_MAX 4
 #define DBF_UNTIL_MAX 4
 #define ST_DEPROTECT 29        // db/resident/status_effect.wdb "sys29"
@@ -785,7 +785,7 @@ static const struct { uint16_t btsc; uint8_t status[DBF_MAX];
                       const char* base; const char* until[DBF_UNTIL_MAX];
                       uint8_t scale[DBF_MAX]; } kDbfMiss[] = {
     // Sunleth Waterscape. The counts are per enemy and are what the user asked to rehearse, not
-    // anything the fight imposes; btsc_picker.tsv's row labels spell them out and must agree.
+    // anything the fight imposes; the picker table's row labels spell them out and must agree.
     { 5027, { ST_DEPROTECT, ST_DEPROTECT },
             { "m234", "m233" },                        // 1 = Enki, 2 = Enlil
             {  5,      3     }, NULL, { NULL } },
@@ -811,7 +811,7 @@ static const struct { uint16_t btsc; uint8_t status[DBF_MAX];
 // ---- launch pin: the break reaction that will not lift ---------------------------------------
 // The fourth mode table, sharing the numbering of the three around it. `scale` is the percent of the
 // launch's real success rate to keep, for the whole fight -- as kDbfMiss's scale, except that what
-// is scaled is an integer resistance, not a float chance. See common/docs/LAUNCH_ROLL_RE.md.
+// is scaled is an integer resistance, not a float chance.
 #define LAU_MAX 4
 static const struct { uint16_t btsc; const char* on[LAU_MAX]; uint8_t scale[LAU_MAX]; } kLauMiss[] = {
     // Eden, the Proudclad's second fight. Launch is one roll against the target's blast resistance,
@@ -903,6 +903,30 @@ static int selkeep_count(uint32_t btsc) {
     return 0;
 }
 
+// ---- aim pin: one named attack put on one party member, from the enemy's Nth aimed action on ----
+// The fifth mode table, sharing the numbering of the four above. The AI picks its target before it
+// names the attack, and some sheets name no target at all, so the bend is where the decision is
+// carried out (on_ai_run). `count` are the attacks that count as aimed, as each goes through.
+#define AIM_COUNT_MAX 4
+static const struct { uint16_t btsc; const char* base; const char* act; const char* who;
+                      const char* count[AIM_COUNT_MAX]; uint8_t after; } kAimPin[] = {
+    // Garuda Interceptor #2 (m048_s1, breaking into m048_s2): Shock Breath on Vanille from its third
+    // aimed action on. Barrier (ac400..ac403) aims at itself and is not counted. One row per
+    // mode, in mode order.
+    { 3038, "m048", "m048_ac100", "pc004", { "m048_ac000", "m048_ac100", "m048_ac200" }, 2 },
+};
+#define AIM_PIN_N ((int)(sizeof(kAimPin)/sizeof(kAimPin[0])))
+static volatile int g_aimPin = 0;      // kAimPin index + 1 while armed; armed last
+static volatile int g_aimN = 0;        // aimed actions gone through this fight
+static volatile int g_aimPending = 0;  // the pinned attack is queued and has not gone through yet
+
+static int aimpin_count(uint32_t btsc) {
+    int n = 0;
+    for (int i = 0; i < AIM_PIN_N; i++)
+        if (kAimPin[i].btsc == (uint16_t)btsc) n++;
+    return n;
+}
+
 // How many choices this fight offers, 0 for "it has none".
 static int aimode_count(uint32_t btsc) {
     for (int i = 0; i < AI_FORMS_N; i++) {
@@ -916,6 +940,8 @@ static int aimode_count(uint32_t btsc) {
     n = laumiss_count(btsc);
     if (n) return n;
     n = openmode_count(btsc);
+    if (n) return n;
+    n = aimpin_count(btsc);
     return n ? n : librakeep_count(btsc);
 }
 
@@ -1025,7 +1051,19 @@ static void aipin_arm(uint32_t btsc, int mode) {
     g_openPin = 0; g_openBent = 0; g_openSkip = 0;
     g_openIgn = 0; g_openDecided = 0; g_openWho = 0; g_openAimed = 0;
     g_openAimOn[0] = 0;
+    g_aimPin = 0; g_aimN = 0; g_aimPending = 0;
     g_libraKeepPick = 0; g_selKeepPick = 0;
+    for (int i = 0, m = 0; i < AIM_PIN_N; i++) {
+        if (kAimPin[i].btsc != btsc) continue;
+        if (++m != mode) {
+            if (m >= aimpin_count(btsc)) return;
+            continue;
+        }
+        g_aimPin = i + 1;
+        ff13logv("[FF13-SRP] aim pin: btsc%05u mode %d armed -- \"%s\" on %s from %s's aimed action %d on\n",
+                 btsc, mode, kAimPin[i].act, kAimPin[i].who, kAimPin[i].base, kAimPin[i].after + 1);
+        return;
+    }
     if (librakeep_count(btsc)) {
         if (mode != 1) return;
         g_libraKeepPick = 1;
@@ -1178,6 +1216,65 @@ uint32_t* actor_table(void) {
     if (!tbl || IsBadReadPtr((void*)(uintptr_t)tbl, ACTOR_SLOTS * 4)) return NULL;
     return (uint32_t*)(uintptr_t)tbl;
 }
+
+#ifdef FF13_DIAG
+// Each party actor of a picked fight, twice a second: the offsets inside it holding a world position
+// at the party's height (found once, on first sight) and the ATB, to tell a character the game is
+// not moving from one being put back.
+#define AW_SLOTS 16
+#define AW_SCAN  0x3000
+static struct { uint32_t a; int off[4]; int noff; } g_aw[AW_SLOTS];
+static struct { uint32_t a; float p[3]; } g_awOpen[AW_SLOTS];   // what on_place_join handed each actor
+static int g_awOpenN = 0;
+static void aw_open_note(uint32_t a, const float* p) {
+    if (g_awOpenN >= AW_SLOTS) g_awOpenN = 0;
+    g_awOpen[g_awOpenN].a = a; memcpy(g_awOpen[g_awOpenN].p, p, sizeof g_awOpen[0].p); g_awOpenN++;
+}
+static uint32_t g_awFight = 0;
+static DWORD g_awNext = 0;
+static int g_awLines = 0;
+void actor_watch_tick(void) {
+    if (!g_bsStarted || !g_awOpenN) return;
+    DWORD now = GetTickCount();
+    if ((int)(now - g_awNext) < 0 || g_awLines >= 900) return;
+    if (g_awFight != g_bsStarted) {
+        memset(g_aw, 0, sizeof g_aw);
+        g_awFight = g_bsStarted; g_awLines = 0;
+        ff13logv("[FF13-SRP] actor watch: running on btsc%05u, %d actor(s) seen opening\n",
+                 (unsigned)g_bsStarted, g_awOpenN);
+    }
+    g_awNext = now + 500;
+    char nm[SPEC_NAME_LEN + 1];
+    for (int i = 0; i < g_awOpenN && i < AW_SLOTS; i++) {
+        uint32_t a = g_awOpen[i].a;
+        if (!actor_name_of(a, nm) || nm[0] != 'p' || nm[1] != 'c') continue;
+        if (IsBadReadPtr((void*)(uintptr_t)a, AW_SCAN)) continue;
+        if (g_aw[i].a != a) {
+            g_aw[i].a = a; g_aw[i].noff = 0;
+            const float* f = (const float*)(uintptr_t)a;
+            const float* op = g_awOpen[i].p;
+            for (int k = 0; k + 2 < AW_SCAN / 4 && g_aw[i].noff < 4; k++) {
+                float dx = f[k] - op[0], dy = f[k + 1] - op[1], dz = f[k + 2] - op[2];
+                if (dx != dx || dy != dy || dz != dz) continue;
+                if (dx * dx + dy * dy + dz * dz > 0.25f) continue;
+                g_aw[i].off[g_aw[i].noff++] = k * 4;
+            }
+            ff13logv("[FF13-SRP] actor watch: \"%s\" @%08X -- %d position candidate(s)\n",
+                     nm, (unsigned)a, g_aw[i].noff);
+        }
+        char line[400]; int o = 0;
+        o += snprintf(line + o, sizeof line - o, "[FF13-SRP] actor watch: %s atb=%d",
+                      nm, *(volatile int*)(uintptr_t)(a + OFF_CHARA_ATB));
+        for (int c = 0; c < g_aw[i].noff; c++) {
+            const float* p = (const float*)(uintptr_t)(a + g_aw[i].off[c]);
+            o += snprintf(line + o, sizeof line - o, "  +%04X=(%.2f %.2f %.2f)", g_aw[i].off[c],
+                          (double)p[0], (double)p[1], (double)p[2]);
+        }
+        ff13logv("%s\n", line);
+        g_awLines++;
+    }
+}
+#endif
 
 // -> the actor whose charaspec starts with `name`, and its slot through *slot. Prefix rather than an
 // exact match, because a boss can change spec mid-fight (m300 -> m300_hard) and still be the actor.
@@ -1510,7 +1607,7 @@ const uint8_t P_RESOLVETGT[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x80,0x01,0x00,0x00};
 #define actor_id_slot(id)  ((int)(int16_t)((uint32_t)(id) & 0xFFFFu))
 
 // An actor carries its own handle at +0x16C, where the game's own target selectors read it and
-// store it back (ENEMY_AI_TARGET_RE.md 4). It is COPIED, never rebuilt from a slot -- a handle
+// store it back. It is COPIED, never rebuilt from a slot -- a handle
 // assembled out of a tag learned from some other id was wrong on hardware and the game ignored the
 // write.
 #define OFF_ACTOR_ID 0x16C
@@ -1640,6 +1737,7 @@ static void aipin_battle_over(void) {
     g_dbfLandN = 0;
     g_dbfUntilAct[0] = 0; g_dbfUntilSeen = 0;
     g_lauOn[0] = 0; g_lauScale = 0; g_lauRollN = 0; g_lauDownN = 0;
+    g_aimPin = 0; g_aimN = 0; g_aimPending = 0;
     if (!g_formBase[0] && !g_aimHoldUntil) return;
     g_formWant[0] = 0; g_formAct[0] = 0; g_formAim[0] = 0; g_formBase[0] = 0;
     g_formUntil = 0; g_formActBent = 0; g_formAimUntil = 0; g_formSwapEnds = 0;
@@ -1658,16 +1756,16 @@ static void aipin_battle_over(void) {
 const uint8_t P_ABILLABEL[9] = {0x55,0x8B,0xEC,0x81,0xEC,0xAC,0x00,0x00,0x00};
 
 // The AI's own count of the attacks it has got out, low 7 bits, raised by AFTER_COUNTER_ADD_1
-// (ENEMY_AI_TARGET_RE.md 2). Logged, never acted on: it LAGS a go by one (measured), and a build
+// Logged, never acted on: it LAGS a go by one (measured), and a build
 // that counted goes by it put the pattern one attack late.
 #define OFF_AI_ACTCNT (0x1370 + 0x5B0)
 
-// Where apiAiSetEnemyTarget leaves the handle it drew (ENEMY_AI_TARGET_RE.md 3): the script sets
+// Where apiAiSetEnemyTarget leaves the handle it drew: the script sets
 // the target BEFORE it returns the ability name, so the field is already filled in by the time the
 // name reaches the door below. An entry that defers the draw to AFTER_TARGET_0 (Tail Hammer) never
 // is.
 #define OFF_AI_TARGET  (0x1360 + 0x598)
-#define OFF_BS_LEADER  0x154         // the leader's handle (BATTLE_API_RE.md command 9)
+#define OFF_BS_LEADER  0x154         // the leader's handle (battle API command 9)
 // The three party slots, and the SAME array the target lot draws from (0x4EB460, and command 40's
 // getRoleCount). Do NOT use bs+0x164/0x168 for this: those two read back as summon actors.
 #define OFF_BS_PARTY   0x16C
@@ -1756,8 +1854,7 @@ static int read_cstr_safe(uint32_t p, char* out, int cap) {
 // Battle.apiAiPushEnemyAfterExecArgs (0xBC3300): arguments come off the VM operand stack at
 // [ctx+0x114], one 8-byte slot each with the value in the second dword, in REVERSE of the order the
 // script writes them -- k0 int argc, k1 int argv, k2 str argc, k3 str argv, k4 enemy id, k5 kind.
-// Filled BEFORE the ability name is returned, so the name door cannot reach it
-// (ENEMY_AI_FLAGS_RE.md 2).
+// Filled BEFORE the ability name is returned, so the name door cannot reach it.
 const uint8_t P_AIAFTER[6] = {0x55,0x8B,0xEC,0x83,0xEC,0x4C};
 #define VM_ARG_STACK 0x114
 #define VM_ARG(a, k) ((a)[2 * (k) + 1])
@@ -1792,8 +1889,7 @@ void __cdecl on_ai_afterexec(uint32_t ctx) {
 }
 
 // The condition dispatcher's join (0x558031): the hooked instruction is the mov that loads the
-// answer into eax, so writing [esp+0x2C98] here decides the condition. Frame layout and the rules
-// that come with it: ENEMY_AI_FLAGS_RE.md 3.9.
+// answer into eax, so writing [esp+0x2C98] here decides the condition.
 const uint8_t P_AICOND[7] = {0x8B,0x84,0x24,0x98,0x2C,0x00,0x00};
 
 // The AI state setter, 0x549D40(this, state); state 9 = the action went through.
@@ -1802,7 +1898,19 @@ const uint8_t P_AISTATE[6] = {0x55,0x8B,0xEC,0x83,0xEC,0x30};
 
 // IsBadReadPtr costs a page probe, and this runs on every condition the battle AI evaluates:
 // measured, it drops frames. Do not put one back.
-static int prb_ptr_ok(uint32_t p) { return p >= 0x10000u && p < 0x7FFF0000u; }
+// The top is the OS's, not 2 GB: a large-address-aware exe (the 4GB patch) on 64-bit Windows hands
+// out heap above 0x80000000.
+static uint32_t g_prbTop;
+static int prb_ptr_ok(uint32_t p) {
+    if (!g_prbTop) {
+        SYSTEM_INFO si; GetSystemInfo(&si);
+        g_prbTop = (uint32_t)(uintptr_t)si.lpMaximumApplicationAddress;
+    }
+#ifdef FF13_DIAG
+    diag_ptr_seen(p);
+#endif
+    return p >= 0x10000u && p <= g_prbTop - 0x10000u;   // room for the field offsets read past p
+}
 
 // The one enemy the AI overrule below applies to. The condition kinds are generic -- every sheet
 // spends them on something of its own -- so widening this rewrites AI nobody has looked at.
@@ -1815,7 +1923,6 @@ static char g_actLast[ACT_NAME_LEN + 1];   // the ability the AI last named, for
 // overruled, never a share of rolls: the element change is what a FAILED roll produces, so a roll
 // that cannot fail stops the element cycling altogether. Neither rate is the rate that comes out --
 // a forced decision still dies to a hit before the gauge can pay -- so calibrate by measuring.
-// Values, and what each one cost to find: CODE_NOTES / ENEMY_AI_FLAGS_RE.md 3.9.
 #define EXTRA_FORCE_PCT 25
 // Aim the grant at one of the two rolls: the sheet asks the 30% one first, so answering the first
 // roll yes makes every forced extra the plain attack (measured, 10 of 10).
@@ -2098,9 +2205,184 @@ void __cdecl on_launch_resist(uint32_t esp) {
                  nm, *(int32_t*)(uintptr_t)(esp + LAU_REGIST), g_lauDownN, g_lauRollN);
 }
 
+// The AI block sits at chara+0x1360; [aiblk+0x600] is the chara's standing target ([chara+0x1960],
+// what 0x473A00 reads), and the ordinary decision (0x5495C0) queues the attack it just named with
+// 0x47D820 against that standing target. So the bend is the standing target, just before that call:
+// later doors only move it for the NEXT attack (hardware, twice).
+#define AIB_FROM_CHARA    0x1360
+#define OFF_AIB_STANDING  0x600
+#define OFF_AIB_LABEL     0x618   // the attack being carried out, 16 chars, NUL-padded
+#define OFF_AIB_LABEL_LEN 16
+// 0x5498A0: push 0 / push 0 / push 0 / lea eax,[ebp-0x18] -- the three zeros and the name of the
+// 0x47D820 call. The frame is esp = ebp-0xB8 here (nothing outstanding), so the AI block
+// ([ebp-0xB4]) is [esp+4] and the attack's name key ([ebp-0x18]) is at esp+0xA0.
+const uint8_t P_AIQUEUE[9] = {0x6A,0x00,0x6A,0x00,0x6A,0x00,0x8D,0x45,0xE8};
+#define AIQ_AIBLK  0x04
+#define AIQ_LABEL  0xA0
+
+// -> the handle of the party member whose charaspec is `who`, or 0.
+static uint32_t aim_member(const char* who) {
+    uint32_t bs = battle_sys();
+    if (!bs || IsBadReadPtr((void*)(uintptr_t)(bs + OFF_BS_LEADER), 4)
+            || IsBadReadPtr((void*)(uintptr_t)(bs + OFF_BS_PARTY), 3 * 4)) return 0;
+    uint32_t* tbl = actor_table();
+    if (!tbl) return 0;
+    uint32_t h[4];
+    h[0] = *(uint32_t*)(uintptr_t)(bs + OFF_BS_LEADER);
+    memcpy(&h[1], (const void*)(uintptr_t)(bs + OFF_BS_PARTY), 3 * 4);
+    char nm[SPEC_NAME_LEN + 1];
+    for (int i = 0; i < 4; i++) {
+        if ((int32_t)h[i] < 0) continue;
+        int s = actor_id_slot(h[i]);
+        if (s < 0 || s >= ACTOR_SLOTS || !actor_name_of(tbl[s], nm)) continue;
+        if (!strcmp(nm, who)) return h[i];
+    }
+    return 0;
+}
+
+void __cdecl on_ai_queue(uint32_t esp) {
+    int k = g_aimPin - 1;
+    if (k < 0 || !prb_ptr_ok(esp)) return;
+    uint32_t aib = *(uint32_t*)(uintptr_t)(esp + AIQ_AIBLK);
+    if (!prb_ptr_ok(aib) || aib < AIB_FROM_CHARA) return;
+    uint32_t* tbl = actor_table();
+    if (!tbl) return;
+    int slot = actor_id_slot(*(int32_t*)(uintptr_t)aib);
+    char nm[SPEC_NAME_LEN + 1];
+    if (slot < 0 || slot >= ACTOR_SLOTS || !actor_name_of(tbl[slot], nm) || !spec_is(nm, kAimPin[k].base))
+        return;
+    char act[OFF_AIB_LABEL_LEN + 1];
+    memcpy(act, (const void*)(uintptr_t)(esp + AIQ_LABEL), OFF_AIB_LABEL_LEN);
+    act[OFF_AIB_LABEL_LEN] = 0;
+    // Counted where an attack goes through (on_ai_state), not here: one attack is queued over and
+    // over until it runs (hardware), so a count kept here put the first one past the threshold.
+    uint32_t was = *(uint32_t*)(uintptr_t)(aib + OFF_AIB_STANDING);
+    if (strcmp(act, kAimPin[k].act) || g_aimN < kAimPin[k].after) return;
+    uint32_t want = aim_member(kAimPin[k].who);
+    if (!want) {
+        ff13logv("[FF13-SRP] aim pin: %s is not in the party -- %s left at %08X\n",
+                 kAimPin[k].who, act, was);
+        return;
+    }
+    // The game's own setter (0x47CB60) refuses here: hardware showed the standing target unchanged
+    // after it, every time. The slot itself is what 0x47D820 reads.
+    *(uint32_t*)(uintptr_t)(aib + OFF_AIB_STANDING) = want;
+    g_aimPending = 1;
+    if (was != want)
+        ff13logv("[FF13-SRP] aim pin: %s after %d aimed action(s) re-aimed %08X -> %08X (%s)\n",
+                 act, g_aimN, was, want, kAimPin[k].who);
+}
+
+// 0x548EA0(this = the AI block) carries out what was decided, in phases ([this+0x610]). Until the
+// attack runs, both [this+0x614] and [this+0x598] (applied as a new target the instant it runs)
+// still re-aim it -- hardware showed a re-aimed Shock Breath land on whichever they held -- so
+// from the moment the pinned attack is queued until it goes through, all three say the same member.
+#define OFF_AIB_NEXT  0x598
+#define OFF_AIB_AIM   0x614
+const uint8_t P_AIRUN[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x84,0x00,0x00,0x00};
+void __cdecl on_ai_run(uint32_t ecx) {
+    int k = g_aimPin - 1;
+    if (k < 0 || !prb_ptr_ok(ecx)) return;
+#ifndef FF13_DIAG
+    // Every actor's AI, every frame: the cheap tests first.
+    if (!g_aimPending
+            || strncmp((const char*)(uintptr_t)(ecx + OFF_AIB_LABEL), kAimPin[k].act, OFF_AIB_LABEL_LEN))
+        return;
+#endif
+    uint32_t* tbl = actor_table();
+    if (!tbl) return;
+    int slot = actor_id_slot(*(int32_t*)(uintptr_t)ecx);
+    char nm[SPEC_NAME_LEN + 1];
+    if (slot < 0 || slot >= ACTOR_SLOTS || !actor_name_of(tbl[slot], nm) || !spec_is(nm, kAimPin[k].base))
+        return;
+    if (g_aimPending
+            && !strncmp((const char*)(uintptr_t)(ecx + OFF_AIB_LABEL), kAimPin[k].act, OFF_AIB_LABEL_LEN)) {
+        uint32_t want = aim_member(kAimPin[k].who);
+        if (want) {
+            uint32_t* nx = (uint32_t*)(uintptr_t)(ecx + OFF_AIB_NEXT);
+            uint32_t* am = (uint32_t*)(uintptr_t)(ecx + OFF_AIB_AIM);
+            uint32_t* st = (uint32_t*)(uintptr_t)(ecx + OFF_AIB_STANDING);
+            if (*nx != want || *am != want || *st != want) {
+                ff13logv("[FF13-SRP] aim pin: %s pending -- 598/614/600 %08X/%08X/%08X -> %08X\n",
+                         kAimPin[k].act, *nx, *am, *st, want);
+                *nx = want; *am = want; *st = want;
+            }
+        }
+    }
+#ifdef FF13_DIAG
+    static uint32_t last[5];
+    static char lastAct[OFF_AIB_LABEL_LEN + 1];
+    uint32_t cur[5] = { *(uint32_t*)(uintptr_t)(ecx + 0x610), *(uint32_t*)(uintptr_t)(ecx + 0x598),
+                        *(uint32_t*)(uintptr_t)(ecx + 0x600), *(uint32_t*)(uintptr_t)(ecx + 0x614), 0 };
+    char act[OFF_AIB_LABEL_LEN + 1];
+    memcpy(act, (const void*)(uintptr_t)(ecx + OFF_AIB_LABEL), OFF_AIB_LABEL_LEN);
+    act[OFF_AIB_LABEL_LEN] = 0;
+    if (!memcmp(cur, last, sizeof cur) && !strcmp(act, lastAct)) return;
+    memcpy(last, cur, sizeof cur); strcpy(lastAct, act);
+    ff13logv("[FF13-SRP] aim watch: %s phase %u label %s 598=%08X standing(600)=%08X 614=%08X\n",
+             nm, cur[0], act, cur[1], cur[2], cur[3]);
+#endif
+}
+
+// 0x549370, in 0x548EA0's last phase: mov eax,[ebp-0x80] / mov ecx,[eax+0x598]. Between the entry
+// and here the phase runs the decision again (0x5481D0 at 0x549347), which writes [aiblk+0x598]
+// afresh, and this read is the set-target the attack actually follows (hardware: every landed hit
+// matched the last one). esp = ebp-0x88 here, so the AI block ([ebp-0x80]) is [esp+8].
+const uint8_t P_AIREAIM[9] = {0x8B,0x45,0x80,0x8B,0x88,0x98,0x05,0x00,0x00};
+void __cdecl on_ai_reaim(uint32_t esp) {
+    int k = g_aimPin - 1;
+    if (k < 0 || !g_aimPending || !prb_ptr_ok(esp)) return;
+    uint32_t aib = *(uint32_t*)(uintptr_t)(esp + 8);
+    if (!prb_ptr_ok(aib)
+            || strncmp((const char*)(uintptr_t)(aib + OFF_AIB_LABEL), kAimPin[k].act, OFF_AIB_LABEL_LEN))
+        return;
+    uint32_t* tbl = actor_table();
+    if (!tbl) return;
+    int slot = actor_id_slot(*(int32_t*)(uintptr_t)aib);
+    char nm[SPEC_NAME_LEN + 1];
+    if (slot < 0 || slot >= ACTOR_SLOTS || !actor_name_of(tbl[slot], nm) || !spec_is(nm, kAimPin[k].base))
+        return;
+    uint32_t want = aim_member(kAimPin[k].who);
+    uint32_t* nx = (uint32_t*)(uintptr_t)(aib + OFF_AIB_NEXT);
+    if (!want || *nx == want) return;
+    ff13logv("[FF13-SRP] aim pin: %s about to run -- the re-decision said %08X, %s is %08X\n",
+             kAimPin[k].act, *nx, kAimPin[k].who, want);
+    *nx = want;
+}
+
+#ifdef FF13_DIAG
+static volatile uint32_t g_aimChara = 0;   // the pinned enemy's chara, seen at the last set-target
+
+// The party member a hit landed on, while an aim pin is armed (from the applyHPDelta probe).
+void aim_watch_hit(uint32_t actor) {
+    static int n = 0;
+    if (!g_aimPin || n >= 400) return;
+    char nm[SPEC_NAME_LEN + 1];
+    if (!actor_name_of(actor, nm) || nm[0] != 'p' || nm[1] != 'c') return;
+    n++;
+    uint32_t c = g_aimChara;
+    ff13logv("[FF13-SRP] aim watch: hit on %s (hp %d)  enemy 1310=%08X 1960=%08X\n", nm,
+             *(int*)(uintptr_t)(actor + OFF_HP), c ? *(uint32_t*)(uintptr_t)(c + 0x1310) : 0,
+             c ? *(uint32_t*)(uintptr_t)(c + 0x1960) : 0);
+}
+
+// 0x47CB60(this = chara, handle, 0): every set-target on the pinned enemy, with who asked.
+const uint8_t P_SETTGT[6] = {0x55,0x8B,0xEC,0x83,0xEC,0x10};
+void __cdecl on_set_target(uint32_t ecx, uint32_t handle, uint32_t* pRet, uint32_t* pUnused) {
+    (void)pUnused;
+    static int n = 0;
+    if (!g_aimPin || n >= 600 || !prb_ptr_ok(ecx)) return;
+    char nm[SPEC_NAME_LEN + 1];
+    if (!actor_name_of(ecx, nm) || !spec_is(nm, kAimPin[g_aimPin - 1].base)) return;
+    g_aimChara = ecx;
+    n++;
+    ff13logv("[FF13-SRP] aim watch: setTarget(%08X) from %08X  1310=%08X 1960=%08X\n", handle,
+             pRet ? *pRet : 0, *(uint32_t*)(uintptr_t)(ecx + 0x1310), *(uint32_t*)(uintptr_t)(ecx + 0x1960));
+}
+#endif
+
 // `this` is the AI block and its first field is the actor id. Resolve the chara THROUGH that id,
-// never by name: this enemy renames itself on every element change and its PARTS keep the old name
-// (ENEMY_AI_FLAGS_RE.md 3.10).
+// never by name: this enemy renames itself on every element change and its PARTS keep the old name.
 void __cdecl on_ai_state(uint32_t ecx, uint32_t state, uint32_t* pRet, uint32_t* pUp) {
     (void)pRet; (void)pUp;
     if (state != 9 || !prb_ptr_ok(ecx)) return;
@@ -2112,6 +2394,19 @@ void __cdecl on_ai_state(uint32_t ecx, uint32_t state, uint32_t* pRet, uint32_t*
     if (!prb_ptr_ok(self)) return;
     char nm[SPEC_NAME_LEN + 1];
     if (!actor_name_of(self, nm)) return;
+    if (g_aimPin && spec_is(nm, kAimPin[g_aimPin - 1].base)) {
+        int k = g_aimPin - 1;
+        char act[OFF_AIB_LABEL_LEN + 1];
+        memcpy(act, (const void*)(uintptr_t)(ecx + OFF_AIB_LABEL), OFF_AIB_LABEL_LEN);
+        act[OFF_AIB_LABEL_LEN] = 0;
+        int counted = 0;
+        for (int c = 0; c < AIM_COUNT_MAX && kAimPin[k].count[c]; c++)
+            if (!strcmp(act, kAimPin[k].count[c])) { counted = 1; break; }
+        if (counted) g_aimN++;
+        g_aimPending = 0;
+        ff13logv("[FF13-SRP] aim pin: %s went through%s (aimed actions %d)\n", act,
+                 counted ? "" : ", not counted", g_aimN);
+    }
     // An opening pin lives and dies here. A GO is the enemy choosing among its attacks, ended by
     // the next change of its AI state; landing is deliberately NOT required, and one go is the
     // whole of it -- the sheet re-rolls its odds every decision, so a pin that outlived its go
@@ -2164,8 +2459,8 @@ void __cdecl on_ai_state(uint32_t ecx, uint32_t state, uint32_t* pRet, uint32_t*
     if (strncmp(nm, g_probeSpec, pl) || (nm[pl] && nm[pl] != '_')) return;
     uint32_t w = *(uint32_t*)(uintptr_t)(self + OFF_AI_ACTCNT);
 #ifdef FF13_DIAG
-    // One line per action: ability, action counter, generic flag array (chara+8). The flags are
-    // the open question -- ENEMY_AI_FLAGS_RE.md 3.8 has been wrong about them twice.
+    // One line per action: ability, action counter, generic flag array (chara+8). The flags'
+    // meaning is unconfirmed: do not trust a reading of them without this log.
     ff13logv("[FF13-SRP] m097 acted: %-12s cnt=%u flags=%08X act=%d\n",
              g_actLast[0] ? g_actLast : "?", w & 0x7Fu,
              *(uint32_t*)(uintptr_t)(self + 8), *(signed char*)(uintptr_t)(self + 0x265));
@@ -2380,11 +2675,10 @@ void __cdecl on_spec_replace(uint32_t ecx, uint32_t name) {
 // warped back once the field is really there (warp_to, camera carry and recentre included).
 // NOT in every zone. The Archylte Steppe is one continuous field streamed in cells as you walk and
 // the way back crosses most of it: the party arrives and the game locks up on ground that has not
-// streamed. Until the destination's cells can be asked for up front (AnywhereSave appends them to
-// reconcile's desired[] at 0x42b9a0), the honest answer there is not to move the party at all.
-#define HOME_SETTLE_MS 300      // after FIELD_IDLE returns, before the party is moved (was 900;
-                                // the destination's cells are pre-armed now -- raise this first
-                                // if the way back ever wedges again)
+// streamed. Until the destination's cells can be asked for up front (the save-anywhere load appends them
+// to reconcile's desired[] at 0x42b9a0), the honest answer there is not to move the party at all.
+#define HOME_SETTLE_MS 300      // after FIELD_IDLE returns, before the party is moved; raise
+                                // this first if the way back wedges
 volatile int      g_homeHave = 0;    // a spot was taken for this fight
 volatile int      g_homeDue  = 0;    // 1 = waiting for the field, 2 = the worker may warp
 static volatile int g_homeNoWarp = 0;  // ...unless this fight's row asked to be left where it ends
@@ -3479,6 +3773,9 @@ void __cdecl on_place_join(uint32_t esp) {
             memcpy(nm, (const void*)(uintptr_t)(who + OFF_ACTOR_NAME), 16); nm[16] = 0;
         }
         g_openLogN++;
+#ifdef FF13_DIAG
+        aw_open_note(who, o + 12);
+#endif
         ff13logv("[FF13-SRP] battle: actor \"%.16s\" [%08X] opens at %.2f %.2f %.2f%s\n",
                  nm, who, (double)o[12], (double)o[13], (double)o[14],
                  g_bsStarted ? "  (picked fight)" : "");
@@ -3607,7 +3904,7 @@ typedef void (__cdecl *tpSet_t)(int tp);
 
 // The store is FOUR sheets deep and battle init (0x4D49E0) leaves it alone when the scene's bit 34
 // (scene+0x252 & 4, a chain's second half) is set -- so every pick empties it, or the fifth such
-// pick runs off its end (crash report, reproduced; CODE_NOTES).
+// pick runs off its end (crash report, reproduced).
 const uint8_t P_BTRES_CLEAR[14] = {0x55,0x8B,0xEC,0x83,0xEC,0x08,0x6A,0x00,0x8B,0x0D,0x60,0xB0,0x82,0x02};
 typedef void (__cdecl *btresClear_t)(void);
 volatile int g_btresOk = 0;
@@ -4099,7 +4396,7 @@ const uint8_t P_LOADHIDE[10] = {0x55,0x8B,0xEC,0x51,0x8B,0x0D,0x4C,0x6A,0x82,0x0
 static volatile DWORD g_loadUpAt = 0;
 static volatile int   g_loadUp = 0;
 // ...and when it went down: a pick taken seconds after a load lands while the game's own loader is
-// still finishing (CODE_NOTES).
+// still finishing.
 static volatile DWORD g_loadDownAt = 0;
 
 void __cdecl on_load_show(uint32_t mode) {
@@ -4116,6 +4413,9 @@ void __cdecl on_load_hide(uint32_t ecx) {
     g_loadDownAt = GetTickCount();
     ff13logv("[FF13-SRP] loading indicator: down after %lums (zone state %d)\n",
              (unsigned long)(GetTickCount() - g_loadUpAt), field_zone_state());
+#ifdef FF13_DIAG
+    diag_vm_census("load landed");
+#endif
 }
 
 // A spinner that turns for four seconds and one four-second freeze add up to the same total and are
@@ -4382,7 +4682,7 @@ static int async_loader_type(void) {
 }
 
 // The paradigm the pick was made in, put back on the field -- the game does it itself for some
-// fights and deliberately not for others (CODE_NOTES) -- or, for a row that keeps it, the one the
+// fights and deliberately not for others -- or, for a row that keeps it, the one the
 // fight ended on. Only ever the DECK IN HAND is written, never the decks themselves. Must wait for
 // the field to settle: the game's own restore lands at fight-over and the field's init writes
 // after it, and writing into that leaves the menu showing one paradigm and the party fighting in
@@ -4438,7 +4738,7 @@ static void field_drop_watch(DWORD now) {
 // The deferred half of the fight-over character-set restore. A chrset command sent while the
 // battle's own loads are still draining freezes the AsyncLoader thread for the rest of the session,
 // and the end-of-encounter work behind it never runs: the party cannot walk and every later touch
-// is refused until a full reload (btsc04026, measured -- CODE_NOTES). So it goes back only with the
+// is refused until a full reload (btsc04026, measured). So it goes back only with the
 // field up and the loader idle. The cap is for an idle that never comes on a busy field.
 #define CS_RESTORE_SETTLE_MS 800
 #define CS_RESTORE_CAP_MS  15000
@@ -4553,7 +4853,7 @@ static void enc_slots_watch(void) {
 
 // ---- the game's leak tracker, walked the way free() (0x83FD30 -> 0xBB8550) walks it ----------
 // One hash set of every tracked block's 16-byte header {vtbl, next, prev, flags}: 0x80 buckets x
-// 12 bytes, chained on next. The walk is under the game's own mutex; the layout is in CODE_NOTES.
+// 12 bytes, chained on next. The walk is under the game's own mutex.
 #define RVA_TRK_MUTEXP  0x241E250
 #define RVA_TRK_MUTEX   0x241E238     // the object 0x83FAE0 stores at RVA_TRK_MUTEXP
 #define RVA_TRK_ENABLED 0x241E254
@@ -4656,7 +4956,7 @@ static void trk_watch(DWORD now) {
 
 // ---- a pause menu that will not close --------------------------------------------------------
 // A WITNESS, not a fix: a pause that will not close on START is reported but has never reproduced
-// here, so this prints what could be holding it, once per episode (CODE_NOTES). 21..32 is every
+// here, so this prints what could be holding it, once per episode. 21..32 is every
 // pause the state machine has -- EVENT_ON_FIELD/BATTLE, FIELD and BATTLE, each with its PAUSE /
 // PAUSE_WAIT / PAUSE_END_WAIT -- and 75/76 lead out of one into a restart or a reset. The reported
 // case was a BATTLE pause, so watching the field's alone is not enough.
@@ -5020,7 +5320,7 @@ static void pump_decks(DWORD now) {
     } else if (g_decksRestoreFor && g_btlScene == g_decksRestoreFor) {
         g_decksRestoreFor = 0;
         // The decks themselves are left ALONE: what the game generates for the new pair is what the
-        // story fight has (measured -- CODE_NOTES). Only the one in hand is set.
+        // story fight has (measured). Only the one in hand is set.
         ff13log("[FF13-SRP] battle picker: this fight's party was set by the picker -- opening on "
                  "the first paradigm\n");
         vm_set_optima_deck(0);
@@ -5144,6 +5444,7 @@ static void pump_holds(DWORD now) {
     camera_follow_hold();
     camera_recentre_due();
     turn_watch_tick();
+    actor_watch_tick();
     boss_basis_probe();
     encinfo_tweak();
     restart_watch();

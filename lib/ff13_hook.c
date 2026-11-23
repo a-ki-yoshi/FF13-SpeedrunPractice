@@ -1,5 +1,5 @@
 /*
- * FF13-AnywhereSave — save-anywhere mod for FINAL FANTASY XIII (Steam).
+ * FF13 mods — shared modules for the FINAL FANTASY XIII / XIII-2 practice mods (Steam).
  * Copyright (C) 2026 Akiyoshi
  *
  * This program is free software: you can redistribute it and/or modify
@@ -80,7 +80,6 @@ void* ff13_install_stackarg_hook(uintptr_t hookAddr, const uint8_t* prologue,
 
 void* ff13_install_ecx_stackarg_hook(uintptr_t hookAddr, const uint8_t* prologue,
                                      int prologueLen, void* handler, int stackOff) {
-    // handler(ecx, [esp+stackOff]): push arg2 (stack) then arg1 (ecx).
     int disp = 0x24 + stackOff;
     if (disp < 0 || disp > 0x7F) return 0;
     uint8_t seq[] = {0xFF, 0x74, 0x24, (uint8_t)disp, 0x51};  // push [esp+disp8]; push ecx
@@ -111,6 +110,75 @@ void* ff13_install_argptr_hook(uintptr_t hookAddr, const uint8_t* prologue, int 
         0x51,                                   // push ecx
     };
     return build(hookAddr, prologue, prologueLen, handler, seq, (int)sizeof(seq), 4);
+}
+
+// Displacements into the cave's own frame, measured from esp AFTER `pushad; pushfd; sub esp,4`:
+//   +0x00 retval slot   +0x04 eflags   +0x08.. pushad (edi,esi,ebp,esp,ebx,edx,ecx,eax)
+// so pushad's saved EAX sits at +0x24 and the caller's esp at the hook site is +0x28. Writing the
+// EAX slot is how the handler's *retval reaches the caller: popad loads eax back out of it.
+#define RH_EAX_SLOT 0x24
+#define RH_ESP_DISP 0x28
+
+void* ff13_install_replace_hook(uintptr_t hookAddr, const uint8_t* prologue, int prologueLen,
+                                void* handler, int retBytes) {
+    if (prologueLen < 5 || retBytes < 0 || retBytes > 0xFFFF) return 0;
+    if (memcmp((const void*)hookAddr, prologue, (size_t)prologueLen) != 0) return 0;
+
+    uint8_t* cave = (uint8_t*)VirtualAlloc(NULL, 256, MEM_COMMIT | MEM_RESERVE,
+                                           PAGE_EXECUTE_READWRITE);
+    if (!cave) return 0;
+
+    uint8_t* p = cave;
+    *p++ = 0x60;                                        // pushad
+    *p++ = 0x9C;                                        // pushfd
+    *p++ = 0x83; *p++ = 0xEC; *p++ = 0x04;              // sub esp,4            retval slot
+    *p++ = 0x8B; *p++ = 0xC4;                           // mov eax,esp          &retval
+    *p++ = 0x8D; *p++ = 0x54; *p++ = 0x24;
+    *p++ = (uint8_t)RH_ESP_DISP;                        // lea edx,[esp+0x28]   caller's esp
+    *p++ = 0x50;                                        // push eax             arg3 &retval
+    *p++ = 0x52;                                        // push edx             arg2 esp
+    *p++ = 0x51;                                        // push ecx             arg1 ecx
+    *p++ = 0xE8;                                        // call rel32 -> handler
+    { int32_t r = (int32_t)((uintptr_t)handler - ((uintptr_t)p + 4));
+      memcpy(p, &r, 4); p += 4; }
+    *p++ = 0x83; *p++ = 0xC4; *p++ = 0x0C;              // add esp,12           cdecl, 3 args
+    *p++ = 0x85; *p++ = 0xC0;                           // test eax,eax
+    *p++ = 0x74;                                        // jz run_original
+    uint8_t* jz = p++;                                  // its rel8, patched once p reaches there
+    *p++ = 0x8B; *p++ = 0x04; *p++ = 0x24;              // mov eax,[esp]        retval
+    *p++ = 0x89; *p++ = 0x44; *p++ = 0x24;
+    *p++ = (uint8_t)RH_EAX_SLOT;                        // mov [esp+0x24],eax   pushad's eax
+    *p++ = 0x83; *p++ = 0xC4; *p++ = 0x04;              // add esp,4
+    *p++ = 0x9D;                                        // popfd
+    *p++ = 0x61;                                        // popad
+    if (retBytes) {
+        *p++ = 0xC2;
+        *p++ = (uint8_t)(retBytes & 0xFF);
+        *p++ = (uint8_t)((retBytes >> 8) & 0xFF);       // ret retBytes
+    } else {
+        *p++ = 0xC3;                                    // ret
+    }
+    *jz = (uint8_t)(p - (jz + 1));                      // run_original:
+    *p++ = 0x83; *p++ = 0xC4; *p++ = 0x04;              // add esp,4
+    *p++ = 0x9D;                                        // popfd
+    *p++ = 0x61;                                        // popad
+    memcpy(p, prologue, (size_t)prologueLen); p += prologueLen;
+    *p++ = 0xE9;                                        // jmp rel32 -> hookAddr + prologueLen
+    { int32_t r = (int32_t)((hookAddr + prologueLen) - ((uintptr_t)p + 4));
+      memcpy(p, &r, 4); p += 4; }
+
+    DWORD old;
+    if (!VirtualProtect((void*)hookAddr, (size_t)prologueLen, PAGE_EXECUTE_READWRITE, &old)) {
+        VirtualFree(cave, 0, MEM_RELEASE);
+        return 0;
+    }
+    uint8_t* h = (uint8_t*)hookAddr;
+    h[0] = 0xE9;
+    { int32_t r = (int32_t)((uintptr_t)cave - (hookAddr + 5)); memcpy(h + 1, &r, 4); }
+    for (int i = 5; i < prologueLen; i++) h[i] = 0x90;
+    VirtualProtect((void*)hookAddr, (size_t)prologueLen, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), (void*)hookAddr, (size_t)prologueLen);
+    return cave;
 }
 
 void* ff13_install_savescreen_hook(uintptr_t hookAddr, uintptr_t doSaveAddr,

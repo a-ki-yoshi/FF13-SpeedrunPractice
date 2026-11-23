@@ -26,12 +26,12 @@
 // slot0.value; the substitute string must live in this DLL's data segment, because the game copies
 // it into the encounter-info struct.
 // ASSET LIMIT: the btsc must already be loaded in the DataBattle DB, or getBattleScene (0xB41640)
-// fails. RE: common/docs/EVENT_BATTLE_RE.md EN-0..EN-6.
+// fails.
 #define SB_ARGSTACK_OFF 0x114        // [vmctx+0x114] = VM operand-stack pointer
 // Defensive head-room, not a measured need: a native called with a missing slot reads AND
 // writes past what the caller laid out (natives push their return value back into the operand
 // slots). 0x400 turns that mistake into corrupted padding, not a corrupted frame (the 12091
-// crash; CODE_NOTES).
+// crash).
 #define VM_CTX_SIZE 0x400
 #define SB_SLOT         8            // one tagged VM slot: {tag @+0, value @+4}
 // push ebp; mov ebp,esp; sub esp,0x290
@@ -245,7 +245,6 @@ void __cdecl on_start_battle(uint32_t vmctx) {
 // The cave calls the handler with the original id and writes the handler's return value over the
 // EAX slot pushad saved ([esp+0x20] there), so popad restores OUR id and the game's own store
 // writes it. Same asset limit as above: the scene must already be loaded.
-// RE: /workspace/.logs/toolH_battleswap_impl.md.
 const uint8_t P_ENC[6] = {0x89,0x81,0x54,0x03,0x00,0x00};
 void* g_encCave = NULL;
 
@@ -1042,7 +1041,7 @@ const char* zone_state_name(int st) {
     return (n && !IsBadStringPtrA(n, 64)) ? n : "?";
 }
 
-// The party manager's live record; see common/docs/PARTY_LEADER.md for the walk to it.
+// The party manager's live record.
 #define RVA_PARTY_ROOT   0x242B230   // VA 0x282B230
 #define OFF_PARTY_LIVE   0xBC0       // which of the four records is live
 #define OFF_PARTY_RECS   0x3C
@@ -1075,7 +1074,7 @@ static void party_log(const char* when) {
 
 // The paradigm decks live in the same live party record: entry n = (record+0x78) + 4 + n*0x30,
 // eight of them; within an entry the three roles are at +4, +8, +0xC, one byte each, 0xFF = empty.
-// Role numbering is fake/Party.java's ROLE_* constants: 0 SEN 1 COM 2 RAV 3 SYN 4 SAB 5 MED.
+// Role numbering is the script Party API's ROLE_* constants: 0 SEN 1 COM 2 RAV 3 SYN 4 SAB 5 MED.
 #define OFF_REC_DECKS   0x7C     // record + 0x78, +4 for the container's own header
 #define DECK_STRIDE     0x30
 #define DECK_COUNT      8
@@ -1233,8 +1232,8 @@ static const struct { uint16_t btsc; const char* const* who; int n; } kScenePart
     // btsc07010 has a door and the door is not enough: its chain's script sets the decks but the
     // BATTLE party does not follow, so the party change belongs to a step the door enters past.
     { 7010, kPartySnowAlone, 1 },
-    // btsc04027's party change is the story's own step and NOT part of its cutscene (the chain is
-    // in CODE_NOTES). Set here rather than through a door: the plain field swap already fields all
+    // btsc04027's party change is the story's own step and NOT part of its cutscene.
+    // Set here rather than through a door: the plain field swap already fields all
     // five enemies, and a door would hand the win to bt_vpek_200_cb, which marks a save point and
     // plays the next cutscene on into the story.
     { 4027, kPartyLightningHope, 2 },
@@ -1264,7 +1263,7 @@ static const struct { uint16_t btsc; int n; signed char decks[8][3]; } kSceneDec
     // btsc11412 needs no entry: its door produces the right paradigms already.
     // btsc04027 -- measured off the story fight, and also what the game generates for the pair.
     // Do NOT "restore" the player's saved set for a party the picker sets: it grows over a
-    // playthrough and gave six decks where the story has four (CODE_NOTES).
+    // playthrough and gave six decks where the story has four.
     { 4027, 4, { { R_COM, R_RAV, -1 },
                  { R_COM, R_SYN, -1 },
                  { R_MED, R_MED, -1 },
@@ -1439,8 +1438,8 @@ volatile uint32_t g_evTouch = 0;     // the touched object the first pass was gi
 
 #define RVA_ACTIVATEAREA 0x7E05B0    // VA 0xBE05B0  Scene.activateAreaIgnoreFieldActive_l
 // activateAreaIgnoreFieldActive_l(String, boolean): TWO slots, read last-pushed-first, so slot0
-// is the force flag and slot1 the group. Check the fake/*.java declaration before binding any
-// native -- a missing slot hands it stack garbage (the 12091 crash; CODE_NOTES).
+// is the force flag and slot1 the group. Check the native's script declaration before binding
+// any native -- a missing slot hands it stack garbage (the 12091 crash).
 void vm_activate_area(const char* group) {
     if (!g_base || !group || !group[0]) return;
     uint8_t  ctx[VM_CTX_SIZE];
@@ -1630,7 +1629,7 @@ int leader_name(char out[20]) {
     return out[0] != 0;
 }
 
-// The game decides this the same way (fld/com.java's sfIsChocoboRide compares the leader against
+// The game decides this the same way (the field script's sfIsChocoboRide compares the leader against
 // "cho_vn"/"cho_lt"/"cho_sz"/"cho_ho"/"cho_sn"/"cho_fa"), so a leader key beginning "cho_" is the
 // mount and nothing else in the roster is. Picking a fight while mounted crashed on hardware.
 int riding_chocobo(void) {
@@ -1641,7 +1640,7 @@ int riding_chocobo(void) {
 
 // Resolving the name inside switchControl's entry (0xBC61B0) is the btsc09055 crash: the interning
 // is session-ordered and the chara-DB bounds check there only LOGS before it derefs. Do it here and
-// call the tail, which returns NULL on a miss. Game thread only (virtual call). See CODE_NOTES.
+// call the tail, which returns NULL on a miss. Game thread only (virtual call).
 #define RVA_CHARA_MGR    0x22E80DC   // VA 0x26E80DC -> field chara manager
 #define OFF_CM_SLOTS     0x310       // manager -> object table, indexed by chara id
 #define CM_SLOT_MAX      0x70        // where the game's own by-name walk stops
@@ -1752,8 +1751,8 @@ static void field_ui_unlock(void) {
 }
 
 // Three parts, none of them through the VM: input dies at the dinput8 proxy (di_gate_arm), the
-// party is pinned, and the field UI and pause menu are shut. A fourth part -- Chara.switchControl
-// through a forged context -- crashed on hardware and was removed (CODE_NOTES, the input gate).
+// party is pinned, and the field UI and pause menu are shut. Do not add Chara.switchControl through a
+// forged context as a fourth part: it crashes.
 // ctl_force_on still needs switchControl (undoing a switch-off the game's own scripts did is out
 // of an input gate's reach), but past the string resolve: see chara_id_by_name above.
 volatile int g_ctlLocked = 0;
@@ -1930,7 +1929,7 @@ static const ff13_arena kSceneArena[] = {
       { { NULL, 0, 0, 0 } },                           // en: one enemy
       { NULL, NULL },                                  // btlBg
       // Event door: a SCRIPT-event root (startCinema mode 0 with its own success label, evScript).
-      // z029/scr100.java efCallEvLasd300 -> bf_ev_300, whose callback stages the room and then
+      // z029's efCallEvLasd300 -> bf_ev_300, whose callback stages the room and then
       // starts ev_lasd_300, whose callback calls this fight.
       { "bf_ev_300", "bf_ev_300_cb", NULL, "suc_e_o_flmd_e" },
       { NULL }, { NULL, NULL }, NULL, 1, 0 },
@@ -1983,9 +1982,8 @@ static const ff13_arena kSceneArena[] = {
       {   0.500f,  -2.665f }, 1200.0f, 1 },
 
     // btsc06046 -- measured, correct, and RETIRED (the plain field swap is what ships). Re-enabling
-    // is dropping the #if 0, but every value here is load-bearing and three of them are traps that
-    // cost a hardware session each -- read CODE_NOTES ("btsc06046 wants a kSceneArena row", and the
-    // section that follows it) before changing any of them.
+    // is dropping the #if 0, but every value here is load-bearing and three of them are traps: read
+    // the "btsc06046 wants a kSceneArena row" notes before changing any of them.
 #if 0
     { .btsc = 6046, .arena = "bt_gapr_200_cb", .flags = 0x4,
       .ex = 0.0f, .ey = 0.0f, .ez = 5.0f,
@@ -2110,7 +2108,7 @@ static const ff13_arena kSceneArena[] = {
     // btsc01016, the second Manasvin fight, DERIVED: its authored enemy placement is
     // byte-identical to btsc01001's and it is the same model, so that entry's measured offset
     // carries over. No party places and no camera -- kPartyStage places the party once the battle
-    // has a stage. The two loads are the story's own staging (zone/z016/scr100.java).
+    // has a stage. The two loads are the story's own staging (z016's scr100).
     { 1016, "bt_hang_020_cb", 0x8, -0.018f, 0.098f, 12.780f,
       { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } },
       { 0, 0, 0 },
@@ -2442,8 +2440,8 @@ const ff13_arena* scene_arena(uint32_t btsc) {
     return NULL;
 }
 
-// What the story takes off the field right before these fights and a door-less pick does not
-// (derivations in CODE_NOTES). Rows of one btsc must stay together: field_drops returns a run.
+// What the story takes off the field right before these fights and a door-less pick does not.
+// Rows of one btsc must stay together: field_drops returns a run.
 static const ff13_fielddrop kFieldDrop[] = {
     // btsc12090's door (efCallBeforeEvLasd300) drops these five and nothing before 12091/12092
     // puts them back, so the two Narthex fights after it need the same hand.
@@ -2471,7 +2469,7 @@ const ff13_fielddrop* field_drops(uint32_t btsc, int* n) {
 }
 
 // Whether picking this fight puts a cutscene on screen first. Derived from kSceneArena rather than
-// written down again in the TSV: a picked fight plays a cutscene only where THIS MOD hands it one.
+// written down again in the picker table: a picked fight plays a cutscene only where THIS MOD hands it one.
 // A row with no door goes in through the field encounter; evNoFight gates the cutscene off.
 int scene_has_cutscene(uint32_t btsc) {
     const ff13_arena* a = scene_arena(btsc);

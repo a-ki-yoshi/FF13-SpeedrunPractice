@@ -42,6 +42,7 @@ void __cdecl on_apply_hp_delta(uint32_t thisActor) {
     if (!thisActor) return;
     void* a = (void*)(uintptr_t)thisActor;
     if (IsBadReadPtr(a, ACTOR_SPAN)) return;       // unreadable -> skip silently
+    aim_watch_hit(thisActor);
     if (!seen_add_if_new(thisActor)) return;       // already logged this window
 
     int      hp    = *(int*)     ((char*)a + OFF_HP);
@@ -102,60 +103,116 @@ void* install_onehit_cave(uintptr_t hookAddr, const volatile void* armedFlag,
 }
 
 
-// ---- GAME-SPEED MODE: scale the per-frame delta so the game advances faster ----
-// Hooked at the app-clock tick 0x6AA480, whose first stack arg is `int* frameDeltaMs`; multiplying
-// it before the tick body runs makes every system that reads the frame dt advance further. Keep the
-// factor modest (high ones can desync audio/streaming), and note that while it is ON the in-game
-// timers are warped, so any IGT/real-time readout is only accurate with it OFF.
-// ---- ...and the ATB gauges with it -----------------------------------------------------------
-// The frame delta does NOT reach the ATB gauges (measured on hardware), so game-speed also drives
-// the game's own ATB-only lever: battle command 35 `setAtbSpeed`, whose only consumers are the two
-// BattleChara ATB accessors -- animation, camera and enemy motion never read it.
-//   [0x027FD208]  the battle object (the same one the GAME timer is read from)
-//   [bs + 0x4F4]  float, the multiplier; 1.0 is normal
-//   0x004F5220(this, float, int)  __thiscall setter; the int arm also runs 0x49D1A0 on [bs+8]
-#define RVA_BS_ATB_PTR   0x23FD208    // VA 0x27FD208
-#define OFF_BS_ATBSPEED  0x4F4
-const uint8_t P_SETATB[8] = {0x55,0x8B,0xEC,0x83,0xEC,0x14,0x89,0x4D};
-volatile int   g_atbOk = 0;            // the setter is where it should be
-static volatile float g_atbSaid = -1.0f;      // last value the log named
+// ---- GAME-SPEED MODE: the engine's own framework frame-speed float ----
+// The frame function 0xE8A090 multiplies the capped frame delta by [GameMain+0x34] before handing it
+// to every update task, battle and ATB included. The setter is a bare store, so the float is written
+// directly. Only this game-thread pump writes it; the hotkey thread only moves the step.
+#define RVA_GAMEMAIN_PTR   0x241C9BC   // VA 0x281C9BC
+#define OFF_GM_FRAMETIMER  0x20
+#define OFF_GM_FRAMESPEED  0x34        // frame timer +0x14, default 1.0
+#define RVA_FRAMETIMER_VT  0x2223548   // VA 0x2623548
+#define GS_MEASURE_SEC     5.0
+#define FRAME_TICKS_PER_SEC 300000.0   // the shared frame delta's unit
 
-// Every frame while a fight is up. The value is READ back rather than remembered, so it follows the
-// game resetting it between fights, and a gauge the game itself has stalled is left alone.
-static void atb_speed_pump(void) {
-    if (!g_atbOk || !g_base) return;
-    uintptr_t p = g_base + RVA_BS_ATB_PTR;
-    if (IsBadReadPtr((void*)p, 4)) return;
-    uint32_t bs = *(uint32_t*)p;
-    if (!bs || IsBadWritePtr((void*)(uintptr_t)(bs + OFF_BS_ATBSPEED), 4)) return;
-    float cur = *(float*)(uintptr_t)(bs + OFF_BS_ATBSPEED);
-    if (cur == 0.0f) return;                          // the game is holding the gauges itself
-    float want = (g_gsEnabled && g_gsFactor > 0.0) ? (float)g_gsFactor : 1.0f;
-    if (cur == want) return;
-    ((void (__thiscall *)(void*, float, int))(uintptr_t)(g_base + RVA_SETATBSPEED))
-        ((void*)(uintptr_t)bs, want, 0);
-    if (want != g_atbSaid) {
-        g_atbSaid = want;
-        ff13log("[FF13-SRP] game-speed: ATB gauge speed %.2fx (was %.2fx)\n",
-                 (double)want, (double)cur);
+static float g_gsOurs = 1.0f;          // the last value this mod wrote
+static int   g_gsHaveOurs = 0;
+static int   g_gsForeignSaid = 0;
+static int   g_gsVtSaid = 0;
+
+// Mode 1 = measuring while on; 2 = one window after off. The game side is the sum of the frame
+// delta this tick receives, which is downstream of the float.
+static int      g_mMode = 0;
+static int      g_mStep = -2;
+static LONGLONG g_mQpc0 = 0;
+static int64_t  g_mTicks = 0;
+static double   g_mFreq = 0.0;
+
+static void gs_measure(int step, int delta) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    if (step != g_mStep) {
+        g_mMode = step >= 0 ? 1 : (g_mStep >= 0 ? 2 : 0);
+        g_mStep = step;
+        g_mQpc0 = now.QuadPart;
+        g_mTicks = 0;
+        return;
+    }
+    if (!g_mMode) return;
+    if (delta > 0) g_mTicks += delta;
+    if (g_mFreq <= 0.0) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g_mFreq = (double)f.QuadPart;
+        if (g_mFreq <= 0.0) { g_mMode = 0; return; }
+    }
+    double wall = (double)(now.QuadPart - g_mQpc0) / g_mFreq;
+    if (wall < GS_MEASURE_SEC) return;
+    double wanted = g_mMode == 1 ? g_gsFactor : 1.0;
+    if (g_mTicks <= 0)
+        ff13logv("[FF13-SRP] game-speed: the frame delta did not advance over %.1f s (paused or"
+                 " loading) -- window skipped\n", wall);
+    else
+        ff13log("[FF13-SRP] game-speed: measured %.2fx over %.1f s (wanted %.2fx)\n",
+                ((double)g_mTicks / FRAME_TICKS_PER_SEC) / wall, wall, wanted);
+    g_mQpc0 = now.QuadPart;
+    g_mTicks = 0;
+    if (g_mMode == 2) g_mMode = 0;
+}
+
+static void gs_pump(int step) {
+    uintptr_t pp = g_base + RVA_GAMEMAIN_PTR;
+    if (IsBadReadPtr((void*)pp, 4)) return;
+    uintptr_t gm = *(volatile uint32_t*)pp;
+    if (!gm || IsBadReadPtr((void*)gm, OFF_GM_FRAMESPEED + 4)) return;
+    uint32_t vt = *(volatile uint32_t*)(gm + OFF_GM_FRAMETIMER);
+    if (vt != (uint32_t)(g_base + RVA_FRAMETIMER_VT)) {
+        if (!g_gsVtSaid) {
+            g_gsVtSaid = 1;
+            ff13loga("[FF13-SRP] game-speed: GameMain+0x20 has vtable 0x%08X, not the frame timer's"
+                     " 0x%08X -- the speed is not touched while it is\n", vt,
+                     (unsigned)(g_base + RVA_FRAMETIMER_VT));
+        }
+        return;
+    }
+    if (IsBadWritePtr((void*)(gm + OFF_GM_FRAMESPEED), 4)) return;
+    volatile float* sp = (volatile float*)(gm + OFF_GM_FRAMESPEED);
+    float want = step >= 0 ? (float)g_gsFactor : 1.0f;
+    float cur = *sp;
+    if (cur == want) { g_gsForeignSaid = 0; return; }
+    // Only the engine default or our own value is replaced: anything else was set by someone else.
+    int mine = g_gsHaveOurs && cur == g_gsOurs;
+    if (step >= 0 ? (cur == 1.0f || mine) : mine) {
+        *sp = want;
+        ff13log("[FF13-SRP] game-speed: frame speed %.2f -> %.2f\n", (double)cur, (double)want);
+        g_gsOurs = want;
+        g_gsHaveOurs = step >= 0;
+        g_gsForeignSaid = 0;
+    } else if (step >= 0 || g_gsHaveOurs) {
+        if (!g_gsForeignSaid) {
+            g_gsForeignSaid = 1;
+            ff13log("[FF13-SRP] game-speed: the frame speed is %.2f, not ours -- left alone\n",
+                    (double)cur);
+        }
+        if (step < 0) g_gsHaveOurs = 0;
     }
 }
 
 const uint8_t P_FRAMETICK[9] = {0x55,0x8B,0xEC,0x81,0xEC,0x84,0x00,0x00,0x00}; // push ebp;mov ebp,esp;sub esp,0x84
 _Static_assert(sizeof(P_FRAMETICK) == 9, "P_FRAMETICK size");
 
-// Installed via ff13_install_stackarg_hook with stackOff=4, so pDelta is [esp+4] = frameDeltaMs.
-// Runs on the game thread once per frame, before the tick body.
+// Installed via ff13_install_stackarg_hook with stackOff=4, so pDelta is [esp+4] = int* frame delta
+// (1/300000 s). Runs on the game thread once per frame, before the tick body. Read only: the delta
+// is already scaled by the frame speed, so multiplying it here again would square the factor.
 void __cdecl on_frame_tick(uint32_t pDelta) {
     // The picker's game-thread work rides on this tick: it is the one that fires every frame
     // unconditionally (the GetWorldPos hook only runs while something is moving).
     bs_pump();
     battle_cam_watch();
-    atb_speed_pump();          // ...and the gauges, which the frame delta does not reach
-    if (!g_gsEnabled || !pDelta) return;
-    if (IsBadWritePtr((void*)(uintptr_t)pDelta, 4)) return;
-    int v = *(int*)(uintptr_t)pDelta;
-    if (v > 0) *(int*)(uintptr_t)pDelta = (int)((double)v * g_gsFactor);
+    int step = g_gsEnabled ? g_gsStep : -1;
+    gs_pump(step);
+    int d = 0;
+    if (pDelta && !IsBadReadPtr((void*)(uintptr_t)pDelta, 4)) d = *(volatile int*)(uintptr_t)pDelta;
+    gs_measure(step, d);
 }
 
 #ifdef FF13_DIAG

@@ -19,15 +19,15 @@
 #include "srp_internal.h"
 
 // ============================ WARP (record a spot / warp the leader to it) ===
-// AnywhereSave owns the inline hooks at 0xD6D2D0 / 0x7982C0 / 0x61CBAD / 0x61CE3E and ff13_hook's
+// srp_save.c owns the inline hooks at 0xD6D2D0 / 0x7982C0 / 0x61CBAD / 0x61CE3E and ff13_hook's
 // memcmp guard is per-address, so those must NOT be re-hooked here. Instead the field leader is
 // CAPTURED at GetWorldPos (0x78EEE0) and the committed position OVERRIDDEN at the per-object commit
-// method (0x79C5E0), both AnywhereSave-free, by overwriting the source vector it commits from.
+// method (0x79C5E0), neither of them srp_save.c's, by overwriting the source vector it commits from.
 // All addresses are RVAs (VA - 0x400000).
 #define VT_CHARA        0x10C934C      // character/actor class vtable (reject non-character reads)
 const uint8_t P_TP6[6] = {0x55,0x8B,0xEC,0x83,0xE4,0xF0}; // shared prologue of both entries
 
-// ---- pool + cluster (ported from AnywhereSave's cluster_restore; duplicated on purpose) --------
+// ---- pool + cluster (srp_save.c's cluster_restore, duplicated on purpose) ---------------------
 // One shared transform pool: base = *(*([SceneObj+0x2C]+0xC)); a character's slot is
 // base + [[SceneObj+0x2C]+8]*0x70, {X,Y,Z,W} floats at +0/+4/+8/+0xC.
 static volatile uint32_t g_poolBase = 0;
@@ -108,7 +108,7 @@ static void place_boss(uint32_t ecx, float* src) {
         // Held for the whole fight, which is the least wrong of what has been tried: released
         // outright the boss drifts away, on the leash it is dragged back every frame it strays and
         // reads as a teleport each time it swings. The fix is to stop placing it by hand at all
-        // (relative placement -- see .logs/toolH_battleswap_impl.md).
+        // (relative placement).
         src[0] = g_bossSlotPos[i][0]; src[1] = g_bossSlotPos[i][1]; src[2] = g_bossSlotPos[i][2];
         return;
     }
@@ -257,7 +257,7 @@ static int pool_read_slot(uint32_t pb, uint32_t i, float* x, float* y, float* z,
     if (w) *w = *(float*)(a+0xC);
     return 1;
 }
-// Live leader/party reference position: slot 2 then slot 0 (AnywhereSave's proven, field-valid choice).
+// Live leader/party reference position: slot 2 then slot 0 (the field-valid pair the save restore also uses).
 int field_party_pos(float* x, float* y, float* z) {
     uint32_t pb = g_poolBase; if (!pb) return 0;
     if (pool_read_slot(pb, 2, x, y, z, 0) && !(*x==0 && *y==0 && *z==0)) return 1;
@@ -808,7 +808,7 @@ void hold_still_end(void) {
 }
 
 // Recorded warp points -- ONE per zone, persisted next to the exe so they survive a game restart.
-// Own sidecar file (NOT AnywhereSave's) -- one text line "zone x y z" per recorded zone.
+// Own sidecar file (not the save sidecars') -- one text line "zone x y z" per recorded zone.
 typedef struct { int valid; uint32_t zone; float x, y, z; } warp_point_t;
 #define WARP_MAXPOINTS 128
 static warp_point_t g_warpPoints[WARP_MAXPOINTS];

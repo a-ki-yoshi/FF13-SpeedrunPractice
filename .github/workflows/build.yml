@@ -1,5 +1,5 @@
 # CI for the PUBLIC FF13-SpeedrunPractice repo. This file lives in the private monorepo at
-# sr_practice/publish/build.yml and is placed at .github/workflows/build.yml by publish.sh --
+# ff13_sr_practice/publish/build.yml and is placed at .github/workflows/build.yml by publish.sh --
 # deliberately NOT under the monorepo's own .github/, so it never runs there.
 #
 # zig cross-compiles the x86 Windows DLL on a Linux runner: no Windows runner, no game files.
@@ -21,9 +21,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      ZIG_VERSION: "0.16.0"   # keep in sync with the private repo's vendored toolchain
+      ZIG_VERSION: "0.17.1"   # keep in sync with the private repo's vendored toolchain
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install zig ${{ env.ZIG_VERSION }}
         run: |
@@ -44,7 +44,7 @@ jobs:
         run: ./src/build.sh
 
       - name: Upload build artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: FF13-SpeedrunPractice-dinput8
           path: src/out/dinput8.dll
@@ -58,20 +58,28 @@ jobs:
           set -euo pipefail
           # One flat zip: everything lands in the game's bin folder, so "extract the zip
           # there" is the whole install. Loose .bat/.dll downloads also trip browser
-          # warnings that a zip avoids. The ini ships under its real name -- every key is
-          # optional and the content equals the built-in defaults, so placing it unedited
-          # changes nothing, and nobody has to rename an .example first. The two launchers
-          # are the with/without-tools way to start the game (run parks the DLL).
+          # warnings that a zip avoids. No ini: every setting has a built-in default and the
+          # settings screen writes the file, so an ini in the zip would overwrite a player's own
+          # settings on every update. The two launchers are the with/without-tools way to
+          # start the game (run parks the DLL).
           # LICENSE travels WITH the binary because GPLv3 asks it to: the zip is what gets
           # passed around, and a copy re-shared from a chat has nothing else to go on. The
           # READMEs come along because the crash-report steps are read at the moment of the
           # crash, in this very folder, by someone who is not going back to a web page.
-          cp ff13-srpractice.ini.example ff13-srpractice.ini
           zip -j "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" \
             src/out/dinput8.dll \
-            ff13-srpractice.ini \
             ff13-practice.bat \
             ff13-run.bat \
+            README.md \
+            README.ja.md \
+            LICENSE
+          # Linux (Steam / Proton) gets its own zip: the same dll with .sh launchers in place of the
+          # .bat ones, so neither zip carries files its players cannot use. zip keeps the scripts'
+          # executable bit from the checkout.
+          zip -j "FF13-SpeedrunPractice-$GITHUB_REF_NAME-linux.zip" \
+            src/out/dinput8.dll \
+            ff13-practice.sh \
+            ff13-run.sh \
             README.md \
             README.ja.md \
             LICENSE
@@ -83,12 +91,12 @@ jobs:
           # --generate-notes would say nothing).
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             gh release upload "$GITHUB_REF_NAME" \
-              "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" --clobber
+              "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" "FF13-SpeedrunPractice-$GITHUB_REF_NAME-linux.zip" --clobber
             gh release edit "$GITHUB_REF_NAME" \
               --notes-file .github/RELEASE_NOTES.md
           else
             gh release create "$GITHUB_REF_NAME" \
-              "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" \
+              "FF13-SpeedrunPractice-$GITHUB_REF_NAME.zip" "FF13-SpeedrunPractice-$GITHUB_REF_NAME-linux.zip" \
               --title "FF13-SpeedrunPractice $GITHUB_REF_NAME" \
               --notes-file .github/RELEASE_NOTES.md
           fi

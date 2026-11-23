@@ -40,8 +40,8 @@ static const uint8_t P_OHK_SIG[] = {0x8B,0x45,0xE8,0x8B,0x4D,0xFC,   // mov eax,
 // Does the keyboard belong to this game right now? Asked of the foreground window's PROCESS, not of
 // a window handle: the game creates more than one window over its life, so a handle captured at
 // startup would stop matching. Nothing is cached -- the answer changes with alt-tab.
-static int hk_active(void) {
-    if (!g_hkFocusOnly) return 1;
+int hk_active(void) {
+    if (g_hkGlobal) return 1;
     HWND fg = GetForegroundWindow();
     if (!fg) return 0;                 // briefly true across a task switch or a lock screen
     DWORD pid = 0;
@@ -56,7 +56,7 @@ static int hk_active(void) {
 // The modifier match is EXACT and deliberate: a modified binding must not fire the plain key, and
 // the plain key must not fire while a modifier is down -- anything looser makes combos impossible.
 // Left and right are the same thing (VK_CONTROL / VK_SHIFT / VK_MENU are the either-side codes).
-static UINT hk_mods_now(void) {
+UINT hk_mods_now(void) {
     UINT m = 0;
     if (GetAsyncKeyState(VK_CONTROL) & 0x8000) m |= HK_CTRL;
     if (GetAsyncKeyState(VK_SHIFT)   & 0x8000) m |= HK_SHIFT;
@@ -100,6 +100,15 @@ static int hk_taphold(UINT b, hk_tap* s, DWORD now, DWORD holdMs) {
     if (down && !s->was)      { s->downAt = now; s->held = 0; }          // the press
     else if (down && !s->held && (int)(now - s->downAt) >= (int)holdMs) { s->held = 1; r = 2; }
     else if (!down && s->was && !s->held) { r = 1; }                     // released, still a tap
+    s->was = down;
+    return hk_active() ? r : 0;
+}
+// 1 on the key's RELEASE, held or not: a menu opened by the press would otherwise see the same press
+// inside it.
+static int hk_tap_up(UINT b, hk_tap* s) {
+    if (!b) return 0;
+    int down = hk_down(b);
+    int r = !down && s->was;
     s->was = down;
     return hk_active() ? r : 0;
 }
@@ -162,8 +171,7 @@ static void tidy_confirm(void) {
     } else if (g_ssOpen) {
         if (g_ssSel == SS_CAT_PICK) {
             // Left open on purpose: the "using" row wearing the new name is the receipt.
-            const char* pick = cat_pick();
-            if (pick) cat_switch(pick);
+            cat_sw_go();
         } else if (g_ssSel == SS_CAT_DEL) {
             // Left open either way: the first confirm only asks, and after a delete the
             // next category is already under the row.
@@ -176,10 +184,10 @@ static void tidy_confirm(void) {
                 flash_say_c(ui_text(T_LABEL_NO_WINDOW), OVL_FLASH_OFF);
         } else if (g_ssSel == SS_FILTER) {
             filter_apply(0); state_save();
-        } else {
-            if (g_ssSel == SS_RENUM) save_renumber_apply(); else save_sort_apply();
-            g_ssOpen = 0; menu_gate_release();
+        } else if (g_ssSel == SS_RENUM) {
+            if (save_renumber_apply()) { g_ssOpen = 0; menu_gate_release(); }
         }
+        // SS_ORDER takes no confirm: the arrows alone change it, and each one writes it.
     }
 }
 
@@ -263,15 +271,15 @@ static DWORD WINAPI worker(LPVOID unused) {
                  g_suppressEnabled ? "ENABLED" : "disabled (press the suppress hotkey)", waited6);
     }
 
-    // Game-speed, on the app-clock tick entry: the stackarg hook passes [esp+4] (= frameDeltaMs
-    // pointer) to on_frame_tick. Non-fatal on failure.
+    // The per-frame game-thread pump (picker, battle camera, game-speed's frame-speed write), on the
+    // app-clock tick entry: the stackarg hook passes [esp+4] (= int* frame delta). Non-fatal.
     int waited7 = wait_for_bytes(g_base + RVA_FRAMETICK, P_FRAMETICK, (int)sizeof(P_FRAMETICK), 120000);
     if (waited7 < 0) {
-        ff13loga("[FF13-SRP] timed out waiting for frame-tick to decrypt -> no game-speed\n");
+        ff13loga("[FF13-SRP] timed out waiting for frame-tick to decrypt -> no game-speed, no picker pump\n");
     } else {
         void* hc = ff13_install_stackarg_hook(g_base + RVA_FRAMETICK, P_FRAMETICK,
                                               (int)sizeof(P_FRAMETICK), (void*)on_frame_tick, 4);
-        (hc ? ff13logv : ff13loga)("[FF13-SRP] game-speed hook @0x%08X: %s (factor=%.2f, %s; decrypted after ~%dms)\n",
+        (hc ? ff13logv : ff13loga)("[FF13-SRP] frame-tick hook @0x%08X: %s (game-speed %.2fx, %s; decrypted after ~%dms)\n",
                  (unsigned)(g_base + RVA_FRAMETICK), hc ? "OK" : "FAIL", g_gsFactor,
                  g_gsEnabled ? "ENABLED" : "disabled (press the game-speed hotkey)", waited7);
     }
@@ -454,13 +462,6 @@ static DWORD WINAPI worker(LPVOID unused) {
         (ab ? ff13logv : ff13loga)("[FF13-SRP] ability label hook @0x%08X: %s\n",
                  (unsigned)(g_base + RVA_ABILLABEL), ab ? "OK" : "FAIL");
     }
-    // The ATB-speed setter game-speed leans on: called, not hooked, so the wait is the only proof
-    // the bytes are the function we read -- and calling into the wrong bytes under SteamStub is how
-    // a mod takes the game with it.
-    int waitedAtb = wait_for_bytes(g_base + RVA_SETATBSPEED, P_SETATB, (int)sizeof(P_SETATB), 15000);
-    g_atbOk = waitedAtb >= 0;
-    (g_atbOk ? ff13logv : ff13loga)("[FF13-SRP] ATB speed setter @0x%08X: %s\n", (unsigned)(g_base + RVA_SETATBSPEED),
-             g_atbOk ? "OK" : "NOT THERE -- game-speed leaves the gauges alone");
     // The AI's after-exec queue, so a bent form spends its own mode in the enemy's bookkeeping
     // rather than the one the AI rolled (see on_ai_afterexec).
     int waitedAe = wait_for_bytes(g_base + RVA_AIAFTER, P_AIAFTER, (int)sizeof(P_AIAFTER), 15000);
@@ -522,6 +523,37 @@ static DWORD WINAPI worker(LPVOID unused) {
         (st ? ff13logv : ff13loga)("[FF13-SRP] AI state hook @0x%08X: %s\n",
                  (unsigned)(g_base + RVA_AISTATE), st ? "OK" : "FAIL");
     }
+    {
+        int wq = wait_for_bytes(g_base + RVA_AIQUEUE, P_AIQUEUE, (int)sizeof(P_AIQUEUE), 15000);
+        void* aq = wq < 0 ? NULL
+                 : ff13_install_esp_hook(g_base + RVA_AIQUEUE, P_AIQUEUE, (int)sizeof(P_AIQUEUE), (void*)on_ai_queue);
+        (aq ? ff13logv : ff13loga)("[FF13-SRP] AI attack queue hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_AIQUEUE), aq ? "OK" : "FAIL");
+    }
+    {
+        int wr = wait_for_bytes(g_base + RVA_AIRUN, P_AIRUN, (int)sizeof(P_AIRUN), 15000);
+        void* ar = wr < 0 ? NULL
+                 : ff13_install_ecx_hook(g_base + RVA_AIRUN, P_AIRUN, (int)sizeof(P_AIRUN), (void*)on_ai_run);
+        (ar ? ff13logv : ff13loga)("[FF13-SRP] AI decision hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_AIRUN), ar ? "OK" : "FAIL");
+    }
+    {
+        int wa = wait_for_bytes(g_base + RVA_AIREAIM, P_AIREAIM, (int)sizeof(P_AIREAIM), 15000);
+        void* aa = wa < 0 ? NULL
+                 : ff13_install_esp_hook(g_base + RVA_AIREAIM, P_AIREAIM, (int)sizeof(P_AIREAIM), (void*)on_ai_reaim);
+        (aa ? ff13logv : ff13loga)("[FF13-SRP] AI re-aim hook @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_AIREAIM), aa ? "OK" : "FAIL");
+    }
+#ifdef FF13_DIAG
+    {
+        int wt = wait_for_bytes(g_base + RVA_SETTGT, P_SETTGT, (int)sizeof(P_SETTGT), 15000);
+        void* st = wt < 0 ? NULL
+                 : ff13_install_argptr_hook(g_base + RVA_SETTGT, P_SETTGT, (int)sizeof(P_SETTGT),
+                                            (void*)on_set_target, 4, 0, 0);
+        (st ? ff13logv : ff13loga)("[FF13-SRP] set-target watch @0x%08X: %s\n",
+                 (unsigned)(g_base + RVA_SETTGT), st ? "OK" : "FAIL");
+    }
+#endif
     // The charaspec swap, so a picked form can be made to stick (see on_spec_replace).
     int waitedSr = wait_for_bytes(g_base + RVA_SPECREPL, P_SPECREPL, (int)sizeof(P_SPECREPL), 15000);
     if (waitedSr < 0) {
@@ -941,18 +973,23 @@ static DWORD WINAPI worker(LPVOID unused) {
     // screen / postcam x2 / reconcile), each waiting on its own prologue. See srp_save.c.
     save_install_hooks();
 
-    // With the save-list key refused (Steam Cloud, srp_save.c) there is no key left to clear a
-    // restored filter, so the short list it makes would read as saves lost.
-    if (steam_cloud_on() == 1)
+    // With the save-list key refused (Steam Cloud, srp_save.c) there is no key left to clear
+    // either setting, and a list that is short or in an unexpected order would read as saves lost.
+    // Neither is written back, so both come back once Cloud is off for this game.
+    if (steam_cloud_on() == 1) {
         ff13loga("[FF13-SRP] save menu: Steam Cloud is on for this game -- the save-list key is "
-                 "refused, and the chapter filter stays off\n");
-    else
+                 "refused, and the chapter filter and the list order stay off (filter %d, order %d "
+                 "kept in the state file)\n", g_filterChapter, g_sortOrder);
+        g_filterChapter = 0;
+        g_sortOrder = 0;
+    } else {
         filter_restore();
+    }
 
     overlay_init();
 
-    ff13loga("[FF13-SRP] ready. help 0x%X = the hotkey list; kill_mode 0x%X = cycling OFF -> "
-             "INSTANT WIN (+ one-hit-kill, "
+    ff13loga("[FF13-SRP] ready. help 0x%X = the hotkeys-and-settings screen; kill_mode 0x%X = "
+             "cycling OFF -> INSTANT WIN (+ one-hit-kill, "
              "arm it BEFORE the encounter; gate %s) -> ONE-HIT KILL -> OFF, now %s; enemy_suppress "
              "0x%X = every " SUPPRESS_PREFIX "* group; game_speed 0x%X = %s then off; "
              "warp 0x%X = warp (tap) / record (hold), field + same-zone; battle_overlay 0x%X = "
@@ -963,16 +1000,16 @@ static DWORD WINAPI worker(LPVOID unused) {
              g_armVk, g_iwInstGate ? "live" : "MISSING", kill_mode_name_en(g_killMode),
              g_supVk, g_gsVk, gs_steps_str(), g_warpVk, g_boVk,
              g_bsVk, g_saveVk, g_camUnstickVk, g_menuOkVk);
-    ff13loga("[FF13-SRP] hotkeys: %s\n", g_hkFocusOnly
-             ? "only while the game window has focus ([hotkeys] require_focus = 0 to lift that)"
-             : "always, focus or not ([hotkeys] require_focus = 0)");
+    ff13loga("[FF13-SRP] hotkeys: %s\n", g_hkGlobal
+             ? "always, focus or not ([hotkeys] global_hotkeys = 1)"
+             : "only while the game window has focus ([hotkeys] global_hotkeys = 1 to lift that)");
 
     // Hotkey polling. Every press goes through hk_edge, which is also where "not while the game is
     // in the background" lives.
     int wasArm = 0, wasSup = 0, wasGs = 0, wasCancel = 0, wasBo = 0, wasHelp = 0, wasMok = 0;
     hk_tap tpKey = { 0, 0, 0 };                  // the warp key's tap-or-hold state
     hk_tap bsKey = { 0, 0, 0 };                  // ...and the picker key's, on the same hold time
-    hk_tap ssKey = { 0, 0, 0 };                  // ...and the save-sort menu's
+    hk_tap ssKey = { 0, 0, 0 };                  // the tidy key's release (hk_tap_up)
 
     hk_rep bsUp = { 0, 0 }, bsDown = { 0, 0 },   // the four that repeat while held
            bsLeft = { 0, 0 }, bsRight = { 0, 0 };
@@ -981,12 +1018,18 @@ static DWORD WINAPI worker(LPVOID unused) {
     for (;;) {
         Sleep(HK_POLL_MS);
         DWORD hkNow = GetTickCount();
+        // The game installs its own filter after this mod's, so the seat is re-taken on a timer --
+        // above every menu branch's continue, so it is re-taken with a menu up as well.
+        if ((int)(hkNow - crashRearmAt) >= 0) { crashRearmAt = hkNow + 2000; crash_report_rearm(); }
+#ifdef FF13_DIAG
+        { static DWORD censusAt; if ((int)(hkNow - censusAt) >= 0) { censusAt = hkNow + 5000; diag_vm_census("every 5 s"); } }
+#endif
         menu_screen_tick();
         if (g_liftWait) {
             // A menu of ours reopening owns the gate now. An editor being torn down is NOT that
             // case: menu_screen_tick closed it a statement earlier and the flag outlives the tick,
             // so the editor branch below releases again.
-            if (g_ssOpen || g_lselOpen || g_labelEdit) g_liftWait = 0;
+            if (g_ssOpen || g_lselOpen || g_labelEdit || setup_is_open()) g_liftWait = 0;
             else if (di_gate_left_ms() < 0) g_liftWait = 0;
             else if ((int)(hkNow - g_liftWaitAt) > DI_GATE_MAX_MS) {
                 // A key that never reads as released (stuck, or a remapper ate the up) must not
@@ -1018,8 +1061,8 @@ static DWORD WINAPI worker(LPVOID unused) {
             hk_held(g_bsLeftVk, &bsLeft, hkNow);   hk_held(g_bsRightVk, &bsRight, hkNow);
             hk_held(g_listPrevVk, &lPrev, hkNow);  hk_held(g_listNextVk, &lNext, hkNow);
             save_keys_step();   // ...and the two the save loop owns: the continue skips its tick
-            int e = hk_taphold(g_ssVk, &ssKey, hkNow, WARP_HOLD_MS);
-            if (e) label_edit_finish(e == 2);
+            int e = hk_tap_up(g_ssVk, &ssKey);
+            if (e) label_edit_finish(0);
             else if (mok) label_edit_finish(1);
             if (edit_mode() == EDIT_LABEL) {
                 char what2[160];
@@ -1040,12 +1083,46 @@ static DWORD WINAPI worker(LPVOID unused) {
             else if (di_gate_left_ms() < DI_GATE_MAX_MS / 2) di_gate_arm();
             continue;
         }
-        // The game installs its own filter after this mod's, so the seat is re-taken on a timer.
-        if ((int)(hkNow - crashRearmAt) >= 0) { crashRearmAt = hkNow + 2000; crash_report_rearm(); }
-        if (hk_edge(g_helpVk, &wasHelp)) {
-            g_helpOpen = !g_helpOpen;
-            ff13log("[FF13-SRP] hotkey list %s\n", g_helpOpen ? "shown" : "hidden");
+        // The settings screen owns the menu keys the same way; every feature gesture is stepped so
+        // none fires under it and none reads as fresh the tick it closes.
+        if (setup_is_open()) {
+            int help = hk_edge(g_helpVk, &wasHelp);
+            hk_edge(g_armVk, &wasArm);     hk_edge(g_supVk, &wasSup);
+            hk_edge(g_gsVk, &wasGs);       hk_edge(g_boVk, &wasBo);
+            int cancel = hk_edge(g_warpCancelVk, &wasCancel);
+            hk_taphold(g_bsVk, &bsKey, hkNow, WARP_HOLD_MS);
+            hk_taphold(g_warpVk, &tpKey, hkNow, WARP_HOLD_MS);
+            int up    = hk_held(g_bsUpVk, &bsUp, hkNow);
+            int down  = hk_held(g_bsDownVk, &bsDown, hkNow);
+            int left  = hk_held(g_bsLeftVk, &bsLeft, hkNow);
+            int right = hk_held(g_bsRightVk, &bsRight, hkNow);
+            hk_held(g_listPrevVk, &lPrev, hkNow);  hk_held(g_listNextVk, &lNext, hkNow);
+            save_keys_step();
+            hk_tap_up(g_ssVk, &ssKey);
+            // A capture reads the raw keys itself, the help key included: there it cancels the
+            // capture rather than closing the screen.
+            if (setup_capturing()) {
+                setup_capture_tick();
+            } else if (setup_settling()) {
+                // The gesture state above still tracks the bindings from before the capture.
+            } else if (help) {
+                setup_close();
+                menu_gate_release();
+            } else {
+                if (up)    setup_move(-1);
+                if (down)  setup_move(+1);
+                if (left)  setup_cycle(-1);
+                if (right) setup_cycle(+1);
+                if (mok) setup_ok();
+                else if (cancel) { setup_close(); menu_gate_release(); }
+            }
+            if (setup_is_open() && di_gate_left_ms() < DI_GATE_MAX_MS / 2) di_gate_arm();
+            continue;
         }
+        // Not over anything of ours, and not under a gate still held for one: the key is consumed.
+        if (hk_edge(g_helpVk, &wasHelp) && !g_ssOpen && !g_lselOpen && !g_labelEdit && !g_bsOpen
+            && !g_warpPrompt && di_gate_left_ms() < 0)
+            setup_open();
 
         // The kill-mode cycle, strongest first (user-facing order):
         // OFF -> INSTANT WIN (+ one-hit-kill) -> ONE-HIT KILL -> OFF.
@@ -1055,6 +1132,7 @@ static DWORD WINAPI worker(LPVOID unused) {
 #endif
             kill_mode_apply(g_killMode == KILL_OFF     ? KILL_INSTANT :
                             g_killMode == KILL_INSTANT ? KILL_ONEHIT  : KILL_OFF, 1);
+            if (g_killMode == KILL_OFF) flash_say_c(ui_text(T_KILL_OFF_FLASH), OVL_FLASH_OFF);
             state_save();                          // persist across restarts
         }
 
@@ -1064,18 +1142,20 @@ static DWORD WINAPI worker(LPVOID unused) {
             g_suppressEnabled = !g_suppressEnabled;
             ff13log("[FF13-SRP] enemy suppression %s (every " SUPPRESS_PREFIX "* group). "
                      "Reload the save to apply.\n", g_suppressEnabled ? "ON" : "OFF");
+            if (!g_suppressEnabled) flash_say_c(ui_text(T_SUPPRESS_OFF), OVL_FLASH_OFF);
             state_save();                          // persist the toggle across restarts
         }
 
-        // gs_clock reads g_gsEnabled on every clock call, so the change takes effect immediately
-        // and continuously (the accumulator keeps the clock monotonic).
+        // Only the step moves here; the frame-tick pump writes the frame speed on the next frame.
         if (hk_edge(g_gsVk, &wasGs)) {
             gs_apply(g_gsStep + 1);                // ...and past the last one is off
             if (g_gsEnabled)
                 ff13log("[FF13-SRP] game-speed ON at %.2fx (step %d of %d).\n",
                          g_gsFactor, g_gsStep + 1, g_gsStepN);
-            else
+            else {
                 ff13log("[FF13-SRP] game-speed OFF.\n");
+                flash_say_c(ui_text(T_GAMESPEED_OFF), OVL_FLASH_OFF);
+            }
             state_save();                          // persist the step across restarts
         }
 
@@ -1139,14 +1219,21 @@ static DWORD WINAPI worker(LPVOID unused) {
                 if (bsRightFire) send_cycle(+1);
             }
         } else if (g_ssOpen) {
+            if ((bsUpFire || bsDownFire) && g_ssSel == SS_CAT_PICK) cat_sw_go();
             if (bsUpFire)   g_ssSel = (g_ssSel > 0) ? g_ssSel - 1 : SS_MODES - 1;
             if (bsDownFire) g_ssSel = (g_ssSel + 1 < SS_MODES) ? g_ssSel + 1 : 0;
             if (g_ssSel == SS_FILTER) {
                 if (bsLeftFire)  { filter_cycle(-1); state_save(); }
                 if (bsRightFire) { filter_cycle(+1); state_save(); }
-            } else if (g_ssSel == SS_CAT_PICK || g_ssSel == SS_CAT_DEL) {
+            } else if (g_ssSel == SS_CAT_PICK) {
+                if (bsLeftFire)  cat_sw_cycle(-1);
+                if (bsRightFire) cat_sw_cycle(+1);
+            } else if (g_ssSel == SS_CAT_DEL) {
                 if (bsLeftFire)  cat_cycle(-1);
                 if (bsRightFire) cat_cycle(+1);
+            } else if (g_ssSel == SS_ORDER) {
+                if (bsLeftFire)  save_order_cycle(-1);
+                if (bsRightFire) save_order_cycle(+1);
             }
         } else if (g_bsOpen && g_bsCount > 0) {
             if (bsUpFire)   g_bsSel = (g_bsSel > 0) ? g_bsSel - 1 : g_bsCount - 1;
@@ -1176,25 +1263,20 @@ static DWORD WINAPI worker(LPVOID unused) {
         // and never opens anything itself -- outside these menus the key belongs to the game.
         if (mok && (g_lselOpen || g_ssOpen)) tidy_confirm();
         {
-            int t = hk_taphold(g_ssVk, &ssKey, hkNow, WARP_HOLD_MS);
+            int t = hk_tap_up(g_ssVk, &ssKey);
             // Only with nothing of ours on screen, so a menu opened before the switch was flipped
-            // can still be closed -- and by zeroing t, so the tap/hold state above still advances.
+            // can still be closed -- and by zeroing t, so the release state above still advances.
             if (t && !g_ssOpen && !g_lselOpen && !g_labelEdit && steam_cloud_on() == 1) {
                 ff13log("[FF13-SRP] save menu: refused -- Steam Cloud is on for this game\n");
                 flash_say_c(ui_text(T_SS_CLOUD), OVL_FLASH_OFF);
                 t = 0;
             }
-            if (t == 2) {
-                if (g_lselOpen || g_ssOpen) {
-                    tidy_confirm();
-                // A refusal here stays silent: on the title screen this same hold is the tidy
-                // menu's confirm, and a complaint would read as that action going wrong.
-                } else if (!g_bsOpen && di_gate_left_ms() < 0 && lsel_open()) {
-                    di_gate_arm();
-                }
-            } else if (t == 1) {
+            if (t) {
                 if (g_lselOpen) { lsel_close(); menu_gate_release(); }
-                else if (g_ssOpen) { g_ssOpen = 0; menu_gate_release(); }
+                else if (g_ssOpen) {
+                    if (g_ssSel == SS_CAT_PICK) cat_sw_go();
+                    g_ssOpen = 0; menu_gate_release();
+                }
                 else if (label_edit_ready() && !g_bsOpen && di_gate_left_ms() < 0) {
                     // lsel_open refuses on the in-game save screen, so that screen falls through
                     // to the note editor. A live gate is someone else's (a staged fight) and
@@ -1234,7 +1316,10 @@ static DWORD WINAPI worker(LPVOID unused) {
         // while a warp prompt is up.
         if (hk_edge(g_warpCancelVk, &wasCancel)) {
             if (g_warpPrompt)    warp_cancel();
-            else if (g_ssOpen)   { g_ssOpen = 0; menu_gate_release(); }
+            else if (g_ssOpen)   {
+                if (g_ssSel == SS_CAT_PICK) cat_sw_go();
+                g_ssOpen = 0; menu_gate_release();
+            }
             else if (g_bsOpen) {
                 g_bsRememberDue = 1;           // ...likewise
                 g_bsOpen = 0;      // no flash: the list vanishing already says it closed

@@ -1,22 +1,5 @@
-; ファイル名をff13-srpractice.iniに変えてexeの隣に置く。全キー省略可(既定値=下の値)。詳細な説明はREADMEにあります。
-; Rename to ff13-srpractice.ini, place next to ffXiiiimg.exe. All keys optional (defaults below). Details in the README.
-
 [hotkeys]
-; キーはF1..F24 / 英字 / 数字 / キー名(Enter, Space, Tab, Backspace, Up, Down, Left, Right,
-; Home, End, PageUp, PageDown, Insert, Delete) / 生の0xNNコード。
-; Ctrl+ / Shift+ / Alt+ を前に付けられる(例: Ctrl+Shift+T)。EscとFnは使えない。
-; 無効にするには値を空にする(例: warp =)。
-; A key is F1..F24, a letter, a digit, a key name (Enter, Space, Tab, Backspace, Up, Down, Left,
-; Right, Home, End, PageUp, PageDown, Insert, Delete), or a raw 0xNN code,
-; alone or behind Ctrl+ / Shift+ / Alt+ (e.g. Ctrl+Shift+T). Esc and Fn cannot be used.
-; To unbind a key, leave its value empty (e.g. warp =).
-
-; require_focus: 1=FF13のウィンドウがアクティブなときだけ有効。0=無条件で有効。
-; require_focus: 1 = only while the FF13 window is active. 0 = always, even in the background.
-require_focus  = 1
-
-; 各機能と現在のホットキーの一覧をゲーム画面に表示する。
-; Shows the in-game list of every feature and its current hotkey.
+global_hotkeys = 0
 help           = F1
 game_speed     = F2
 kill_mode      = F3
@@ -27,49 +10,28 @@ camera_unstick = F8
 save_tidy      = F9
 battle_overlay = F10
 battle_picker  = F11
-picker_up      = 0x26
-picker_down    = 0x28
-picker_left    = 0x25
-picker_right   = 0x27
-cancel         = 0x08
-
-; セーブ整理メニュー用。menu_ok=決定(メニュー表示中はゲームがキーを受け取らないので重なっても安全)、
-; list_prev/list_next=操作対象のセーブを選ぶ。メニュー自体の移動は上のpicker_up/downのまま。
-; For the save/tidy menus. menu_ok confirms (sharing the game's key is safe -- a menu up means the game sees no keyboard);
-; list_prev/list_next pick which save the menu acts on. The menus themselves still move on picker_up/down above.
+picker_up      = Up
+picker_down    = Down
+picker_left    = Left
+picker_right   = Right
+cancel         = Backspace
 menu_ok        = Enter
 list_prev      = A
 list_next      = D
 
-[overlay]
-; Modが表示する文字の言語: auto | jp | en。
-; What the mod draws is in: auto (follow the game) | jp | en.
-language = auto
-
 [game_speed]
-; 0.1〜10倍。カンマ区切りで並べるとホットキーで順に切り替わる(例: 2.0,3.0,0.5)。最後はOFF(最大8個)。
-; How much faster, 0.1..10. A comma-separated list is walked by the hotkey (e.g. 2.0,3.0,0.5), then off (max 8).
 multiplier = 3.0
 
 [battle_picker]
-; 戦闘の曲が入るまでの無音の長さ。0〜8000ms。
-; Silence before a picked fight's own track comes in, 0..8000 ms.
 bgm_delay_ms = 1200
 
 [save]
-; ゲームのセーブ一覧で、どこでもセーブで作成したデータの番号の右に付ける印(「セーブデータ 01*」)。最大8文字。値を空にすると付けない。
-; 全角文字も使用可能。数字は不可。
-; Mark a save made with save-anywhere after its number in the game's save list ("Save Data 01*"). Max 8 chars; leave it empty for no mark.
-; Full-width characters are fine; digits are not.
 list_mark = *
-; ff13-NN.datがあるディレクトリ。空 = 自動検出。
-; Directory holding the ff13-NN.dat save files. Empty = auto-detect.
-; 例 / e.g.  C:\Users\<user>\AppData\Local\SquareEnix\FinalFantasyXIII\save
 save_dir =
+keep_note = off
+
+[overlay]
+top_px = 34
 
 [log]
-; quiet | normal | verbose。quiet=エラーと起動時のみ / normal=+操作の結果 / verbose=+ゲーム内部の動き。
-; quiet = errors and startup only / normal = + your actions' results / verbose = + the game's internals.
-; 不具合を報告するときは できればverbose にして、ff13-mods\ff13-srpractice.log を送ってください。
-; Reporting a problem? Set verbose if you can, and send us ff13-mods\ff13-srpractice.log.
 level = normal

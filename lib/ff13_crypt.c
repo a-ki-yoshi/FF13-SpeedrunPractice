@@ -1,5 +1,5 @@
 /*
- * FF13-AnywhereSave — save-anywhere mod for FINAL FANTASY XIII (Steam).
+ * FF13 mods — shared modules for the FINAL FANTASY XIII / XIII-2 practice mods (Steam).
  * Copyright (C) 2026 Akiyoshi
  *
  * This program is free software: you can redistribute it and/or modify
@@ -16,9 +16,9 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
-// FF13 ff13-NN.dat save crypto — faithful C port of dat_crypt.py.
+// FF13 ff13-NN.dat save crypto.
 // Only the low 32 bits of each half survive to the output, so all arithmetic is
-// done with wrapping uint32_t (verified equivalent to the Python big-int version).
+// done with wrapping uint32_t.
 //
 // Attribution (GPLv3): the White-engine XOR-table block cipher used here — the
 // 264-byte table generator (gen_xor_table), the SpecialKey constant 0xA1652347,
@@ -29,12 +29,15 @@
 // uses the exe's hardcoded 8-byte save seed (data VA 0x281b968: 8e 40 91 d1 5e 8f
 // aa 56, passed WITHOUT the byte-reversal WhiteCryptTool applies to per-file seeds)
 // and leaves the 0x208 plaintext header and trailing 8-byte footer unencrypted.
+// Further change: the table and the windowed decrypt are also exposed with a caller-supplied seed
+// (ff13_crypt_table / ff13_decrypt_window_with), which FF13-2-SpeedrunPractice uses with the
+// FF13-2 per-container save seeds; the FF13 entry points are unchanged.
 // Both works are GPLv3, so this derivation is license-compatible; this notice
 // preserves attribution and records the modifications as GPLv3 sec. 5 requires.
 #include "ff13_crypt.h"
 #include <string.h>
 
-// Hardcoded save seed (exe data VA 0x281b968), no byte-reversal. 8e4091d15e8faa56
+// Hardcoded save seed (exe data VA 0x281b968), used without byte reversal.
 static const uint8_t SAVE_SEED[8] = {0x8e,0x40,0x91,0xd1,0x5e,0x8f,0xaa,0x56};
 
 static uint32_t rd32(const uint8_t* p) {
@@ -45,9 +48,9 @@ static void wr32(uint8_t* p, uint32_t v) {
 }
 static uint32_t rotl32(uint32_t v, int n) { return (v<<n) | (v>>(32-n)); }
 
-// gen_xor_table: 264-byte table from the 8-byte seed.
-static void gen_xor_table(uint8_t table[264]) {
-    uint32_t A = rd32(SAVE_SEED), B = rd32(SAVE_SEED+4);
+// gen_xor_table: 264-byte table from the 8-byte seed, used exactly as given (never reversed).
+static void gen_xor_table(const uint8_t seed[8], uint8_t table[264]) {
+    uint32_t A = rd32(seed), B = rd32(seed+4);
     A = rotl32(A, 8);
     B = (B>>16) | (B<<16);
     uint8_t xb[8];
@@ -86,7 +89,6 @@ static void bc_setup(uint32_t bc, uint32_t* toff, uint32_t* Eval, uint32_t* Fval
     *Fval = (uint32_t)(val >> 32);
 }
 
-// special key: k1 = (Eval+0xA1652347) low32; carry -> k2 = Fval+carry.
 static void special_key(uint32_t Eval, uint32_t Fval, uint32_t* k1, uint32_t* k2) {
     uint32_t carry = (Eval > (~0xA1652347u)) ? 1u : 0u;
     *k1 = Eval + 0xA1652347u;
@@ -131,8 +133,8 @@ static void decrypt_block(const uint8_t* cur, uint32_t bc, const uint8_t* table,
 static void encrypt_block(const uint8_t* pt, uint32_t bc, const uint8_t* table, uint8_t* out) {
     uint32_t blockId = bc >> 3, toff, Eval, Fval;
     bc_setup(bc, &toff, &Eval, &Fval);
-    uint32_t loVal = rd32(pt+4);   // pt[4..7]
-    uint32_t hiVal = rd32(pt);     // pt[0..3]
+    uint32_t loVal = rd32(pt+4);
+    uint32_t hiVal = rd32(pt);
     uint32_t xlo = rd32(table+toff), xhi = rd32(table+toff+4);
     uint32_t k1, k2; special_key(Eval, Fval, &k1, &k2);
     loVal ^= xlo; hiVal ^= xhi;
@@ -151,14 +153,25 @@ static void encrypt_block(const uint8_t* pt, uint32_t bc, const uint8_t* table, 
     out[0]=e1; out[1]=e2; out[2]=e3; out[3]=e4; out[4]=e5; out[5]=e6; out[6]=e7; out[7]=e8;
 }
 
-static void cipher_stream(uint8_t* data, size_t n, uint32_t base,
-                          void (*fn)(const uint8_t*, uint32_t, const uint8_t*, uint8_t*)) {
-    uint8_t table[264]; gen_xor_table(table);
+static void cipher_table(const uint8_t* table, uint8_t* data, size_t n, uint32_t base,
+                         void (*fn)(const uint8_t*, uint32_t, const uint8_t*, uint8_t*)) {
     uint8_t out[8];
     for (size_t i=0; i+8<=n; i+=8) {
         fn(data + i, base + (uint32_t)i, table, out);
         memcpy(data + i, out, 8);
     }
+}
+static void cipher_stream(uint8_t* data, size_t n, uint32_t base,
+                          void (*fn)(const uint8_t*, uint32_t, const uint8_t*, uint8_t*)) {
+    uint8_t table[264]; gen_xor_table(SAVE_SEED, table);
+    cipher_table(table, data, n, base, fn);
+}
+
+void ff13_crypt_table(const uint8_t seed[8], uint8_t table[264]) { gen_xor_table(seed, table); }
+
+void ff13_decrypt_window_with(const uint8_t table[264], uint8_t* buf, uint32_t base, size_t len) {
+    if ((base & 7u) || (len & 7u)) return;
+    cipher_table(table, buf, len, base, decrypt_block);
 }
 
 // One block-aligned window of a save body, decrypted where it lies. Bounds are the caller's:

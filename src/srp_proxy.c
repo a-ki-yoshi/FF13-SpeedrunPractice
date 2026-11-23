@@ -25,10 +25,10 @@ static DI8C_t g_real = NULL;
 
 // ---- the input gate ---------------------------------------------------------------------------
 // Input is silenced HERE, at the DirectInput proxy, and not game-side through Chara.switchControl,
-// which crashed on hardware (CODE_NOTES, the input-gate section). Everything the game plays with
-// comes through this DLL: keyboard and mouse are DirectInput devices too, there is no XInput or
-// RawInput, and the exe's one GetAsyncKeyState call checks VK_LCONTROL only. The mod's hotkeys poll
-// GetAsyncKeyState, so they keep working while the gate is up.
+// which crashes. Everything the game plays with comes through this DLL: keyboard and mouse are
+// DirectInput devices too, there is no XInput or RawInput, and the exe's one GetAsyncKeyState call
+// checks VK_LCONTROL only. The mod's hotkeys poll GetAsyncKeyState, so they keep working while the
+// gate is up.
 //
 // The gate expires on its own (DI_GATE_MAX_MS, header): a stuck gate would eat even the Esc that
 // opens the quit dialog, so a bug elsewhere must not be able to leave the player sealed in.
